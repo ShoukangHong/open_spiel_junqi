@@ -310,9 +310,9 @@ void OthelloState::ObservationTensor(Player player,
   for (int cell = 0; cell < kNumCells; ++cell) {
     if (board_[cell] == CellState::kEmpty) {
       view[{0, cell}] = 1;
-    } else if (board_[cell] == PlayerToState(player)) {
+    } else if (board_[cell] == CellState::kBlack) {
       view[{1, cell}] = 1;
-    } else {  // Opponent's piece
+    } else {  // CellState::kWhite
       view[{2, cell}] = 1;
     }
   }

@@ -1,0 +1,30 @@
+{
+  "game": "othello",
+  "nn_model": "resnet",
+  "nn_width": 24,
+  "nn_depth": 6,
+  "nn_api": "nnx",
+
+  "max_simulations": 64,
+  "actors": 10,
+  "evaluators": 1,
+  "replay_buffer_size": 12000,
+  "replay_buffer_reuse": 4,
+  "train_batch_size": 128,
+  "learning_rate": 0.0003,
+  "weight_decay": 0.0001,
+
+  "max_steps": 300,
+  "checkpoint_freq": 10,
+  "uct_c": 1.41,
+  "policy_epsilon": 0.25,
+  "policy_alpha": 1.0,
+  "temperature": 1.0,
+  "temperature_drop": 2,
+  "evaluation_window": 50,
+  "eval_levels": 3,
+
+  "quiet": false,
+  "verbose": false,
+  "path": "C:\\Users\\shouk\\othello_train"
+}
