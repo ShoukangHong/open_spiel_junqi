@@ -12,7 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Monte-Carlo Tree Search algorithm for game play."""
+
+"""Monte-Carlo Tree Search algorithm for game play.
+
+Contains:
+  - Original MCTS (SearchNode, MCTSBot) — untouched from OpenSpiel
+  - BatchMCTS — virtual loss + leaf batching for higher throughput
+"""
 
 import math
 import time
@@ -21,6 +27,9 @@ from absl import logging
 import numpy as np
 
 import pyspiel
+
+from train.batch_mcts.node import Node
+from train.batch_mcts.config import MCTSConfig
 
 
 class Evaluator(object):
@@ -469,3 +478,267 @@ class MCTSBot(pyspiel.Bot):
         break
 
     return root
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  BatchMCTS — virtual loss + leaf batching
+# ═══════════════════════════════════════════════════════════════════════════
+
+class BatchMCTS:
+    """Batch Monte Carlo Tree Search with virtual loss.
+
+    Instead of running simulations one-by-one, this runs them in batches:
+      1. N virtual threads traverse the tree concurrently using virtual loss
+         to avoid collisions.
+      2. All leaf states are batch-evaluated through the neural network.
+      3. Results are backpropagated, removing virtual losses.
+
+    Key invariant: virtual_visits affects PUCT exploration (inflates N) but
+    NEVER pollutes Q = total_reward / explore_count.
+    """
+
+    def __init__(self, game, config=None, evaluator=None,
+                 random_state=None):
+        """Initialize BatchMCTS.
+
+        Args:
+            game: A pyspiel.Game.
+            config: MCTSConfig instance. Uses defaults if None.
+            evaluator: A BatchEvaluator-compatible object.
+            random_state: Optional numpy RandomState.
+        """
+        game_type = game.get_type()
+        if game_type.reward_model != pyspiel.GameType.RewardModel.TERMINAL:
+            raise ValueError("Game must have terminal rewards.")
+        if game_type.dynamics != pyspiel.GameType.Dynamics.SEQUENTIAL:
+            raise ValueError("Game must have sequential turns.")
+
+        self._game = game
+        self.config = config or MCTSConfig()
+        self.evaluator = evaluator
+        self.max_utility = game.max_utility()
+        self._random_state = random_state or np.random.RandomState()
+
+    # ── Public API ──────────────────────────────────────────────────────
+
+    def mcts_search(self, state):
+        """Run batch MCTS from `state`, returning the root Node."""
+        root = Node(None, state.current_player(), 1)
+        root.state = state.clone()
+
+        max_sim = self.config.max_simulations
+        batch_size = self.config.batch_size
+        num_batches = (max_sim + batch_size - 1) // batch_size
+
+        for batch_idx in range(num_batches):
+            current_batch = min(batch_size,
+                                max_sim - batch_idx * batch_size)
+
+            # ── Phase 1: Selection with virtual loss ─────────────────
+            paths = []  # (path_nodes, leaf_node, leaf_state)
+            for _ in range(current_batch):
+                path_nodes, leaf_node, leaf_state = self._select(root, state)
+                paths.append((path_nodes, leaf_node, leaf_state))
+
+            # ── Phase 2: Deduplicate & batch evaluate ─────────────────
+            # Map leaf_node -> evaluation result; order for array indexing
+            unique_nodes = []
+            node_to_idx = {}
+            for _, leaf_node, leaf_state in paths:
+                if leaf_node not in node_to_idx and not leaf_state.is_terminal():
+                    node_to_idx[leaf_node] = len(unique_nodes)
+                    unique_nodes.append(leaf_node)
+
+            values_map = {}   # leaf_node -> (value_scalar, prior_list)
+            if unique_nodes:
+                states_to_eval = [n.state for n in unique_nodes]
+                values_arr, priors_list = self.evaluator.batch_inference_raw(
+                    states_to_eval)
+                for node, value, prior in zip(unique_nodes, values_arr,
+                                              priors_list):
+                    values_map[node] = (value, prior)
+
+            # ── Phase 3: Expand + Backprop ────────────────────────────
+            expanded_this_batch = set()
+
+            for path_nodes, leaf_node, leaf_state in paths:
+                if leaf_state.is_terminal():
+                    returns = np.array(leaf_state.returns())
+                    leaf_node.outcome = returns
+                else:
+                    value, prior = values_map[leaf_node]
+                    if leaf_node not in expanded_this_batch:
+                        self._expand(leaf_node, leaf_state, prior)
+                        expanded_this_batch.add(leaf_node)
+                    # zero-sum: opposing player gets -value
+                    returns = np.array([value, -value])
+
+                self._backprop(path_nodes, returns)
+
+                # Propagate solved outcomes upward (MCTS-Solver)
+                for node in reversed(path_nodes):
+                    if self._check_solved(node):
+                        if node is root:
+                            break
+
+            # Early stop if game tree is proven from root
+            if root.outcome is not None:
+                break
+
+        return root
+
+    def step(self, state):
+        """Return the best action from the given state."""
+        return self.step_with_policy(state)[1]
+
+    def step_with_policy(self, state):
+        """Return (policy, action) for the given state."""
+        if state.is_chance_node():
+            return [(pyspiel.INVALID_ACTION, 1.0)], pyspiel.INVALID_ACTION
+
+        t1 = time.time()
+        root = self.mcts_search(state)
+        best = root.best_child()
+
+        if self.config.verbose:
+            seconds = time.time() - t1
+            print("Finished {} sims in {:.3f} secs, {:.1f} sims/s".format(
+                root.explore_count, seconds,
+                root.explore_count / seconds))
+            print("Root:")
+            print(root.to_str(state))
+            print("Children:")
+            print(root.children_str(state))
+
+        action = best.action
+        policy = [(a, (1.0 if a == action else 0.0))
+                  for a in state.legal_actions(state.current_player())]
+        return policy, action
+
+    # ── Internal methods ───────────────────────────────────────────────
+
+    def _select(self, root, init_state):
+        """Traverse from *root* using PUCT+virtual_loss to reach a leaf.
+
+        A leaf is a node with explore_count==0 (unexpanded) or a terminal
+        state. Virtual loss is applied to every child selected along the
+        way so that other threads in the same batch are steered elsewhere.
+
+        Returns (path_nodes, leaf_node, leaf_state).
+        """
+        path = [root]
+        node = root
+        state = init_state.clone()
+
+        while node.explore_count > 0 and not state.is_terminal():
+            if (state.is_chance_node()
+                    and node.children):
+                # For chance nodes, sample according to probabilities
+                outcomes = state.chance_outcomes()
+                action_list, prob_list = zip(*outcomes)
+                action = self._random_state.choice(action_list, p=prob_list)
+                node = next(c for c in node.children if c.action == action)
+                state.apply_action(action)
+                path.append(node)
+                continue
+
+            if not node.children:
+                break  # unexpanded leaf — stop here
+
+            # Dirichlet noise at root (AlphaZero) — apply ONCE
+            if node is root and not node.noise_applied and self.config.policy_epsilon:
+                epsilon = self.config.policy_epsilon
+                alpha = self.config.policy_alpha
+                noise = self._random_state.dirichlet(
+                    [alpha] * len(node.children))
+                for child, n in zip(node.children, noise):
+                    child.prior = ((1 - epsilon) * child.prior
+                                   + epsilon * n)
+                node.noise_applied = True
+
+            # Select child with virtual-loss-adjusted PUCT
+            uct_c = self.config.uct_c
+            vloss = self.config.virtual_loss
+            best_child = max(
+                node.children,
+                key=lambda c: c.puct_with_virtual(
+                    node.explore_count, uct_c, vloss))
+
+            # Apply virtual loss
+            best_child.virtual_visits += 1
+
+            state.apply_action(best_child.action)
+            node = best_child
+            path.append(node)
+
+        return path, node, state
+
+    def _expand(self, node, state, prior):
+        """Create children for *node* from the prior probabilities.
+
+        Args:
+            node: leaf Node to expand.
+            state: the game state at this node (used for action strings).
+            prior: list of (action, prob) tuples.
+        """
+        player = state.current_player()
+        # Shuffle to reduce move-generation-order bias
+        self._random_state.shuffle(prior)
+        node.children = [
+            Node(action, player, prob) for action, prob in prior
+        ]
+        # Cache the state so future traversals can clone from here
+        for child in node.children:
+            child.state = state.clone()
+            child.state.apply_action(child.action)
+
+    def _backprop(self, path, returns):
+        """Backpropagate *returns* along *path*, removing virtual losses.
+
+        Each node receives the target return for ITS OWN player (handled
+        identically to the original MCTS code). Virtual visits that were
+        added during selection are decremented.
+        """
+        while path:
+            # Find nearest decision-maker (skip chance nodes)
+            decision_idx = -1
+            while path[decision_idx].player == pyspiel.PlayerId.CHANCE:
+                decision_idx -= 1
+            target = returns[path[decision_idx].player]
+
+            node = path.pop()
+            # Remove virtual loss
+            if node.virtual_visits > 0:
+                node.virtual_visits -= 1
+            # Apply real reward
+            node.total_reward += target
+            node.explore_count += 1
+
+    def _check_solved(self, node):
+        """Attempt to prove *node* using MCTS-Solver logic.
+
+        Returns True if the node was proven (outcome set).
+        """
+        if not node.children:
+            return False
+        player = node.children[0].player
+        if player == pyspiel.PlayerId.CHANCE:
+            outcome = node.children[0].outcome
+            if outcome is not None and all(
+                    np.array_equal(c.outcome, outcome) for c in node.children):
+                node.outcome = outcome
+                return True
+        else:
+            best_child = None
+            all_solved = True
+            for child in node.children:
+                if child.outcome is None:
+                    all_solved = False
+                elif (best_child is None
+                      or child.outcome[player] > best_child.outcome[player]):
+                    best_child = child
+            if best_child is not None and (
+                    all_solved or best_child.outcome[player] == self.max_utility):
+                node.outcome = best_child.outcome
+                return True
+        return False

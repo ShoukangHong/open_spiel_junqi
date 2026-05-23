@@ -7,30 +7,38 @@ Usage: edit the MATCH config below and run.
 Strategies:
     "random"   — uniform random over legal actions
     "greedy"   — one-step lookahead: pick the move that maximizes disk count
-    "model"    — AlphaZero checkpoint, sample from policy head (no MCTS)
-    "mcts"     — AlphaZero checkpoint + MCTS with configurable simulations
+    "model"    — checkpoint policy head only (no MCTS)
+    "mcts"     — checkpoint + BatchMCTS with configurable simulations
 """
+
+import sys
+import os
+_sys_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _sys_root not in sys.path:
+    sys.path.insert(0, _sys_root)
 
 import numpy as np
 import pyspiel
-from open_spiel.python.algorithms import mcts
-from open_spiel.python.algorithms.alpha_zero import evaluator as az_eval
-from open_spiel.python.algorithms.alpha_zero import utils
+
+from train.batch_mcts.config import MCTSConfig
+from train.batch_mcts.evaluator import PyTorchEvaluator
+from train.batch_mcts.mcts import BatchMCTS
+from train.model.othello_resnet import Model, OthelloResNet
 
 # ── Match config ──────────────────────────────────────────────────────────
-CHECKPOINT_DIR = r"C:\Users\shouk\othello_train"
-CHECKPOINT_STEP = 60
-MODEL_TYPE = "resnet"
-NN_WIDTH = 24
-NN_DEPTH = 6
+CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_v2"
+CHECKPOINT_STEP = 25        # 0 = random model (skip loading)
+MODEL_WIDTH = 32
+MODEL_DEPTH = 8
 NUM_GAMES = 100
 
-BLACK = "model"      # strategy for black (player 0)
-WHITE = "random"     # strategy for white (player 1)
+BLACK = "model"    # strategy for black (player 0)
+WHITE = "random"  # strategy for white (player 1)
 
 # ── Strategy parameters ────────────────────────────────────────────────────
 MODEL_TEMPERATURE = 0.1    # temperature for "model" policy sampling (0 = argmax)
-MCTS_SIMULATIONS = 100     # playouts for "mcts" strategy
+MCTS_SIMULATIONS = 64      # playouts for "mcts" strategy
+MCTS_BATCH_SIZE = 4       # batch size for MCTS leaf evaluation
 MCTS_UCT_C = 1.41
 MCTS_VERBOSE = False
 
@@ -51,13 +59,24 @@ def _game_obj():
 def _model_obj():
     global _model
     if _model is None:
-        m = utils.api_selector("nnx").Model.build_model(
-            model_type=MODEL_TYPE, input_shape=(3, 8, 8), output_size=65,
-            nn_width=NN_WIDTH, nn_depth=NN_DEPTH,
-            weight_decay=1e-4, learning_rate=1e-3, path=CHECKPOINT_DIR,
+        game = _game_obj()
+        obs_shape = game.observation_tensor_shape()
+        num_actions = game.num_distinct_actions()
+
+        net = OthelloResNet(
+            input_channels=obs_shape[0],
+            board_size=obs_shape[1],
+            output_size=num_actions,
+            nn_width=MODEL_WIDTH,
+            nn_depth=MODEL_DEPTH,
         )
-        m.load_checkpoint(CHECKPOINT_STEP)
-        print(f"Loaded checkpoint-{CHECKPOINT_STEP}  params={m.num_trainable_variables}")
+        m = Model(net, checkpoint_path=CHECKPOINT_DIR)
+        if CHECKPOINT_STEP > 0:
+            m.load_checkpoint(CHECKPOINT_STEP)
+            print(f"Loaded checkpoint-{CHECKPOINT_STEP}  "
+                  f"params={m.num_trainable_variables}")
+        else:
+            print(f"Using random model  params={m.num_trainable_variables}")
         _model = m
     return _model
 
@@ -66,12 +85,16 @@ def _mcts():
     global _mcts_evaluator, _mcts_bot
     if _mcts_bot is None:
         game = _game_obj()
-        _mcts_evaluator = az_eval.AlphaZeroEvaluator(game, _model_obj())
-        _mcts_bot = mcts.MCTSBot(
-            game, MCTS_UCT_C, MCTS_SIMULATIONS, _mcts_evaluator,
-            solve=False, verbose=MCTS_VERBOSE, dont_return_chance_node=True,
-            child_selection_fn=mcts.SearchNode.puct_value,
+        _mcts_evaluator = PyTorchEvaluator(game, _model_obj())
+        mcts_cfg = MCTSConfig(
+            max_simulations=MCTS_SIMULATIONS,
+            batch_size=MCTS_BATCH_SIZE,
+            uct_c=MCTS_UCT_C,
+            policy_epsilon=0,   # no noise during evaluation
+            verbose=MCTS_VERBOSE,
         )
+        _mcts_bot = BatchMCTS(game, mcts_cfg, _mcts_evaluator,
+                              random_state=np.random.RandomState())
     return _mcts_bot
 
 
@@ -84,12 +107,13 @@ def _act(strategy, state):
     if strategy == "greedy":
         cur = state.current_player()
         token = "x" if cur == 0 else "o"
-        counts = [str(state.clone().apply_action(a)).count(token) for a in legal]
+        counts = [str(state.clone().apply_action(a)).count(token)
+                  for a in legal]
         return legal[int(np.argmax(counts))]
 
     if strategy == "model":
-        obs = np.asarray(state.observation_tensor(0), dtype=np.float32)
-        mask = np.asarray(state.legal_actions_mask(), dtype=np.bool_)
+        obs = np.asarray(state.observation_tensor(), dtype=np.float32)
+        mask = np.asarray(state.legal_actions_mask(), dtype=np.bool)
         _, policy = _model_obj().inference(obs, mask)
         probs = np.array([policy[a] for a in legal])
         if MODEL_TEMPERATURE > 0:
@@ -137,7 +161,7 @@ def main():
                   f"draw={score['draw']:3d}")
 
     n = NUM_GAMES
-    print(f"\n── {BLACK}: {score[BLACK]} ({score[BLACK]/n:.1%})  "
+    print(f"\n-- {BLACK}: {score[BLACK]} ({score[BLACK]/n:.1%})  "
           f"{WHITE}: {score[WHITE]} ({score[WHITE]/n:.1%})  "
           f"draw: {score['draw']} ({score['draw']/n:.1%})")
 
