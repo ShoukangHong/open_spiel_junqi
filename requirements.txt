@@ -8,4 +8,4 @@ ml-collections >= 0.1.1
 
 # PyTorch (CUDA version; install separately for correct CUDA support)
 # pip install torch --index-url https://download.pytorch.org/whl/cu121
-torch >= 2.0.0
+# torch >= 2.0.0

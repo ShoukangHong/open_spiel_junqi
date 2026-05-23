@@ -138,7 +138,7 @@ class ReplayBuffer:
 
     def __init__(self, max_size: int):
         self._max_size = max_size
-        self._obs = None       # (max_size, 3, 8, 8)
+        self._obs = None       # shape from observation_tensor()
         self._masks = None     # (max_size, 65)
         self._policies = None  # (max_size, 65)
         self._values = None    # (max_size,)
@@ -240,10 +240,13 @@ def play_game(game, mcts, config, rng, record=False):
 
         root = mcts.mcts_search(state)
 
-        # Build policy from visit counts
+        # Build solved-aware policy.
+        from train.batch_mcts.mcts import compute_solved_policy
+        policy_dict = compute_solved_policy(
+            root.children, state.current_player(), game.max_utility())
         policy = np.zeros(game.num_distinct_actions(), dtype=np.float32)
-        for c in root.children:
-            policy[c.action] = c.explore_count
+        for a, p in policy_dict.items():
+            policy[a] = p
 
         # Temperature: τ=1 before drop (exploration), τ=config.temperature
         # after drop (near-greedy).  Policy target and action selection

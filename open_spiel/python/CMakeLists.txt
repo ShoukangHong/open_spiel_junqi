@@ -45,8 +45,7 @@ set(PYTHON_BINDINGS ${PYTHON_BINDINGS}
   pybind11/games_bargaining.h
   pybind11/games_blackjack.cc
   pybind11/games_blackjack.h
-  pybind11/games_bridge.cc
-  pybind11/games_bridge.h
+  # bridge bindings added below if available
   pybind11/games_catch.cc
   pybind11/games_catch.h
   pybind11/games_chess.cc
@@ -109,6 +108,13 @@ set(PYTHON_BINDINGS ${PYTHON_BINDINGS}
   pybind11/utils.h
 )
 
+if (OPEN_SPIEL_BRIDGE_ENABLED)
+  set(PYTHON_BINDINGS ${PYTHON_BINDINGS}
+    pybind11/games_bridge.cc
+    pybind11/games_bridge.h
+  )
+endif()
+
 if (OPEN_SPIEL_BUILD_WITH_ACPC)
   set(PYTHON_BINDINGS ${PYTHON_BINDINGS}
       pybind11/games_repeated_poker.cc
@@ -158,6 +164,10 @@ set_target_properties(pyspiel PROPERTIES PREFIX "")
 if (WIN32)
   # Python does not seem able to import the module without this change.
   set_target_properties(pyspiel PROPERTIES SUFFIX ".pyd")
+endif()
+
+if (NOT OPEN_SPIEL_BRIDGE_ENABLED)
+  target_compile_definitions(pyspiel PRIVATE OPEN_SPIEL_DISABLE_BRIDGE)
 endif()
 
 
@@ -244,8 +254,7 @@ set(PYTHON_TESTS ${PYTHON_TESTS}
   algorithms/wolf_phc_test.py
   algorithms/mmd_dilated_test.py
   coalitional_games/shapley_values_test.py
-  bots/bluechip_bridge_test.py
-  bots/bluechip_bridge_uncontested_bidding_test.py
+  # bridge tests added below if available
   bots/is_mcts_test.py
   bots/uniform_random_test.py
   egt/dynamics_test.py
@@ -280,7 +289,7 @@ set(PYTHON_TESTS ${PYTHON_TESTS}
   tests/game_transforms_test.py
   tests/games_bargaining_test.py
   tests/games_blackjack_test.py
-  tests/games_bridge_test.py
+  # bridge test added below if available
   tests/games_catch_test.py
   tests/games_chess_test.py
   tests/games_connect_four_test.py
@@ -330,6 +339,15 @@ if (OPEN_SPIEL_ENABLE_JAX)
     jax/policy_gradient_jax_test.py
     coalitional_games/least_core_lagrangian_test.py
     mfg/algorithms/fictitious_play_test.py
+  )
+endif()
+
+# Add bridge tests if enabled.
+if (OPEN_SPIEL_BRIDGE_ENABLED)
+  set(PYTHON_TESTS ${PYTHON_TESTS}
+    bots/bluechip_bridge_test.py
+    bots/bluechip_bridge_uncontested_bidding_test.py
+    tests/games_bridge_test.py
   )
 endif()
 
@@ -409,7 +427,7 @@ endforeach(py_test_file)
 
 # Additional tests (running examples as tests)
 # We don't generate these automatically because we may want custom parameters.
-if (OPEN_SPIEL_ENABLE_JAX AND NOT OPEN_SPIEL_BUILDING_WHEEL)
+if (OPEN_SPIEL_ENABLE_JAX AND NOT OPEN_SPIEL_BUILDING_WHEEL AND OPEN_SPIEL_BRIDGE_ENABLED)
   add_test(NAME python_examples_bridge_supervised_learning
            COMMAND ${PYBIN}
            ${CMAKE_CURRENT_SOURCE_DIR}/examples/bridge_supervised_learning.py

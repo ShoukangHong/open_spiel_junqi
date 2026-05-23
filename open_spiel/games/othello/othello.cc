@@ -316,6 +316,11 @@ void OthelloState::ObservationTensor(Player player,
       view[{2, cell}] = 1;
     }
   }
+
+  // Channel 3: player-to-move indicator (1 for black/player 0, 0 for white/player 1).
+  for (int cell = 0; cell < kNumCells; ++cell) {
+    view[{3, cell}] = (current_player_ == 0) ? 1 : 0;
+  }
 }
 
 std::unique_ptr<State> OthelloState::Clone() const {

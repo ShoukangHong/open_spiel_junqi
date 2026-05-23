@@ -76,22 +76,20 @@ class Node:
 
     def puct_with_virtual(self, parent_explore_count: int, uct_c: float,
                           virtual_loss: float) -> float:
-        """PUCT that uses `visit_count` for exploration and penalises
-        in-flight nodes so sibling threads spread out.
+        """PUCT with virtual loss that penalises in-flight nodes.
 
-        When virtual_visits > 0 the exploration bonus shrinks (larger N),
-        and the virtual-loss penalty makes the node less attractive.
+        When virtual_visits > 0 the exploration bonus shrinks (larger N)
+        and the penalty term pushes sibling threads elsewhere.
+
+        No ``inf`` shortcut for unexplored nodes — when explore_count=0
+        and virtual_visits=0 the formula reduces to c * P * sqrt(parent_N),
+        which matches the original PUCT and breaks ties by prior.
         """
         if self.outcome is not None:
             return self.outcome[self.player]
 
-        if self.explore_count == 0 and self.virtual_visits == 0:
-            return float("inf")
-
         n = self.visit_count
-        # Exploration term uses effective visits (real + virtual).
         u = uct_c * self.prior * math.sqrt(parent_explore_count) / (n + 1)
-        # Virtual loss: penalty proportional to in-flight threads.
         vloss = -virtual_loss * self.virtual_visits / max(n, 1)
         return self.q_value + u + vloss
 

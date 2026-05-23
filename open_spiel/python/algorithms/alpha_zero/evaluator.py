@@ -16,7 +16,6 @@
 
 from typing import Any
 
-import jax
 import numpy as np
 
 from open_spiel.python.algorithms import mcts

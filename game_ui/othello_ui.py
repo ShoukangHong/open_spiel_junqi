@@ -1,27 +1,71 @@
-"""Play Othello against a trained AlphaZero model via OpenSpiel."""
+"""Play Othello against a trained PyTorch AlphaZero model via OpenSpiel."""
 
+import json
 import os
 import sys
+
 import numpy as np
 import pygame
 
-from open_spiel.python.algorithms import mcts
-from open_spiel.python.algorithms.alpha_zero import evaluator as az_evaluator
-from open_spiel.python.algorithms.alpha_zero import utils
+# Make train/ imports work from this directory
+_sys_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _sys_root not in sys.path:
+    sys.path.insert(0, _sys_root)
+
 import pyspiel
+from train.batch_mcts.config import MCTSConfig
+from train.batch_mcts.evaluator import PyTorchEvaluator
+from train.batch_mcts.mcts import BatchMCTS
+from train.model.othello_resnet import Model, OthelloResNet
 
-# ── Model config (must match training run) ──────────────────────────────
-CHECKPOINT_DIR = r"C:\Users\shouk\othello_train"
-CHECKPOINT_STEP = 30
-MODEL_TYPE = "resnet"
-NN_WIDTH = 24
-NN_DEPTH = 6
-OBS_SHAPE = (3, 8, 8)
-OUTPUT_SIZE = 65
-
-# ── MCTS config ─────────────────────────────────────────────────────────
+# ── Config — paths only, model settings read from checkpoint dir ────────
+CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_v2"
+CHECKPOINT_STEP = 5             # checkpoint step to load (must exist)
+MCTS_SIMULATIONS = 100          # MCTS search budget per move
+MCTS_BATCH_SIZE = 8             # leaf evaluation batch size
 UCT_C = 1.41
-MAX_SIMULATIONS = 100  # cranked up for actual play
+
+
+def load_model(game):
+    """Build PyTorch OthelloResNet, reading model config from train_config.json."""
+    config_path = os.path.join(CHECKPOINT_DIR, "train_config.json")
+    with open(config_path) as f:
+        train_cfg = json.load(f)
+    nn_width = train_cfg["nn_width"]
+    nn_depth = train_cfg["nn_depth"]
+    device = train_cfg.get("device", "cpu")
+
+    obs_shape = game.observation_tensor_shape()
+    num_actions = game.num_distinct_actions()
+    net = OthelloResNet(
+        input_channels=obs_shape[0],
+        board_size=obs_shape[1],
+        output_size=num_actions,
+        nn_width=nn_width,
+        nn_depth=nn_depth,
+    )
+    model = Model(net, device=device, checkpoint_path=CHECKPOINT_DIR)
+    model.load_checkpoint(CHECKPOINT_STEP)
+    print(f"Loaded checkpoint-{CHECKPOINT_STEP} from {CHECKPOINT_DIR}")
+    print(f"  nn_width={nn_width}  nn_depth={nn_depth}  device={device}")
+    print(f"  params={model.num_trainable_variables}")
+    return model
+
+
+def create_bot(game, model):
+    """Create a BatchMCTS bot backed by the PyTorch model."""
+    evaluator = PyTorchEvaluator(game, model)
+    mcts_cfg = MCTSConfig(
+        max_simulations=MCTS_SIMULATIONS,
+        batch_size=MCTS_BATCH_SIZE,
+        uct_c=UCT_C,
+        policy_epsilon=0,           # no noise during play
+        verbose=False,
+    )
+    bot = BatchMCTS(game, mcts_cfg, evaluator,
+                    random_state=np.random.RandomState())
+    return bot, evaluator
+
 
 # ── Pygame constants ────────────────────────────────────────────────────
 ROWS = COLS = 8
@@ -40,42 +84,23 @@ BLUE = (0, 0, 255)
 YELLOW = (255, 255, 0)
 
 
-def load_model():
-    """Build AlphaZero model and load the checkpoint."""
-    model = utils.api_selector("nnx").Model.build_model(
-        model_type=MODEL_TYPE,
-        input_shape=OBS_SHAPE,
-        output_size=OUTPUT_SIZE,
-        nn_width=NN_WIDTH,
-        nn_depth=NN_DEPTH,
-        weight_decay=1e-4,
-        learning_rate=1e-3,
-        path=CHECKPOINT_DIR,
-    )
-    model.load_checkpoint(CHECKPOINT_STEP)
-    print(f"Loaded checkpoint-{CHECKPOINT_STEP} from {CHECKPOINT_DIR}")
-    return model
-
-
-def create_bot(game, model):
-    """Create an MCTS bot backed by the AlphaZero model."""
-    evaluator = az_evaluator.AlphaZeroEvaluator(game, model)
-    bot = mcts.MCTSBot(
-        game,
-        UCT_C,
-        MAX_SIMULATIONS,
-        evaluator,
-        solve=False,
-        verbose=False,
-        dont_return_chance_node=True,
-    )
-    return bot, evaluator
-
-
 def obs_to_board(obs):
-    """Convert [3, 8, 8] observation tensor to flat array: 1=black, -1=white, 0=empty."""
-    obs = np.reshape(obs, (3, 8, 8))
+    """Convert [4, 8, 8] observation tensor to flat array: 1=black, -1=white, 0=empty."""
+    obs = np.reshape(obs, (4, 8, 8))
     return (obs[1] - obs[2]).flatten().astype(int)
+
+def print_state(state):
+  """Print 4-channel observation tensor: 4 grids side by side."""
+  obs = np.reshape(state.observation_tensor(0), (4, 8, 8))
+  labels = ["empty", "black", "white", "turn"]
+  for row in range(8):
+      parts = []
+      for ch in range(4):
+          parts.append(" ".join(
+              "." if obs[ch, row, col] == 0 else str(int(obs[ch, row, col]))
+              for col in range(8)))
+      print("  |  ".join(parts))
+  print()
 
 
 def get_piece_counts(board):
@@ -115,7 +140,7 @@ def draw_board(screen, board, legal_actions=None, hints=None):
             cy = row * SQ_SIZE + SQ_SIZE // 2
             pygame.draw.circle(screen, DARK_GREEN, (cx, cy), 8)
 
-    # Hint overlay (visit counts & win rate from MCTS)
+    # Hint overlay (visit counts from MCTS)
     if hints:
         actions, visits, values = hints
         max_visit = max(visits) if visits else 1
@@ -228,10 +253,9 @@ def get_hints(bot, state):
 
 
 def main():
-    print("Loading model...")
-    model = load_model()
-
     game = pyspiel.load_game("othello")
+    print("Loading model...")
+    model = load_model(game)
     bot, evaluator = create_bot(game, model)
 
     pygame.init()
@@ -269,7 +293,8 @@ def main():
                             action = row * COLS + col
                             if action in legal:
                                 state.apply_action(action)
-                                bot.inform_action(state, current, action)
+                                print_state(state)
+                                evaluator.clear_cache()
                                 showing_hints = False
                                 hints = None
                                 message = ""
@@ -300,6 +325,8 @@ def main():
 
                 action = bot.step(state)
                 state.apply_action(action)
+                print_state(state)
+                evaluator.clear_cache()
                 message = f"AI played: {action}"
                 showing_hints = False
                 hints = None

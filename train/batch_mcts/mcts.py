@@ -32,6 +32,64 @@ from train.batch_mcts.node import Node
 from train.batch_mcts.config import MCTSConfig
 
 
+def compute_solved_policy(children, player, max_utility, alpha=2.0):
+    """Solved-aware policy from root children.
+
+    Three cases:
+      1. All children proven → best-outcome children split evenly.
+      2. Some non-loss proven → reward/penalty model:
+         weight = exp(α × diff × √N)  where diff = eff_i - best_val.
+         eff_i = outcome for proven, Q for unproven.
+      3. Only loss-proven or none → visit-proportional, loss proven zeroed.
+
+    Returns: dict {action: probability}.
+    """
+    # Case 1: fully solved
+    all_solved = all(c.outcome is not None for c in children)
+    non_loss = [c for c in children
+                if c.outcome is not None
+                and c.outcome[player] > -max_utility]
+
+    if all_solved:
+        best_val = max(c.outcome[player] for c in children)
+        best_actions = {c.action for c in children
+                        if c.outcome[player] == best_val}
+        return {c.action: (1.0 / len(best_actions)
+                           if c.action in best_actions else 0.0)
+                for c in children}
+
+    # Case 2: some non-loss proven → reward/penalty model
+    if non_loss:
+        eff = {}
+        for c in children:
+            if c.outcome is not None:
+                eff[c.action] = c.outcome[player]
+            elif c.explore_count > 0:
+                eff[c.action] = c.q_value
+        best_val = max(eff.values()) if eff else 0.0
+
+        weights = {}
+        for c in children:
+            c_eff = eff.get(c.action, 0.0)
+            diff = c_eff - best_val
+            confidence = math.sqrt(max(c.explore_count, 1))
+            weights[c.action] = math.exp(alpha * diff * confidence)
+        total_w = sum(weights.values())
+        return {a: w / max(total_w, 1e-9) for a, w in weights.items()}
+
+    # Case 3: only loss-proven or none
+    loss_actions = {c.action for c in children
+                    if c.outcome is not None
+                    and c.outcome[player] < 0}
+    total_visits = sum(c.explore_count for c in children
+                       if c.action not in loss_actions)
+    if total_visits > 0:
+        return {c.action: (c.explore_count / total_visits
+                           if c.action not in loss_actions else 0.0)
+                for c in children}
+    return {c.action: 1.0 / len(children) for c in children}
+
+
 class Evaluator(object):
   """Abstract class representing an evaluation function for a game.
 
@@ -592,7 +650,11 @@ class BatchMCTS:
         return self.step_with_policy(state)[1]
 
     def step_with_policy(self, state):
-        """Return (policy, action) for the given state."""
+        """Return (policy, action) for the given state.
+
+        Policy is visit-count proportional unless the solver has proven
+        winning children, in which case all mass goes to those children.
+        """
         if state.is_chance_node():
             return [(pyspiel.INVALID_ACTION, 1.0)], pyspiel.INVALID_ACTION
 
@@ -610,9 +672,14 @@ class BatchMCTS:
             print("Children:")
             print(root.children_str(state))
 
-        action = best.action
-        policy = [(a, (1.0 if a == action else 0.0))
+        # Solved-aware policy.
+        player = state.current_player()
+        policy_dict = compute_solved_policy(
+            root.children, player, self.max_utility)
+        policy = [(a, policy_dict.get(a, 0.0))
                   for a in state.legal_actions(state.current_player())]
+
+        action = best.action
         return policy, action
 
     # ── Internal methods ───────────────────────────────────────────────
@@ -656,11 +723,23 @@ class BatchMCTS:
                                    + epsilon * n)
                 node.noise_applied = True
 
-            # Select child with virtual-loss-adjusted PUCT
+            # Select child with virtual-loss-adjusted PUCT.
+            # Prune children proven worse than another sibling.
             uct_c = self.config.uct_c
             vloss = self.config.virtual_loss
+            candidates = node.children
+            if self.config.solve:
+                player = node.children[0].player
+                best_proven = -float("inf")
+                for c in node.children:
+                    if c.outcome is not None and c.outcome[player] > best_proven:
+                        best_proven = c.outcome[player]
+                if best_proven > -float("inf"):
+                    candidates = [c for c in node.children
+                                  if c.outcome is None
+                                  or c.outcome[player] >= best_proven]
             best_child = max(
-                node.children,
+                candidates,
                 key=lambda c: c.puct_with_virtual(
                     node.explore_count, uct_c, vloss))
 
@@ -698,15 +777,17 @@ class BatchMCTS:
         Each node receives the target return for ITS OWN player (handled
         identically to the original MCTS code). Virtual visits that were
         added during selection are decremented.
+
+        Does NOT mutate *path* — the caller needs it for solver.
         """
-        while path:
+        for i in range(len(path) - 1, -1, -1):
+            node = path[i]
             # Find nearest decision-maker (skip chance nodes)
-            decision_idx = -1
+            decision_idx = i
             while path[decision_idx].player == pyspiel.PlayerId.CHANCE:
                 decision_idx -= 1
             target = returns[path[decision_idx].player]
 
-            node = path.pop()
             # Remove virtual loss
             if node.virtual_visits > 0:
                 node.virtual_visits -= 1

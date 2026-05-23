@@ -1,6 +1,6 @@
 """PyTorch AlphaZero-style ResNet for Othello.
 
-Input:  observation tensor  (batch, 3, 8, 8)
+Input:  observation tensor  (batch, 4, 8, 8)
 Output: policy logits      (batch, 65) — 64 squares + pass
         value               (batch,)   — tanh → [-1, 1]
 """
@@ -78,14 +78,14 @@ class OthelloResNet(nn.Module):
     """AlphaZero ResNet for Othello.
 
     Args:
-        input_channels: observation tensor channels (3 for Othello).
+        input_channels: observation tensor channels (4 for Othello: empty, black, white, player_to_move).
         board_size: spatial size (8 for Othello).
         output_size: number of distinct actions (65 for Othello).
         nn_width: number of filters in conv layers.
         nn_depth: number of residual blocks.
     """
 
-    def __init__(self, input_channels: int = 3, board_size: int = 8,
+    def __init__(self, input_channels: int = 4, board_size: int = 8,
                  output_size: int = 65, nn_width: int = 32, nn_depth: int = 5):
         super().__init__()
         self.input_channels = input_channels
@@ -185,7 +185,7 @@ class OthelloResNet(nn.Module):
         """Batch inference.
 
         Args:
-            observations: (batch, ...) — flat (batch, 192) or shaped
+            observations: (batch, ...) — flat (batch, 256) or shaped
                 (batch, input_channels, board_size, board_size).
             legals_masks: (batch, output_size).
 
@@ -337,3 +337,5 @@ class Model:
             ckpt = torch.load(filepath, map_location=self._device, weights_only=False)
             self._model.load_state_dict(ckpt["model_state_dict"])
             self._optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        else:
+            raise FileNotFoundError(f"Checkpoint not found: {filepath}")

@@ -830,7 +830,9 @@ PYBIND11_MODULE(pyspiel, m) {
   init_pyspiel_games_backgammon(m);
   init_pyspiel_games_bargaining(m);
   init_pyspiel_games_blackjack(m);
+#ifndef OPEN_SPIEL_DISABLE_BRIDGE
   init_pyspiel_games_bridge(m);
+#endif
   init_pyspiel_games_catch(m);
   init_pyspiel_games_chess(m);
   init_pyspiel_games_crazyhouse(m);

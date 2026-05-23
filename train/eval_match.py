@@ -11,6 +11,7 @@ Strategies:
     "mcts"     — checkpoint + BatchMCTS with configurable simulations
 """
 
+import json
 import sys
 import os
 _sys_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -25,18 +26,16 @@ from train.batch_mcts.evaluator import PyTorchEvaluator
 from train.batch_mcts.mcts import BatchMCTS
 from train.model.othello_resnet import Model, OthelloResNet
 
-# ── Match config ──────────────────────────────────────────────────────────
+# ── Match config — model settings read from checkpoint dir ──────────────
 CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_v2"
-CHECKPOINT_STEP = 10        # 0 = random model (skip loading)
-MODEL_WIDTH = 32
-MODEL_DEPTH = 8
+CHECKPOINT_STEP = 20         # 0 = random model (skip loading)
 NUM_GAMES = 100
 
 BLACK = "model"    # strategy for black (player 0)
-WHITE = "mcts"  # strategy for white (player 1)
+WHITE = "random"  # strategy for white (player 1)
 
 # ── Strategy parameters ────────────────────────────────────────────────────
-MODEL_TEMPERATURE = 0.1    # temperature for "model" policy sampling (0 = argmax)
+MODEL_TEMPERATURE = 0.03    # temperature for "model" policy sampling (0 = argmax)
 MCTS_SIMULATIONS = 64      # playouts for "mcts" strategy
 MCTS_BATCH_SIZE = 4       # batch size for MCTS leaf evaluation
 MCTS_UCT_C = 1.41
@@ -60,6 +59,13 @@ def _model_obj():
     global _model
     if _model is None:
         game = _game_obj()
+        config_path = os.path.join(CHECKPOINT_DIR, "train_config.json")
+        with open(config_path) as f:
+            train_cfg = json.load(f)
+        nn_width = train_cfg["nn_width"]
+        nn_depth = train_cfg["nn_depth"]
+        device = train_cfg.get("device", "cpu")
+
         obs_shape = game.observation_tensor_shape()
         num_actions = game.num_distinct_actions()
 
@@ -67,16 +73,18 @@ def _model_obj():
             input_channels=obs_shape[0],
             board_size=obs_shape[1],
             output_size=num_actions,
-            nn_width=MODEL_WIDTH,
-            nn_depth=MODEL_DEPTH,
+            nn_width=nn_width,
+            nn_depth=nn_depth,
         )
-        m = Model(net, checkpoint_path=CHECKPOINT_DIR)
+        m = Model(net, device=device, checkpoint_path=CHECKPOINT_DIR)
         if CHECKPOINT_STEP > 0:
             m.load_checkpoint(CHECKPOINT_STEP)
             print(f"Loaded checkpoint-{CHECKPOINT_STEP}  "
+                  f"nn_width={nn_width}  nn_depth={nn_depth}  device={device}  "
                   f"params={m.num_trainable_variables}")
         else:
-            print(f"Using random model  params={m.num_trainable_variables}")
+            print(f"Using random model  nn_width={nn_width}  nn_depth={nn_depth}"
+                  f"  params={m.num_trainable_variables}")
         _model = m
     return _model
 
