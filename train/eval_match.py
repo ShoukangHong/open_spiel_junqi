@@ -27,13 +27,13 @@ from train.model.othello_resnet import Model, OthelloResNet
 
 # ── Match config ──────────────────────────────────────────────────────────
 CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_v2"
-CHECKPOINT_STEP = 25        # 0 = random model (skip loading)
+CHECKPOINT_STEP = 10        # 0 = random model (skip loading)
 MODEL_WIDTH = 32
 MODEL_DEPTH = 8
 NUM_GAMES = 100
 
 BLACK = "model"    # strategy for black (player 0)
-WHITE = "random"  # strategy for white (player 1)
+WHITE = "mcts"  # strategy for white (player 1)
 
 # ── Strategy parameters ────────────────────────────────────────────────────
 MODEL_TEMPERATURE = 0.1    # temperature for "model" policy sampling (0 = argmax)
