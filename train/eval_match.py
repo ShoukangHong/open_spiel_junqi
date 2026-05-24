@@ -149,8 +149,10 @@ def main():
     _load_if_needed(cfg1)
 
     s0, s1 = cfg0["strategy"], cfg1["strategy"]
-    name0 = f"{s0}" if s0 in ("random","greedy") else f"{s0}({cfg0.get('mcts_simulations',0)}sim)"
-    name1 = f"{s1}" if s1 in ("random","greedy") else f"{s1}({cfg1.get('mcts_simulations',0)}sim)"
+    st0 = cfg0.get("checkpoint_step", 0)
+    st1 = cfg1.get("checkpoint_step", 0)
+    name0 = f"{s0}" if s0 in ("random","greedy") else f"{s0}(step{st0},{cfg0.get('mcts_simulations',0)}sim)"
+    name1 = f"{s1}" if s1 in ("random","greedy") else f"{s1}(step{st1},{cfg1.get('mcts_simulations',0)}sim)"
     print(f"\nMatch: {name0} (black) vs {name1} (white), {NUM_GAMES} games\n")
 
     score = {name0: 0, name1: 0, "draw": 0}
