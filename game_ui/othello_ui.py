@@ -20,8 +20,8 @@ from train.model.othello_resnet import Model, OthelloResNet
 
 # ── Config — paths only, model settings read from checkpoint dir ────────
 CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_v2"
-CHECKPOINT_STEP = 5             # checkpoint step to load (must exist)
-MCTS_SIMULATIONS = 100          # MCTS search budget per move
+CHECKPOINT_STEP = 40             # checkpoint step to load (must exist)
+MCTS_SIMULATIONS = 1280          # MCTS search budget per move
 MCTS_BATCH_SIZE = 8             # leaf evaluation batch size
 UCT_C = 1.41
 
@@ -71,7 +71,7 @@ def create_bot(game, model):
 ROWS = COLS = 8
 SQ_SIZE = 80
 WIDTH = HEIGHT = COLS * SQ_SIZE
-PANEL_HEIGHT = 200
+PANEL_HEIGHT = 120
 SCREEN_HEIGHT = HEIGHT + PANEL_HEIGHT
 
 GREEN = (0, 128, 0)
@@ -91,17 +91,76 @@ def obs_to_board(obs):
 
 def print_state(state):
   """Print 4-channel observation tensor: 4 grids side by side."""
-  obs = np.reshape(state.observation_tensor(0), (4, 8, 8))
-  labels = ["empty", "black", "white", "turn"]
-  for row in range(8):
-      parts = []
-      for ch in range(4):
-          parts.append(" ".join(
-              "." if obs[ch, row, col] == 0 else str(int(obs[ch, row, col]))
-              for col in range(8)))
-      print("  |  ".join(parts))
-  print()
+  print(state)
+  # obs = np.reshape(state.observation_tensor(0), (4, 8, 8))
+  # for row in range(8):
+  #     parts = []
+  #     for ch in range(4):
+  #         parts.append(" ".join(
+  #             "." if obs[ch, row, col] == 0 else str(int(obs[ch, row, col]))
+  #             for col in range(8)))
+  #     print("  |  ".join(parts))
+  # print()
 
+def print_mcts_info(root, state, evaluator=None):
+    """Print MCTS root policy, raw NN prior, and value."""
+    player = state.current_player()
+    player_name = "BLACK(p0)" if player == 0 else "WHITE(p1)"
+    print(f"  ── MCTS  {player_name} ──")
+
+    # Value — proven outcome if solved
+    if root.outcome is not None:
+        root_val = root.outcome[player]
+    else:
+        root_val = root.total_reward / max(root.explore_count, 1)
+    print(f"  value = {root_val:+.4f}    sims = {root.explore_count}"
+          f"{'  (solved)' if root.outcome is not None else ''}")
+
+    # Build combined: NN raw + MCTS side by side
+    nn_value = None
+    nn_policy = None
+    if evaluator is not None:
+        nn_value, nn_policy = evaluator._inference(state)
+        print(f"  ── NN raw value={nn_value:+.4f}    MCTS value={root_val:+.4f}    sims={root.explore_count} ──")
+
+    # Gather all legal actions with both policies
+    legal = state.legal_actions()
+    rows = []
+    for a in legal:
+        mcts_p = 0.0
+        mcts_v = 0.0
+        mcts_n = 0
+        mcts_solved = " "
+        for c in root.children:
+            if c.action == a:
+                mcts_n = c.explore_count
+                mcts_v = c.outcome[player] if c.outcome is not None else c.q_value
+                mcts_solved = "✓" if c.outcome is not None else " "
+                break
+        nn_p = float(nn_policy[a]) if nn_policy is not None else 0.0
+        if a >= 64:
+            coord = "pass"
+        else:
+            row, col = a // COLS, a % COLS
+            coord = f"({row},{col})"
+        rows.append((a, coord, nn_p, mcts_n, mcts_v, mcts_solved))
+
+    # Sort by MCTS visits, fallback to NN prior
+    rows.sort(key=lambda r: (-r[3], -r[2]))
+
+    total_visits = sum(c.explore_count for c in root.children)
+    # Fixed-width columns: move(action) | NN prob + bar | MCTS prob + bar | V | N
+    BAR_W = 30
+    HDR = f"  {'move':>8s}  {'NN':>5s}  {'':<{BAR_W}s}  {'MCTS':>5s}  {'':<{BAR_W}s}  {'V':>7s}  {'N':>4s}"
+    print(HDR)
+    print("  " + "-" * (len(HDR) - 2))
+    for a, coord, nn_p, mcts_n, mcts_v, mcts_solved in rows[:12]:
+        nn_bar = "█" * int(nn_p * BAR_W) if nn_p > 0.001 else ""
+        mcts_p = mcts_n / max(total_visits, 1)
+        mcts_bar = "█" * int(mcts_p * BAR_W) if mcts_n > 0 else ""
+        print(f"  {coord:>6s} {a:>3d}  {nn_p:.3f} {nn_bar:<{BAR_W}s}  "
+              f"{mcts_p:.3f} {mcts_bar:<{BAR_W}s} {mcts_v:+.3f}{mcts_solved} {mcts_n:>4d}")
+    print()
 
 def get_piece_counts(board):
     black = int((board == 1).sum())
@@ -140,56 +199,84 @@ def draw_board(screen, board, legal_actions=None, hints=None):
             cy = row * SQ_SIZE + SQ_SIZE // 2
             pygame.draw.circle(screen, DARK_GREEN, (cx, cy), 8)
 
-    # Hint overlay (visit counts from MCTS)
-    if hints:
-        actions, visits, values = hints
-        max_visit = max(visits) if visits else 1
-        font = pygame.font.Font(None, 20)
-        for a, vst, val in zip(actions, visits, values):
-            if a >= 64:
-                continue
-            row, col = a // COLS, a % COLS
-            cx = col * SQ_SIZE + SQ_SIZE // 2
-            cy = row * SQ_SIZE + SQ_SIZE // 2
-            ratio = vst / max_visit
-            color = RED if ratio > 0.8 else (BLUE if ratio > 0.4 else GRAY)
-            txt = font.render(str(vst), True, color)
-            screen.blit(txt, (cx - txt.get_width() // 2, cy - txt.get_height() // 2))
 
-
-def draw_panel(screen, black_count, white_count, current_player, message=""):
+def draw_panel(screen, black_count, white_count, current_player, message="",
+               value=None, draw_hints=False):
     """Draw info panel below the board."""
+    small_font = pygame.font.Font(None, 26)
     font = pygame.font.Font(None, 30)
-    y = HEIGHT + 10
+    y = HEIGHT + 8
 
     turn = "Black" if current_player == 0 else "White"
     texts = [
-        f"Black: {black_count}    White: {white_count}",
-        f"Turn: {turn}",
-        message,
-        f"H: hint   R: restart   Q: quit",
+        f"Black: {black_count}    White: {white_count}    Turn: {turn}",
     ]
-    for t in texts:
-        surf = font.render(t, True, BLACK)
+    if value is not None:
+        win_pct = (1 + value) * 50
+        texts.append(f"Value: {value:+.3f}  (win rate: {win_pct:.1f}%)")
+    texts.append(message)
+    texts.append("H: hint   F: freeze   R: restart   Q: quit")
+
+    for i, t in enumerate(texts):
+        surf = small_font.render(t, True, BLACK)
         screen.blit(surf, (10, y))
-        y += 35
+        y += 26
+
+
+def draw_hints_on_board(screen, hints, board_size=COLS):
+    """Overlay MCTS visit counts and Q values on the board squares."""
+    if not hints:
+        return
+    actions, visits, q_values = hints
+    if not visits or not q_values:
+        return
+    max_visit = max(visits)
+    best_q = max(q_values)
+    font_q = pygame.font.Font(None, 30)
+    font_v = pygame.font.Font(None, 30)
+
+    for a, vst, q in zip(actions, visits, q_values):
+        if a >= 64:
+            continue
+        row, col = a // board_size, a % board_size
+        cx = col * SQ_SIZE + SQ_SIZE // 2
+        cy = row * SQ_SIZE + SQ_SIZE // 2
+
+        # Visit count — red if best, otherwise blue/dark
+        if vst == max_visit and max_visit > 1:
+            v_color = RED
+        else:
+            v_color = BLUE if vst > max_visit * 0.3 else GRAY
+        v_txt = font_v.render(str(vst), True, v_color)
+        screen.blit(v_txt, (cx - v_txt.get_width() // 2, cy + SQ_SIZE // 2 - 18))
+
+        # Q value — blue if best, else dark
+        if q == best_q:
+            q_color = BLUE
+        else:
+            q_color = BLACK
+        q_txt = font_q.render(f"{q:+.2f}", True, q_color)
+        screen.blit(q_txt, (cx - q_txt.get_width() // 2, cy - SQ_SIZE // 2 + 5))
 
 
 def choose_color(screen):
-    """Menu: pick black or white."""
+    """Menu: pick black/white/HvH.  Returns 0, 1, or -1 for HvH."""
     font = pygame.font.Font(None, 40)
-    btn_black = pygame.Rect(150, 250, 300, 60)
-    btn_white = pygame.Rect(150, 350, 300, 60)
+    btn_black = pygame.Rect(150, 200, 300, 60)
+    btn_white = pygame.Rect(150, 300, 300, 60)
+    btn_hvh   = pygame.Rect(150, 400, 300, 60)
 
     while True:
         screen.fill(GREEN)
         title = font.render("Play as:", True, BLACK)
-        screen.blit(title, (250, 150))
+        screen.blit(title, (250, 110))
 
         pygame.draw.rect(screen, GRAY, btn_black)
         pygame.draw.rect(screen, GRAY, btn_white)
-        screen.blit(font.render("Black (first)", True, WHITE), (210, 262))
-        screen.blit(font.render("White (second)", True, WHITE), (210, 362))
+        pygame.draw.rect(screen, GRAY, btn_hvh)
+        screen.blit(font.render("Black (first)", True, WHITE), (210, 212))
+        screen.blit(font.render("White (second)", True, WHITE), (210, 312))
+        screen.blit(font.render("Human vs Human", True, WHITE), (210, 412))
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -199,6 +286,8 @@ def choose_color(screen):
                     return 0
                 if btn_white.collidepoint(event.pos):
                     return 1
+                if btn_hvh.collidepoint(event.pos):
+                    return -1
         pygame.display.flip()
 
 
@@ -239,17 +328,20 @@ def game_over_screen(screen, board, black_count, white_count):
         pygame.display.flip()
 
 
-def get_hints(bot, state):
-    """Run MCTS and return (actions, visits, values) for each legal child."""
-    root = bot.mcts_search(state)
+def get_hints_from_root(root):
+    """Extract (actions, visits, q_values) from an MCTS root node.
+    Uses proven outcome when available, else visit-based Q."""
     actions = []
     visits = []
-    values = []
+    q_values = []
     for c in root.children:
         actions.append(c.action)
         visits.append(c.explore_count)
-        values.append(c.total_reward / max(1, c.explore_count))
-    return actions, visits, values
+        v = c.q_value
+        if c.outcome is not None:
+            v = c.outcome[c.player]
+        q_values.append(v)
+    return actions, visits, q_values
 
 
 def main():
@@ -270,18 +362,31 @@ def main():
 
         state = game.new_initial_state()
         showing_hints = False
+        freeze_hint = False
         hints = None
+        ai_value = None
+        hint_root = None
+        hint_state = None
         message = ""
+        restart_game = False
+        hvh = (human_color == -1)
 
-        while not state.is_terminal():
+        while not state.is_terminal() and not restart_game:
             obs = state.observation_tensor(0)
             board = obs_to_board(obs)
             black_c, white_c = get_piece_counts(board)
             current = state.current_player()
 
-            if current == human_color:
-                # Human turn
+            if hvh or current == human_color:
+                # Human turn — auto-pass if only pass is available
                 legal = state.legal_actions()
+                if legal == [64]:
+                    state.apply_action(64)
+                    print_state(state)
+                    evaluator.clear_cache()
+                    message = "Human auto-pass"
+                    continue
+
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         pygame.quit()
@@ -295,8 +400,9 @@ def main():
                                 state.apply_action(action)
                                 print_state(state)
                                 evaluator.clear_cache()
-                                showing_hints = False
                                 hints = None
+                                ai_value = None
+                                hint_root = None
                                 message = ""
                                 break
                             else:
@@ -304,54 +410,97 @@ def main():
                     if event.type == pygame.KEYDOWN:
                         if event.key == pygame.K_h:
                             showing_hints = not showing_hints
-                            if showing_hints:
-                                hints = get_hints(bot, state)
-                            else:
+                            freeze_hint = False
+                            if not showing_hints:
                                 hints = None
+                                ai_value = None
+                                hint_root = None
+                            else:
+                                hint_root = None  # force fresh search
+                        elif event.key == pygame.K_f and showing_hints and hint_root is not None:
+                            freeze_hint = not freeze_hint
+                            if freeze_hint:
+                                print_mcts_info(hint_root, state, evaluator)
+                                message = "Hint FROZEN"
+                            else:
+                                message = ""
                         elif event.key == pygame.K_r:
-                            break  # restart
+                            restart_game = True
                         elif event.key == pygame.K_q:
                             pygame.quit()
                             sys.exit()
 
-                if showing_hints and not state.is_terminal():
-                    hints = get_hints(bot, state)
+                if showing_hints and not state.is_terminal() and not freeze_hint:
+                    # Persistent incremental search — tree accumulates sims.
+                    if hint_root is None or hint_state != str(state):
+                        hint_cfg = MCTSConfig(
+                            max_simulations=64, batch_size=MCTS_BATCH_SIZE,
+                            uct_c=UCT_C, policy_epsilon=0, verbose=False)
+                        hint_mcts = BatchMCTS(game, hint_cfg, evaluator,
+                                              random_state=np.random.RandomState())
+                        hint_root = hint_mcts.mcts_search(state)
+                        hint_state = str(state)
+                    else:
+                        hint_mcts.config.max_simulations = 64
+                        hint_root = hint_mcts.mcts_search(state, root=hint_root)
+                    hints = get_hints_from_root(hint_root)
+                    if hint_root.outcome is not None:
+                        ai_value = hint_root.outcome[current]
+                    else:
+                        ai_value = hint_root.total_reward / max(hint_root.explore_count, 1)
             else:
                 # AI turn
                 message = "AI thinking..."
                 draw_board(screen, board, state.legal_actions(), hints)
-                draw_panel(screen, black_c, white_c, current, message)
+                draw_hints_on_board(screen, hints)
+                draw_panel(screen, black_c, white_c, current, message,
+                           value=ai_value)
                 pygame.display.flip()
 
-                action = bot.step(state)
-                state.apply_action(action)
+                # Run MCTS and display info
+                root = bot.mcts_search(state)
                 print_state(state)
+                print_mcts_info(root, state, evaluator)
+
+                action = root.best_child().action
+                state.apply_action(action)
                 evaluator.clear_cache()
-                message = f"AI played: {action}"
-                showing_hints = False
-                hints = None
+                # Only auto-show hints if toggle is on
+                if showing_hints:
+                    hints = get_hints_from_root(root)
+                    if root.outcome is not None:
+                        ai_value = root.outcome[current]
+                    else:
+                        ai_value = root.total_reward / max(root.explore_count, 1)
+                else:
+                    hints = None
+                    ai_value = None
+                message = f"AI played: {state.action_to_string(current, action)}"
 
             # Render
             if not state.is_terminal():
                 obs = state.observation_tensor(0)
                 board = obs_to_board(obs)
                 black_c, white_c = get_piece_counts(board)
-                legal = state.legal_actions() if state.current_player() == human_color else None
+                legal = state.legal_actions()
                 draw_board(screen, board, legal, hints)
-                draw_panel(screen, black_c, white_c, state.current_player(), message)
+                draw_hints_on_board(screen, hints)
+                draw_panel(screen, black_c, white_c, state.current_player(), message,
+                           value=ai_value)
 
             clock.tick(30)
             pygame.display.flip()
 
-        # Game over
-        obs = state.observation_tensor(0)
-        board = obs_to_board(obs)
-        black_c, white_c = get_piece_counts(board)
-        draw_board(screen, board)
-        pygame.display.flip()
+        # Game over (skip if restart was requested mid-game)
+        if not restart_game:
+            obs = state.observation_tensor(0)
+            board = obs_to_board(obs)
+            black_c, white_c = get_piece_counts(board)
+            draw_board(screen, board)
+            pygame.display.flip()
 
-        if not game_over_screen(screen, board, black_c, white_c):
-            break
+            if not game_over_screen(screen, board, black_c, white_c):
+                break
 
     pygame.quit()
 

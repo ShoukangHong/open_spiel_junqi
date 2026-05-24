@@ -200,12 +200,23 @@ class OthelloResNet(nn.Module):
             mask_t = torch.from_numpy(
                 np.asarray(legals_masks, dtype=np.bool)).to(self.device)
 
+            # NaN/Inf guard: corrupted weights produce NaN logits,
+            # which cause CUDA unknown error in downstream ops.
+            if not torch.isfinite(obs_t).all():
+                raise RuntimeError("batch_inference: obs_t contains NaN/Inf")
+
             # pyspiel returns flat observations — reshape to (C, H, W)
             if obs_t.dim() == 2:
                 obs_t = obs_t.reshape(obs_t.shape[0], self.input_channels,
                                       self.board_size, self.board_size)
 
             policy_logits, value = self.forward(obs_t)
+
+            if not torch.isfinite(policy_logits).all():
+                raise RuntimeError("batch_inference: policy_logits contains NaN/Inf (model weights likely corrupted)")
+            if not torch.isfinite(value).all():
+                raise RuntimeError("batch_inference: value contains NaN/Inf (model weights likely corrupted)")
+
             policy_logits = torch.where(mask_t, policy_logits,
                                         torch.full_like(policy_logits, torch.finfo(policy_logits.dtype).min))
             policies = F.softmax(policy_logits, dim=-1)
@@ -321,12 +332,22 @@ class Model:
         if not self._checkpoint_path:
             return ""
         os.makedirs(self._checkpoint_path, exist_ok=True)
+        # Check for NaN/Inf before saving — prevents persisting corrupted weights.
+        for name, p in self._model.named_parameters():
+            if not torch.isfinite(p).all():
+                raise RuntimeError(
+                    f"save_checkpoint: parameter '{name}' contains NaN/Inf "
+                    f"at step {step} — training diverged")
         filepath = os.path.join(self._checkpoint_path, f"checkpoint-{step}.pt")
+        # Write to temp then rename atomically so concurrent readers never
+        # see a half-written file (which can corrupt CUDA context on load).
+        tmp = filepath + ".tmp"
         torch.save({
             "step": step,
             "model_state_dict": self._model.state_dict(),
             "optimizer_state_dict": self._optimizer.state_dict(),
-        }, filepath)
+        }, tmp)
+        os.replace(tmp, filepath)  # atomic on Windows
         return filepath
 
     def load_checkpoint(self, step: int) -> None:

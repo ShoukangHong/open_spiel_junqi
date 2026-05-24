@@ -579,10 +579,15 @@ class BatchMCTS:
 
     # ── Public API ──────────────────────────────────────────────────────
 
-    def mcts_search(self, state):
-        """Run batch MCTS from `state`, returning the root Node."""
-        root = Node(None, state.current_player(), 1)
-        root.state = state.clone()
+    def mcts_search(self, state, root=None):
+        """Run batch MCTS from `state`, returning the root Node.
+
+        If *root* is given, simulations are ADDED to the existing tree
+        (persistent search).  Otherwise a fresh tree is created.
+        """
+        if root is None:
+            root = Node(None, state.current_player(), 1)
+            root.state = state.clone()
 
         max_sim = self.config.max_simulations
         batch_size = self.config.batch_size
@@ -735,9 +740,16 @@ class BatchMCTS:
                     if c.outcome is not None and c.outcome[player] > best_proven:
                         best_proven = c.outcome[player]
                 if best_proven > -float("inf"):
+                    # Exclude proven children — their value is settled.
+                    # If a win is already proven, exploring other children
+                    # is harmless (solve-aware policy handles the final
+                    # output) and more informative.
                     candidates = [c for c in node.children
-                                  if c.outcome is None
-                                  or c.outcome[player] >= best_proven]
+                                  if c.outcome is None]
+                    if not candidates:
+                        candidates = [c for c in node.children
+                                      if c.outcome is not None
+                                      and c.outcome[player] >= best_proven]
             best_child = max(
                 candidates,
                 key=lambda c: c.puct_with_virtual(
