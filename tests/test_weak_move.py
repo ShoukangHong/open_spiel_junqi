@@ -123,19 +123,22 @@ def _mk_weak_test(game_str, diff_val, threshold, weak_thresh):
 def test_weak_branches():
     print("Test C: weak-move three branches ...")
 
-    a, tag, wc, rs, ra, wa, mv = _mk_weak_test("tic_tac_toe", 1.0, 0.8, 0.4)
+    # C1: nn_val=0.8 → prob=90%. mcts≈0 → prob=50%. rel_drop≈0.8 > 0.4 → rare
+    a, tag, wc, rs, ra, wa, mv = _mk_weak_test("tic_tac_toe", 0.8, 0.4, 0.2)
     assert tag == "rare"
     assert rs is not None
     assert a == ra
     print("  C1 (rare): PASSED")
 
-    a, tag, wc, rs, ra, wa, mv = _mk_weak_test("tic_tac_toe", 0.0, 0.8, 0.4)
+    # C2: nn_val=0 → prob=50% = mcts → rel_drop≈0 < 0.2 → weak accepted
+    a, tag, wc, rs, ra, wa, mv = _mk_weak_test("tic_tac_toe", 0.0, 0.4, 0.2)
     assert tag == ""
     assert rs is None
     assert a == wa
     print("  C2 (accept): PASSED")
 
-    a, tag, wc, rs, ra, wa, mv = _mk_weak_test("tic_tac_toe", 0.5, 0.8, 0.4)
+    # C3: nn_val=0.3 → prob=65%. mcts≈0 → prob=50%. rel_drop≈0.3 → weak_final
+    a, tag, wc, rs, ra, wa, mv = _mk_weak_test("tic_tac_toe", 0.3, 0.4, 0.2)
     assert tag == ""
     assert rs is None
     assert a == wa
@@ -190,7 +193,7 @@ def test_perspective():
     m = BatchMCTS(g, MCTSConfig(max_simulations=16, batch_size=4), ev,
                   random_state=np.random.RandomState(42))
     root = m.mcts_search(st)
-    c = _cfg(rare_case_threshold=0.8, weak_move_threshold=0.4,
+    c = _cfg(rare_case_threshold=0.4, weak_move_threshold=0.2,
              weak_move_prob=1.0)
     _orig = tto._nn_raw_after_move
     tto._nn_raw_after_move = lambda *_: 0.3

@@ -25,6 +25,13 @@
   "max_steps": 100,
   "checkpoint_freq": 5,
 
+  "weak_side_prob": 0.5,
+  "weak_move_prob": 0.5,
+  "rare_case_threshold": 0.4,
+  "weak_move_threshold": 0.2,
+  "weak_max_per_game": 3,
+  "weak_move_max_step": 100,
+
   "eval_levels": 1,
   "evaluation_window": 50,
 

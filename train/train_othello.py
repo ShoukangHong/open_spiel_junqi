@@ -90,10 +90,11 @@ class TrainConfig:
     # Weak-move exploration: deliberately play suboptimal moves to
     # discover rare/dangerous states the model has never seen.
     weak_side_prob: float = 0.5        # probability of picking a weak side
-    weak_move_prob: float = 0.1        # prob of weak move on weak side's turn
-    rare_case_threshold: float = 0.8   # |NN_val - MCTS_val| > this → fork rare game
-    weak_move_threshold: float = 0.4   # below this → allow weak move freely
-    weak_max_per_game: int = 1         # max weak moves per game (0 = disabled)
+    weak_move_prob: float = 0.5        # P(N=k) = p^(k-1)*(1-p), E[N] = 1/(1-p). p=0.5→E=2
+    rare_case_threshold: float = 0.4   # rel win-prob drop > this → fork rare game
+    weak_move_threshold: float = 0.2   # rel win-prob drop < this → allow weak freely
+    weak_max_per_game: int = 3         # max weak moves per game (0 = disabled)
+    weak_move_max_step: int = 100      # weak moves only before this move number
 
     # Replay buffer: large capacity + continuous random sampling.
     # Each step collects buffer_sampling_frac * buffer_size new states,
@@ -338,8 +339,7 @@ def _try_weak_move(mcts, state, root, config, rng, weak_side, weak_count,
     weak_cat = ""
 
     if (weak_side is None or cur_player != weak_side
-            or weak_count >= weak_max
-            or rng.random() >= config.weak_move_prob):
+            or weak_count >= weak_max):
         return action, tag, weak_count, rare_state, weak_cat
 
     # NN argmax as weak move candidate
@@ -354,9 +354,17 @@ def _try_weak_move(mcts, state, root, config, rng, weak_side, weak_count,
     nn_val_after = _nn_raw_after_move(mcts.evaluator, state, weak_a)
     mcts_val = root.total_reward / max(root.explore_count, 1)
     nn_cur = nn_val_after if cur_player == 0 else -nn_val_after
-    diff = nn_cur - mcts_val
 
-    if diff > config.rare_case_threshold:
+    # Relative damage: how much win probability the weak move costs.
+    # prob = (val + 1) / 2, e.g. val=+0.2 → 60%, val=-0.5 → 25%.
+    def _to_prob(v):
+        return max((v + 1.0) / 2.0, 0.005)
+    p_before = _to_prob(mcts_val)
+    p_after = _to_prob(nn_cur)
+    rel_drop = abs((p_before - p_after) / max(p_before, 0.01))
+    # rel_drop > 0 means NN's assessment diverges from MCTS (either direction).
+
+    if rel_drop > config.rare_case_threshold:
         weak_cat = "rare"
         rare_state = state.clone()
         tag = "rare"
@@ -366,8 +374,8 @@ def _try_weak_move(mcts, state, root, config, rng, weak_side, weak_count,
                 f"\n── Rare Case ──\n{state}\n"
                 f"  weak action  : {state.action_to_string(cur_player, weak_a)} (a{weak_a})\n"
                 f"  MCTS action  : {state.action_to_string(cur_player, mcts_action)} (a{mcts_action})\n"
-                f"  nn_cur={nn_cur:.3f}  mcts_val={mcts_val:.3f}  diff={diff:.3f}")
-    elif diff < config.weak_move_threshold:
+                f"  nn_cur={nn_cur:.3f}  mcts_val={mcts_val:.3f}  rel_drop={rel_drop:.3f}")
+    elif rel_drop < config.weak_move_threshold:
         weak_cat = "weak"
         action = weak_a
         weak_count += 1
@@ -398,11 +406,24 @@ def play_game(game, mcts, config, rng, logger=None,
     weak_side = None
     weak_count = 0
     weak_max = config.weak_max_per_game if weak_enabled else 0
+    weak_steps = set()  # pre-rolled move numbers for weak move attempts
+
     if weak_max > 0 and rng.random() < config.weak_side_prob:
         weak_side = rng.choice([0, 1])
+        # Geometric-like: 1 most common, N least common, capped at weak_max.
+        n_weak = 1
+        while n_weak < weak_max and rng.random() < config.weak_move_prob:
+            n_weak += 1
+        # Pick n_weak distinct steps between temperature_drop and weak_move_max_step
+        max_step = max(config.temperature_drop + 1, config.weak_move_max_step)
+        cand = list(range(config.temperature_drop, max_step))
+        if len(cand) >= n_weak:
+            weak_steps = set(rng.choice(cand, size=n_weak, replace=False))
 
     if logger is not None:
         logger.log_game_start(weak_side)
+        if weak_steps:
+            logger.log_line(f"[weak steps = {sorted(weak_steps)}]")
 
     while not state.is_terminal():
         cur_player = state.current_player()
@@ -416,10 +437,14 @@ def play_game(game, mcts, config, rng, logger=None,
         # ── MCTS ────────────────────────────────────────────────────
         root = mcts.mcts_search(state)
 
-        # ── Weak-move ───────────────────────────────────────────────
-        action, tag, weak_count, rare_state, weak_cat = _try_weak_move(
-            mcts, state, root, config, rng, weak_side, weak_count,
-            weak_max, logger)
+        # ── Weak-move (pre-rolled steps, +1 for turn alignment) ─────
+        if move_num in weak_steps or (move_num + 1) in weak_steps:
+            action, tag, weak_count, rare_state, weak_cat = _try_weak_move(
+                mcts, state, root, config, rng, weak_side, weak_count,
+                weak_max, logger)
+        else:
+            action, tag, weak_cat = root.best_child().action, "", ""
+            rare_state = None
         if weak_cat in wstats:
             wstats[weak_cat] += 1
         if rare_state is not None:
