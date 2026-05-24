@@ -32,7 +32,7 @@ PLAYER = {
     0: {  # Black (X)
         "strategy":   "mcts",
         "checkpoint_dir":  r"C:\Users\shouk\othello_train_v2",
-        "checkpoint_step": 75,
+        "checkpoint_step": 90,
         "mcts_simulations": 128,
         "mcts_batch_size":  4,
         "mcts_uct_c":       1.41,
@@ -138,7 +138,14 @@ def _act(player_cfg, state):
         return legal[int(np.argmax(probs))]
 
     if strategy == "mcts":
-        return _mcts_for(player_cfg).step(state)
+        root = _mcts_for(player_cfg).mcts_search(state)
+        # Temperature sample from visit distribution (not greedy best_child)
+        visits = np.array([c.explore_count for c in root.children])
+        probs = visits / visits.sum()
+        probs = probs ** (1.0 / max(MODEL_TEMPERATURE, 0.01))
+        probs /= probs.sum()
+        actions = [c.action for c in root.children]
+        return np.random.choice(actions, p=probs)
 
     raise ValueError(f"Unknown strategy: {strategy}")
 
