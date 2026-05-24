@@ -361,7 +361,8 @@ def _try_weak_move(mcts, state, root, config, rng, weak_side, weak_count,
         return max((v + 1.0) / 2.0, 0.005)
     p_before = _to_prob(mcts_val)
     p_after = _to_prob(nn_cur)
-    rel_drop = abs((p_before - p_after) / max(p_before, 0.01))
+    # Symmetric: denominator = larger of the two (the more optimistic estimate).
+    rel_drop = abs(p_before - p_after) / max(p_before, p_after, 0.01)
     # rel_drop > 0 means NN's assessment diverges from MCTS (either direction).
 
     if rel_drop > config.rare_case_threshold:
