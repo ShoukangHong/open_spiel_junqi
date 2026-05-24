@@ -186,15 +186,15 @@ class ReplayBuffer:
         )
 
     def tag_counts(self) -> dict:
-        """Return count of each tag in the buffer."""
+        """Return count of each tag as plain Python types."""
         if self._tags is None:
             return {}
         tags = self._tags[:self._size]
-        valid = [t for t in tags if t is not None]  # filter uninitialized slots
+        valid = [str(t) for t in tags if t is not None]
         if not valid:
             return {}
         unique, counts = np.unique(valid, return_counts=True)
-        return dict(zip(unique, counts))
+        return {str(k): int(v) for k, v in zip(unique, counts)}
 
     def save(self, filepath: str):
         """Serialize buffer to a .npz file."""
@@ -530,7 +530,7 @@ def actor_process(cfg_dict: dict, result_queue: mp.Queue, actor_id: int = 0):
                 loaded_step = mtime
 
         result = play_game(game, mcts, cfg, rng, logger=logger)
-        states_info, returns, rare_games, _wstats = result
+        states_info, returns, rare_games, wstats = result
 
         # Play out rare-case forked games (no weak moves in rare games)
         for rare_state in rare_games:
@@ -543,7 +543,7 @@ def actor_process(cfg_dict: dict, result_queue: mp.Queue, actor_id: int = 0):
             states_info.extend(rare_info)
 
         try:
-            result_queue.put((states_info, returns), timeout=1)
+            result_queue.put((states_info, returns, wstats), timeout=1)
         except queue.Full:
             print("[actor] WARNING: queue full, dropping game", flush=True)
 
@@ -801,9 +801,10 @@ def main():
                 while total_states < samples_per_step:
                     for _, q in actors:
                         try:
-                            states_info, returns = q.get_nowait()
+                            states_info, returns, wstats = q.get_nowait()
                         except queue.Empty:
                             continue
+                        _accum_wstats(cfg, wstats)
                         game_outcome_p0 = returns[0]
 
                         for item in states_info:
@@ -860,8 +861,8 @@ def main():
                 f"selfplay={selfplay_time:.1f}s  train={train_time:.1f}s"
             )
             if avg_loss is not None:
-                log_line += f"  |  loss={avg_loss}"
-            log_line += (f"  |  p0_wins={outcomes['p0']}"
+                log_line += f"\n               loss={avg_loss}  |"
+            log_line += (f"  p0_wins={outcomes['p0']}"
                          f"  p1_wins={outcomes['p1']}"
                          f"  draws={outcomes['draw']}")
             print(log_line)
