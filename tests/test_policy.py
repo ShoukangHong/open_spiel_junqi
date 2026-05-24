@@ -271,5 +271,9 @@ def run_tests():
     print(f"{'=' * 60}")
 
 
-if __name__ == "__main__":
+def test_policy():
     run_tests()
+
+
+if __name__ == "__main__":
+    test_policy()

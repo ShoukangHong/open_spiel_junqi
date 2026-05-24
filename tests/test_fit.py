@@ -1,8 +1,8 @@
 """Quick buffer-fit check: can the model learn the data it was trained on?"""
 
+import pytest
 import json
 import os
-import sys
 
 import numpy as np
 import torch
@@ -101,5 +101,9 @@ def main():
     print(f"\nDone. Final loss={avg}")
 
 
-if __name__ == "__main__":
+@pytest.mark.skip(reason="slow: 50-epoch training run, use --run-slow to enable")
+def test_fit():
     main()
+
+if __name__ == "__main__":
+    test_fit()

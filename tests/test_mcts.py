@@ -145,7 +145,6 @@ def test_vs_original():
             f"No overlap in top-3: orig={top_orig_set} batch={top_batch_set}"
 
     print("  Test A PASSED")
-    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -436,26 +435,22 @@ def main():
         ("E", "Search scaling", test_search_scaling),
     ]
 
-    results = {}
+    failed = 0
     for label, desc, fn in tests:
         try:
-            results[label] = fn()
+            fn()
+            print(f"  Test {label}: {desc} — PASSED")
         except Exception as e:
             print(f"\n  Test {label} ERROR: {e}")
             import traceback
             traceback.print_exc()
-            results[label] = False
+            failed += 1
 
     print(f"\n{'=' * 60}")
-    for label, desc, _ in tests:
-        status = "PASSED" if results[label] else "FAILED"
-        print(f"  Test {label}: {desc} — {status}")
-
-    all_passed = all(results.values())
-    print(f"\n  {'ALL TESTS PASSED' if all_passed else 'SOME TESTS FAILED'}")
+    print(f"  {'ALL PASSED' if failed == 0 else f'{failed} FAILED'}")
     print(f"{'=' * 60}")
 
-    return 0 if all_passed else 1
+    return 0 if failed == 0 else 1
 
 
 if __name__ == "__main__":
