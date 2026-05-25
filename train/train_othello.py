@@ -45,7 +45,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 class _Tee:
     """Writes to a file and the original stdout simultaneously."""
     def __init__(self, filepath):
-        self.file = open(filepath, "w", encoding="utf-8", buffering=1)
+        self.file = open(filepath, "a", encoding="utf-8", buffering=1)
         self.stdout = sys.stdout
 
     def write(self, message):
@@ -243,6 +243,16 @@ class ReplayBuffer:
     @property
     def total_seen(self) -> int:
         return self._index
+
+    @property
+    def unique_states(self) -> int:
+        """Count unique states in the buffer (by hash)."""
+        if self._obs is None or self._size == 0:
+            return 0
+        seen = set()
+        for i in range(self._size):
+            seen.add(self._obs[i].tobytes())
+        return len(seen)
 
 
 # ── Actor game logger ────────────────────────────────────────────────────────
@@ -454,35 +464,34 @@ def play_game(game, mcts, config, rng, logger=None,
         policy = np.zeros(game.num_distinct_actions(), dtype=np.float32)
         for a, p in policy_dict.items():
             policy[a] = p
-
-        # Temperature
-        after_drop = move_num >= config.temperature_drop
-        tau = config.temperature if after_drop else 1.0
-
         p_sum = policy.sum()
         if p_sum > 0:
-            policy = policy / p_sum
-            if tau > 0 and tau != 1.0:
-                policy = policy ** (1.0 / tau)
-                policy /= policy.sum()
+            policy /= p_sum
         else:
             for a in state.legal_actions():
                 policy[a] = 1.0
             policy /= policy.sum()
 
-        # ── Store & apply ────────────────────────────────────────────
+        # ── Store raw visit-proportional policy ────────────────────────
         obs = np.asarray(state.observation_tensor(), dtype=np.float32)
         mask = np.asarray(state.legal_actions_mask(), dtype=bool)
         states_info.append((obs, mask, policy, cur_player, tag))
 
-        # Action selection: use temperature sample for MCTS moves,
-        # keep weak_move as-is (bypass temperature).
+        # ── Action selection (temperature sharpens for play, not storage)
+        after_drop = move_num >= config.temperature_drop
+        tau_sel = config.temperature if after_drop else 1.0
+        if tau_sel > 0 and tau_sel != 1.0:
+            sel_probs = policy ** (1.0 / tau_sel)
+            sel_probs /= sel_probs.sum()
+        else:
+            sel_probs = policy
+
         if tag == "rare" or action != mcts_action:
-            pass  # rare → MCTS move already set; weak move already set
+            pass  # rare / weak already set
         elif after_drop:
             action = mcts_action
         else:
-            action = rng.choice(len(policy), p=policy)
+            action = rng.choice(len(sel_probs), p=sel_probs)
 
         if logger is not None:
             children_sorted = sorted(
@@ -494,7 +503,7 @@ def play_game(game, mcts, config, rng, logger=None,
             mcts_info = " | ".join(top5)
             action_str = state.action_to_string(cur_player, action)
             logger.log_move(move_num + 1, cur_player, state, mcts_info,
-                            action_str, tag=tag, tau=tau)
+                            action_str, tag=tag, tau=tau_sel)
 
         state.apply_action(action)
         move_num += 1
@@ -899,6 +908,7 @@ def main():
                 f"[step {step:3d}/{cfg.max_steps}] "
                 f"games={total_games:3d}  states={total_states:4d}  "
                 f"buffer={len(buffer):5d}/{buffer.total_seen:5d}"
+                f" unique={buffer.unique_states}"
                 f"  tags={buffer.tag_counts()}"
                 f"  weak={_wstats_summary(cfg)}  "
                 f"states/s={states_per_s:.1f}  "

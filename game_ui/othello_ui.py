@@ -20,8 +20,9 @@ from train.model.othello_resnet import Model, OthelloResNet
 
 # ── Config — paths only, model settings read from checkpoint dir ────────
 CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_v2"
-CHECKPOINT_STEP = 40             # checkpoint step to load (must exist)
-MCTS_SIMULATIONS = 1280          # MCTS search budget per move
+CHECKPOINT_STEP = 120             # checkpoint step to load (must exist)
+MCTS_SIMULATIONS = 128          # MCTS search budget per move
+HINT_MAX_SIM = 12800
 MCTS_BATCH_SIZE = 8             # leaf evaluation batch size
 UCT_C = 1.41
 
@@ -117,7 +118,6 @@ def print_mcts_info(root, state, evaluator=None):
           f"{'  (solved)' if root.outcome is not None else ''}")
 
     # Build combined: NN raw + MCTS side by side
-    nn_value = None
     nn_policy = None
     if evaluator is not None:
         nn_value, nn_policy = evaluator._inference(state)
@@ -127,7 +127,6 @@ def print_mcts_info(root, state, evaluator=None):
     legal = state.legal_actions()
     rows = []
     for a in legal:
-        mcts_p = 0.0
         mcts_v = 0.0
         mcts_n = 0
         mcts_solved = " "
@@ -440,7 +439,7 @@ def main():
                                               random_state=np.random.RandomState())
                         hint_root = hint_mcts.mcts_search(state)
                         hint_state = str(state)
-                    else:
+                    elif hint_root.visit_count < HINT_MAX_SIM:
                         hint_mcts.config.max_simulations = 64
                         hint_root = hint_mcts.mcts_search(state, root=hint_root)
                     hints = get_hints_from_root(hint_root)

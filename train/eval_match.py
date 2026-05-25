@@ -32,15 +32,15 @@ PLAYER = {
     0: {  # Black (X)
         "strategy":   "mcts",
         "checkpoint_dir":  r"C:\Users\shouk\othello_train_v2",
-        "checkpoint_step": 50,
+        "checkpoint_step": 120,
         "mcts_simulations": 128,
         "mcts_batch_size":  8,
         "mcts_uct_c":       1.41,
     },
     1: {  # White (O)
-        "strategy":   "model",
+        "strategy":   "mcts",
         "checkpoint_dir":  r"C:\Users\shouk\othello_train_v2",
-        "checkpoint_step": 50,
+        "checkpoint_step": 80,
         "mcts_simulations": 128,
         "mcts_batch_size":  6,
         "mcts_uct_c":       1.41,
@@ -48,7 +48,8 @@ PLAYER = {
 }
 
 NUM_GAMES = 100
-MODEL_TEMPERATURE = 0.03  # for "model" policy sampling (0 = argmax)
+MODEL_TEMPERATURE = 0.1  # for "model" policy sampling, and MCTS after drop
+MCTS_TEMP_DROP = 4       # first N moves use τ=1 for MCTS
 
 # ── Internals ────────────────────────────────────────────────────────────────
 _game = None
@@ -108,11 +109,11 @@ def _mcts_for(player_cfg):
             uct_c=player_cfg.get("mcts_uct_c", 1.41),
             policy_epsilon=0, verbose=False)
         _mcts_bots[key] = BatchMCTS(
-            game, cfg, ev, random_state=np.random.RandomState(342))
+            game, cfg, ev, random_state=np.random.RandomState(42))
     return _mcts_bots[key]
 
 
-def _act(player_cfg, state):
+def _act(player_cfg, state, move_num=0):
     strategy = player_cfg["strategy"]
     legal = state.legal_actions()
 
@@ -139,10 +140,10 @@ def _act(player_cfg, state):
 
     if strategy == "mcts":
         root = _mcts_for(player_cfg).mcts_search(state)
-        # Temperature sample from visit distribution (not greedy best_child)
         visits = np.array([c.explore_count for c in root.children])
         probs = visits / visits.sum()
-        probs = probs ** (1.0 / max(MODEL_TEMPERATURE, 0.01))
+        tau = 1.0 if move_num < MCTS_TEMP_DROP else MODEL_TEMPERATURE
+        probs = probs ** (1.0 / max(tau, 0.01))
         probs /= probs.sum()
         actions = [c.action for c in root.children]
         return np.random.choice(actions, p=probs)
@@ -163,6 +164,8 @@ def main():
     print(f"\nMatch: {name0} (black) vs {name1} (white), {NUM_GAMES} games\n")
 
     score = {name0: 0, name1: 0, "draw": 0}
+    sequences = []  # list of (label, [action, action, ...])
+
     for i in range(NUM_GAMES):
         if i % 2 == 0:
             cfg_b, cfg_w = cfg0, cfg1
@@ -172,10 +175,16 @@ def main():
             label_b, label_w = name1, name0
 
         state = _game_obj().new_initial_state()
+        move_num = 0
+        moves = []
         while not state.is_terminal():
             cur = state.current_player()
             cfg = cfg_b if cur == 0 else cfg_w
-            state.apply_action(_act(cfg, state))
+            action = _act(cfg, state, move_num)
+            state.apply_action(action)
+            moves.append(action)
+            move_num += 1
+        sequences.append((label_b, tuple(moves)))
         r = state.returns()[0]
 
         if r > 0:
@@ -194,6 +203,20 @@ def main():
     print(f"\n-- {name0}: {score[name0]} ({score[name0]/n:.1%})  "
           f"{name1}: {score[name1]} ({score[name1]/n:.1%})  "
           f"draw: {score['draw']} ({score['draw']/n:.1%})")
+
+    # ── Move diversity: prefix overlap ──────────────────────────────────────
+    print("\n[PREFIX OVERLAP]  unique prefixes / games  (most-common count)")
+    max_len = max(len(m) for _, m in sequences)
+    for L in range(1, min(max_len + 1, 61), 5):
+        prefs = [m[:L] for _, m in sequences if len(m) >= L]
+        if not prefs:
+            continue
+        arr = np.array(prefs, dtype=int)
+        unique, counts = np.unique(arr, axis=0, return_counts=True)
+        top_count = counts.max()
+        pct = top_count / len(prefs) * 100
+        print(f"  first {L:>2d} moves:  {len(unique)} unique  "
+              f"(top occurs {top_count}/{len(prefs)} = {pct:.0f}%)")
 
 
 if __name__ == "__main__":

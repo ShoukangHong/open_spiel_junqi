@@ -753,7 +753,7 @@ class BatchMCTS:
             best_child = max(
                 candidates,
                 key=lambda c: c.puct_with_virtual(
-                    node.explore_count, uct_c, vloss))
+                    node.visit_count, uct_c, vloss))
 
             # Apply virtual loss
             best_child.virtual_visits += 1
