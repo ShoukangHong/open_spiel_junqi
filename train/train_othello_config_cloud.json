@@ -1,29 +1,29 @@
 {
   "game": "othello",
 
-  "nn_width": 16,
-  "nn_depth": 4,
+  "nn_width": 32,
+  "nn_depth": 8,
 
   "learning_rate": 0.001,
   "weight_decay": 0.0001,
-  "train_batch_size": 128,
+  "train_batch_size": 256,
 
-  "max_simulations": 60,
-  "mcts_batch_size": 6,
+  "max_simulations": 200,
+  "mcts_batch_size": 8,
   "uct_c": 1.41,
   "policy_epsilon": 0.25,
   "policy_alpha": 1.0,
 
-  
+
   "temperature": 0.066,
   "temperature_drop": 4,
 
-  "replay_buffer_size": 8000,
-  "buffer_sampling_frac": 0.2,
-  "symmetry": 4,
+  "replay_buffer_size": 60000,
+  "buffer_sampling_frac": 0.25,
+  "symmetry": 3,
 
   "num_actors": 6,
-  "max_steps": 100,
+  "max_steps": 160,
   "checkpoint_freq": 5,
 
   "weak_side_prob": 0.333,
@@ -33,11 +33,11 @@
   "weak_max_per_game": 3,
   "weak_move_max_step": 64,
 
-  "evaluation_window": 50,
+  "evaluation_window": 100,
   "eval_reference_count": 3,
-  "eval_min_interval": 120,
+  "eval_min_interval": 1800,
 
-  "path": "C:\\Users\\shouk\\othello_train_fast",
+  "path": "/root/othello_train_v2",
   "seed": 42,
   "device": "cuda"
 }

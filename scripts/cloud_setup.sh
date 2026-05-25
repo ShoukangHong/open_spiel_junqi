@@ -1,40 +1,41 @@
 #!/bin/bash
 # One-time setup for Othello AlphaZero training on a cloud GPU instance.
-# Run:  bash scripts/cloud_setup.sh
+#
+# Works both with git clone and with archive extraction:
+#   git clone:  bash scripts/cloud_setup.sh
+#   archive:    tar -xzf open_spiel_junqi.tar.gz && cd open_spiel_junqi && bash scripts/cloud_setup.sh
+#
 # After completion, save this instance as a custom image in your cloud console.
 set -euo pipefail
 
-# ── Config ───────────────────────────────────────────────────────────────────
-GIT_REPO="https://github.com/<YOUR_USER>/open_spiel_junqi.git"  # <-- CHANGE
-GIT_BRANCH="exp"
-PYTHON=python3.11
+PROJ_DIR=$(cd "$(dirname "$0")/.." && pwd)
+cd "$PROJ_DIR"
 
-# ── 1. System deps ───────────────────────────────────────────────────────────
-echo "=== [1/5] System packages ==="
+# ── 1. System deps (Python & PyTorch are pre-installed on this image) ────────
+echo "=== [1/4] System packages ==="
 sudo apt-get update -y
-sudo apt-get install -y build-essential cmake git \
-    ${PYTHON} ${PYTHON}-dev ${PYTHON}-venv
+sudo apt-get install -y build-essential cmake git
 
-# ── 2. Clone repo + deps ─────────────────────────────────────────────────────
-echo "=== [2/5] Cloning repo ==="
-cd ~
-if [ ! -d open_spiel_junqi ]; then
-    git clone -b "$GIT_BRANCH" "$GIT_REPO" open_spiel_junqi
-else
-    cd open_spiel_junqi && git pull && cd ..
+# ── 2. C++ deps (skip if already present from archive) ───────────────────────
+echo "=== [2/5] C++ dependencies ==="
+if [ ! -d pybind11/include ]; then
+    git clone --single-branch --depth 1 https://github.com/pybind/pybind11.git pybind11
 fi
-cd ~/open_spiel_junqi
-
-# Clone OpenSpiel C++ dependencies (skip if already present)
-echo "=== OpenSpiel deps ==="
-[ -d pybind11 ] || git clone --single-branch --depth 1 https://github.com/pybind/pybind11.git pybind11
-[ -d open_spiel/pybind11_json ] && rm -rf open_spiel/pybind11_json
-git clone --single-branch --depth 1 https://github.com/pybind/pybind11_json.git open_spiel/pybind11_json
-[ -d open_spiel/abseil-cpp ] && rm -rf open_spiel/abseil-cpp
-git clone --single-branch --depth 1 https://github.com/abseil/abseil-cpp.git open_spiel/abseil-cpp
-[ -d open_spiel/json ] && rm -rf open_spiel/json
-git clone --single-branch --depth 1 https://github.com/nlohmann/json.git open_spiel/json
-[ -d open_spiel/pybind11_abseil ] || git clone https://github.com/pybind/pybind11_abseil.git open_spiel/pybind11_abseil
+if [ ! -f open_spiel/pybind11_json/include/pybind11_json/pybind11_json.hpp ]; then
+    rm -rf open_spiel/pybind11_json
+    git clone --single-branch --depth 1 https://github.com/pybind/pybind11_json.git open_spiel/pybind11_json
+fi
+if [ ! -d open_spiel/abseil-cpp/absl ]; then
+    rm -rf open_spiel/abseil-cpp
+    git clone --single-branch --depth 1 https://github.com/abseil/abseil-cpp.git open_spiel/abseil-cpp
+fi
+if [ ! -f open_spiel/json/include/nlohmann/json.hpp ]; then
+    rm -rf open_spiel/json
+    git clone --single-branch --depth 1 https://github.com/nlohmann/json.git open_spiel/json
+fi
+if [ ! -d open_spiel/pybind11_abseil ]; then
+    git clone https://github.com/pybind/pybind11_abseil.git open_spiel/pybind11_abseil
+fi
 
 # ── 3. Build pyspiel ─────────────────────────────────────────────────────────
 echo "=== [3/5] Building pyspiel ==="
@@ -42,30 +43,28 @@ rm -rf build && mkdir -p build && cd build
 cmake -DCMAKE_BUILD_TYPE=Release \
       -DOPEN_SPIEL_BUILD_WITH_PYTHON=ON \
       -DOPEN_SPIEL_BRIDGE_ENABLED=OFF \
-      -DPython3_EXECUTABLE=$(which $PYTHON) \
+      -DPython3_EXECUTABLE=$(which python3) \
       ../open_spiel
-cmake --build . --config Release -j$(nproc)
+cmake --build . -j$(nproc)
 cd ..
 
-# ── 4. Python env ────────────────────────────────────────────────────────────
-echo "=== [4/5] Python venv ==="
-$PYTHON -m venv venv
-source venv/bin/activate
-pip install --upgrade pip -q
+# ── 4. Python deps & pyspiel ─────────────────────────────────────────────────
+echo "=== [4/4] Python deps ==="
+pip install numpy attrs absl-py scipy ml-collections -q
 
-# PyTorch with CUDA (adjust cuXXX to match GPU driver: 121=cuda12.1, 118=cuda11.8)
-pip install torch --index-url https://download.pytorch.org/whl/cu121
-
-# Training deps
-pip install numpy attrs absl-py scipy ml-collections
-
-# Install pyspiel
-pip install -e .
+# Copy pyspiel .so to site-packages (no rebuild)
+SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")
+cp build/python/pyspiel*.so "$SITE_PACKAGES/" 2>/dev/null || true
+# Fallback: first-time build from source
+if ! python -c "import pyspiel" 2>/dev/null; then
+    echo "Building pyspiel from source..."
+    pip install -e .
+fi
 
 # ── 5. Verify ────────────────────────────────────────────────────────────────
-echo "=== [5/5] Verify ==="
+echo "=== Verify ==="
 python -c "import pyspiel; s=pyspiel.load_game('othello').observation_tensor_shape(); print(f'Othello obs shape: {s}')"
-python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}')"
+python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}')"
 
 echo ""
 echo "=== Setup complete. ==="

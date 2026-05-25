@@ -271,6 +271,7 @@ class Model:
             else:
                 decay_params.append(param)
 
+        self._lr = learning_rate
         self._optimizer = torch.optim.AdamW([
             {"params": decay_params, "weight_decay": weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
@@ -387,5 +388,8 @@ class Model:
             ckpt = torch.load(filepath, map_location=self._device, weights_only=False)
             self._model.load_state_dict(ckpt["model_state_dict"])
             self._optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            # Keep LR from the current config, not from the checkpoint
+            for pg in self._optimizer.param_groups:
+                pg["lr"] = self._lr
         else:
             raise FileNotFoundError(f"Checkpoint not found: {filepath}")

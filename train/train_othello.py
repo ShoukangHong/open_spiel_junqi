@@ -18,6 +18,11 @@ import json
 import multiprocessing as mp
 import os
 import queue
+
+# Linux: CUDA requires spawn (fork is default on Linux but incompatible with GPU)
+if mp.get_start_method(allow_none=True) is None:
+    mp.set_start_method("spawn")
+import logging
 import sys
 import threading
 import time
@@ -40,25 +45,6 @@ from train.model.othello_resnet import Losses, Model, OthelloResNet, TrainInput
 from train.model.symmetry import OthelloSymmetry
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-
-class _Tee:
-    """Writes to a file and the original stdout simultaneously."""
-    def __init__(self, filepath):
-        self.file = open(filepath, "a", encoding="utf-8", buffering=1)
-        self.stdout = sys.stdout
-
-    def write(self, message):
-        self.stdout.write(message)
-        self.file.write(message)
-        self.file.flush()
-
-    def flush(self):
-        self.stdout.flush()
-        self.file.flush()
-
-    def close(self):
-        self.file.close()
 
 
 # ── Config ──────────────────────────────────────────────────────────────────
@@ -110,8 +96,9 @@ class TrainConfig:
     checkpoint_freq: int = 10
 
     # Evaluation
-    eval_levels: int = 3               # number of MCTS difficulty levels
-    evaluation_window: int = 50        # games per eval level
+    evaluation_window: int = 50        # games per eval per reference
+    eval_reference_count: int = 3      # compare against last N checkpoints
+    eval_min_interval: int = 1800      # seconds between evals (0 = every ckpt)
 
     # Misc
     path: str = "othello_train_v2"
@@ -481,7 +468,7 @@ def play_game(game, mcts, config, rng, logger=None,
         after_drop = move_num >= config.temperature_drop
         tau_sel = config.temperature if after_drop else 1.0
         if tau_sel > 0 and tau_sel != 1.0:
-            sel_probs = policy ** (1.0 / tau_sel)
+            sel_probs = policy.astype(np.float64) ** (1.0 / tau_sel)
             sel_probs /= sel_probs.sum()
         else:
             sel_probs = policy
@@ -622,65 +609,38 @@ def _reset_wstats(cfg):
 
 # ── Evaluation ──────────────────────────────────────────────────────────────
 
-def evaluate(game, model, eval_config, num_games=50):
-    """Evaluate latest model vs random-rollout MCTS at multiple levels."""
-    results = {}
-    for level in range(eval_config.eval_levels):
-        mcts_sim = int(eval_config.max_simulations * (10 ** (level / 2)))
-        eval_cfg = MCTSConfig(
-            max_simulations=mcts_sim,
-            batch_size=eval_config.mcts_batch_size,
-            uct_c=eval_config.uct_c,
-            policy_epsilon=0,           # no noise during evaluation
-            verbose=False,
-        )
-        evaluator = PyTorchEvaluator(game, model)
-        mcts_bot = BatchMCTS(game, eval_cfg, evaluator,
-                             random_state=np.random.RandomState())
+def _run_eval_bg(cfg_path, current_step, ref_steps, num_games):
+    """Run model-vs-model eval against multiple references (background)."""
+    from train.eval_match import run_match
 
-        wins = 0
-        losses = 0
-        draws = 0
-        rng = np.random.RandomState()
+    mcts_cfg = {"strategy": "mcts",
+                "checkpoint_dir": cfg_path,
+                "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41}
+    cur = dict(mcts_cfg, checkpoint_step=current_step)
 
-        for i in range(num_games):
-            state = game.new_initial_state()
-            az_player = i % 2  # alternate sides
-
-            while not state.is_terminal():
-                cur = state.current_player()
-                if cur == az_player:
-                    action = mcts_bot.step(state)
-                else:
-                    action = rng.choice(state.legal_actions())
-                state.apply_action(action)
-
-            r = state.returns()[az_player]
-            if r > 0:
-                wins += 1
-            elif r < 0:
-                losses += 1
+    for ref_step in ref_steps:
+        if ref_step < 0:
+            ref = {"strategy": "random"}
+            ref_name = "random"
+        else:
+            ckpt = os.path.join(cfg_path, f"checkpoint-{ref_step}.pt")
+            if os.path.exists(ckpt):
+                ref = dict(mcts_cfg, checkpoint_step=ref_step)
+                ref_name = f"step{ref_step}"
             else:
-                draws += 1
+                ref = {"strategy": "random"}
+                ref_name = "random"
 
-        results[level] = {"wins": wins, "losses": losses, "draws": draws,
-                          "sims": mcts_sim}
-    return results
+        score, _ = run_match(cur, ref, num_games=num_games,
+                             temperature=0.1, temp_drop=4, quiet=True)
+        keys = [k for k in score if k != "draw"]
+        wr = score[keys[0]] / max(num_games, 1)
+        print(f"    [eval] step{current_step} vs {ref_name}:  "
+              f"W={score[keys[0]]} L={score[keys[1]]} D={score['draw']} "
+              f"WR={wr:.1%}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
-
-def _run_eval(game, model, cfg, step):
-    """Background evaluation thread — runs matches and prints results."""
-    eval_results = evaluate(game, model, cfg,
-                            num_games=cfg.evaluation_window)
-    for level, r in eval_results.items():
-        total = r["wins"] + r["losses"] + r["draws"]
-        wr = r["wins"] / max(total, 1)
-        print(f"    [eval] level={level} (sims={r['sims']}): "
-              f"W={r['wins']} L={r['losses']} D={r['draws']} "
-              f"WR={wr:.2%}")
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -698,31 +658,44 @@ def main():
 
     os.makedirs(cfg.path, exist_ok=True)
 
-    # Tee stdout to a log file in the checkpoint directory.
-    _tee = _Tee(os.path.join(cfg.path, "train.log"))
-    sys.stdout = _tee
+    # Logging: file gets timestamps, terminal stays clean.
+    log_file = os.path.join(cfg.path, "train.log")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(message)s",
+        datefmt="%m-%d %H:%M:%S",
+        handlers=[logging.FileHandler(log_file),
+                  logging.StreamHandler(sys.stdout)])
+    _log = logging.info
 
-    # Save merged config
+    # On resume, reload everything from the stored config (allows editing
+    # train_config.json in the output dir between runs).
+    saved_config = os.path.join(cfg.path, "train_config.json")
+    if not args.fresh and os.path.exists(saved_config):
+        cfg = load_config(saved_config)
+        _log(f"[train] Reloaded config from {saved_config}")
+
+    # Save merged config for future resumes
     with open(os.path.join(cfg.path, "train_config.json"), "w") as f:
         json.dump({k: v for k, v in cfg.__dict__.items()
                    if not k.startswith("_")}, f, indent=2, default=str)
 
-    print(f"[train] game={cfg.game}  nn_width={cfg.nn_width}"
-          f"  nn_depth={cfg.nn_depth}")
-    print(f"[train] max_sim={cfg.max_simulations}"
-          f"  mcts_batch={cfg.mcts_batch_size}  buffer={cfg.replay_buffer_size}")
-    print(f"[train] max_steps={cfg.max_steps}  ckpt_freq={cfg.checkpoint_freq}")
-    print(f"[train] path={cfg.path}")
+    _log(f"[train] game={cfg.game}  nn_width={cfg.nn_width}"
+         f"  nn_depth={cfg.nn_depth}")
+    _log(f"[train] max_sim={cfg.max_simulations}"
+         f"  mcts_batch={cfg.mcts_batch_size}  buffer={cfg.replay_buffer_size}")
+    _log(f"[train] max_steps={cfg.max_steps}  ckpt_freq={cfg.checkpoint_freq}")
+    _log(f"[train] path={cfg.path}")
 
     # Init game
     game = pyspiel.load_game(cfg.game)
     obs_shape = game.observation_tensor_shape()
     num_actions = game.num_distinct_actions()
-    print(f"[train] obs_shape={obs_shape}  num_actions={num_actions}")
+    _log(f"[train] obs_shape={obs_shape}  num_actions={num_actions}")
 
     # Init model
     model = build_model(game, cfg)
-    print(f"[train] Model params: {model.num_trainable_variables}")
+    _log(f"[train] Model params: {model.num_trainable_variables}")
 
     # Replay buffer
     buffer = ReplayBuffer(max_size=cfg.replay_buffer_size)
@@ -731,9 +704,9 @@ def main():
         cfg.train_batch_size)
     n_updates = samples_per_step * cfg.symmetry // cfg.train_batch_size
     sym = OthelloSymmetry() if cfg.symmetry > 1 else None
-    print(f"[train] buffer_sampling_frac={cfg.buffer_sampling_frac}"
-          f"  symmetry={cfg.symmetry}"
-          f"  n_updates={n_updates}")
+    _log(f"[train] buffer_sampling_frac={cfg.buffer_sampling_frac}"
+         f"  symmetry={cfg.symmetry}"
+         f"  n_updates={n_updates}")
 
     # Resume from checkpoint
     start_step = 0
@@ -752,13 +725,13 @@ def main():
                 cfg.path, f"buffer-checkpoint-{start_step}.npz")
             if os.path.exists(buf_path):
                 buffer.load(buf_path)
-                print(f"[train] Resumed from checkpoint-{start_step}"
+                _log(f"[train] Resumed from checkpoint-{start_step}"
                       f" (buffer: {len(buffer)} states)")
             else:
-                print(f"[train] Resumed from checkpoint-{start_step}"
+                _log(f"[train] Resumed from checkpoint-{start_step}"
                       f" (buffer file not found, starting empty)")
         else:
-            print("[train] No checkpoint found, starting fresh")
+            _log("[train] No checkpoint found, starting fresh")
 
     # MCTS config
     mcts_config = MCTSConfig(
@@ -785,10 +758,12 @@ def main():
                            args=(cfg_dict, q, i), name=f"actor-{i}")
             p.start()
             actors.append((p, q))
-        print(f"[train] Spawned {cfg.num_actors} actor processes")
+        _log(f"[train] Spawned {cfg.num_actors} actor processes")
 
     # Training state
     global_rng = np.random.RandomState(cfg.seed + start_step)
+    _last_eval_time = 0.0   # force first eval immediately
+    _eval_thread = None     # track running eval
 
     try:
         for step in range(start_step + 1, cfg.max_steps + 1):
@@ -879,6 +854,7 @@ def main():
             # ── Training ───────────────────────────────────────────────
             train_t0 = time.time()
             losses_list = []
+            entropies = []
 
             for _ in range(n_updates):
                 batch = buffer.sample(cfg.train_batch_size)
@@ -889,6 +865,10 @@ def main():
                                        policy=policy, value=batch.value)
                 loss = model.update(batch)
                 losses_list.append(loss)
+                # Policy entropy (nats) of the target distribution
+                p = batch.policy[batch.policy > 0]
+                if len(p) > 0:
+                    entropies.append(float(-np.mean(p * np.log(p))))
 
             if losses_list:
                 avg_loss = Losses(
@@ -896,8 +876,10 @@ def main():
                     value=sum(l.value for l in losses_list) / len(losses_list),
                     l2=sum(l.l2 for l in losses_list) / len(losses_list),
                 )
+                avg_entropy = sum(entropies) / len(entropies)
             else:
                 avg_loss = None
+                avg_entropy = 0.0
             train_time = time.time() - train_t0
 
             elapsed = time.time() - t0
@@ -915,11 +897,13 @@ def main():
                 f"selfplay={selfplay_time:.1f}s  train={train_time:.1f}s"
             )
             if avg_loss is not None:
-                log_line += f"\n               loss={avg_loss}  |"
-            log_line += (f"  p0_wins={outcomes['p0']}"
-                         f"  p1_wins={outcomes['p1']}"
-                         f"  draws={outcomes['draw']}")
-            print(log_line)
+                log_line += (f"\n               loss={avg_loss}"
+                             f"  entropy={avg_entropy:.3f}  |")
+            g = total_games or 1
+            log_line += (f"  p0={outcomes['p0']/g:.1%}"
+                         f"  p1={outcomes['p1']/g:.1%}"
+                         f"  draw={outcomes['draw']/g:.1%}")
+            _log(log_line)
             _reset_wstats(cfg)
 
             # ── Checkpoint ─────────────────────────────────────────────
@@ -927,37 +911,50 @@ def main():
                 ckpt_path = model.save_checkpoint(step)
                 buffer.save(os.path.join(
                     cfg.path, f"buffer-checkpoint-{step}.npz"))
-                print(f"  [checkpoint] Saved {ckpt_path}")
+                _log(f"  [checkpoint] Saved {ckpt_path}")
 
             # Broadcast latest weights to actors
             if cfg.num_actors > 1:
                 model.save_checkpoint(_LATEST)
 
             # ── Evaluation ─────────────────────────────────────────────
-            if step % (cfg.checkpoint_freq * 5) == 0 or step == start_step + 1:
-                # Run evaluation in background thread so actor queues
-                # keep being consumed during the eval games.
-                eval_model = build_model(game, cfg)
-                eval_model.load_checkpoint(step if step % cfg.checkpoint_freq == 0
-                                           else _LATEST)
-                eval_future = threading.Thread(
-                    target=_run_eval,
-                    args=(game, eval_model, cfg, step),
-                    daemon=True)
-                eval_future.start()
+            if step % cfg.checkpoint_freq == 0 and step > 0:
+                now = time.time()
+                eval_idle = (_eval_thread is None
+                             or not _eval_thread.is_alive())
+                if (eval_idle
+                        and now - _last_eval_time >= cfg.eval_min_interval):
+                    _last_eval_time = now
+                    # Collect last N checkpoints (before current) as references
+                    ckpts = []
+                    for f in os.listdir(cfg.path):
+                        if not (f.startswith("checkpoint-") and f.endswith(".pt")):
+                            continue
+                        try:
+                            s = int(f.split("-")[1].split(".")[0])
+                            if s < step:
+                                ckpts.append(s)
+                        except (ValueError, IndexError):
+                            pass
+                    ckpts.sort(reverse=True)
+                    refs = ckpts[:cfg.eval_reference_count]
+                    if not refs:
+                        refs = [-1]  # sentinel: no checkpoints → random
+                    _eval_thread = threading.Thread(
+                        target=_run_eval_bg,
+                        args=(cfg.path, step, refs, cfg.evaluation_window),
+                        daemon=True)
+                    _eval_thread.start()
 
         # Final save
         model.save_checkpoint(cfg.max_steps)
-        print(f"\n[train] Done. Final checkpoint: {cfg.max_steps}")
+        _log(f"\n[train] Done. Final checkpoint: {cfg.max_steps}")
 
     finally:
         for p, q in actors:
             if p.is_alive():
                 p.terminate()
                 p.join(timeout=5)
-
-    _tee.close()
-
 
 if __name__ == "__main__":
     main()

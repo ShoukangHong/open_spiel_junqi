@@ -1,14 +1,8 @@
 """Evaluate two strategies against each other in Othello.
 
-Usage: edit the MATCH config below and run.
+Usage:  python eval_match.py
 
-    python eval_match.py
-
-Strategies:
-    "random"   — uniform random over legal actions
-    "greedy"   — one-step lookahead: pick the move that maximizes disk count
-    "model"    — checkpoint policy head only (no MCTS)
-    "mcts"     — checkpoint + BatchMCTS with configurable simulations
+Also importable:  from train.eval_match import run_match
 """
 
 import json
@@ -26,32 +20,7 @@ from train.batch_mcts.evaluator import PyTorchEvaluator
 from train.batch_mcts.mcts import BatchMCTS
 from train.model.othello_resnet import Model, OthelloResNet
 
-# ── Strategy config per player ───────────────────────────────────────────────
-# Each player can have their own checkpoint, MCTS budget, and strategy.
-PLAYER = {
-    0: {  # Black (X)
-        "strategy":   "mcts",
-        "checkpoint_dir":  r"C:\Users\shouk\othello_train_v2",
-        "checkpoint_step": 120,
-        "mcts_simulations": 128,
-        "mcts_batch_size":  8,
-        "mcts_uct_c":       1.41,
-    },
-    1: {  # White (O)
-        "strategy":   "mcts",
-        "checkpoint_dir":  r"C:\Users\shouk\othello_train_v2",
-        "checkpoint_step": 80,
-        "mcts_simulations": 128,
-        "mcts_batch_size":  6,
-        "mcts_uct_c":       1.41,
-    },
-}
-
-NUM_GAMES = 100
-MODEL_TEMPERATURE = 0.1  # for "model" policy sampling, and MCTS after drop
-MCTS_TEMP_DROP = 4       # first N moves use τ=1 for MCTS
-
-# ── Internals ────────────────────────────────────────────────────────────────
+# ── Module-level caches (reused across run_match calls) ──────────────────────
 _game = None
 _models = {}
 _mcts_bots = {}
@@ -65,15 +34,7 @@ def _game_obj():
     return _game
 
 
-def _load_if_needed(cfg):
-    s = cfg["strategy"]
-    if s == "model" or s == "mcts":
-        _model_for(cfg)
-
-
-
 def _model_for(player_cfg):
-    """Lazy-load model for a player config dict."""
     key = (player_cfg["checkpoint_dir"], player_cfg.get("checkpoint_step", 0))
     if key not in _models:
         game = _game_obj()
@@ -84,20 +45,20 @@ def _model_for(player_cfg):
             input_channels=game.observation_tensor_shape()[0],
             board_size=game.observation_tensor_shape()[1],
             output_size=game.num_distinct_actions(),
-            nn_width=tc["nn_width"], nn_depth=tc["nn_depth"])
+            nn_width=tc.get("nn_width", 32),
+            nn_depth=tc.get("nn_depth", 6))
         m = Model(net, device=tc.get("device", "cpu"),
                   checkpoint_path=player_cfg["checkpoint_dir"])
         step = player_cfg.get("checkpoint_step", 0)
         if step > 0:
             m.load_checkpoint(step)
-            print(f"[{player_cfg['checkpoint_dir'].rsplit(chr(92),1)[-1]}:{step}]"
-                  f" params={m.num_trainable_variables}")
+            print(f"  [eval] loaded {player_cfg['checkpoint_dir'].rsplit(chr(92),1)[-1].rsplit('/',1)[-1]}:{step}"
+                  f"  params={m.num_trainable_variables}")
         _models[key] = m
     return _models[key]
 
 
 def _mcts_for(player_cfg):
-    """Lazy-load MCTS bot for a player config dict."""
     key = id(player_cfg)
     if key not in _mcts_bots:
         game = _game_obj()
@@ -113,7 +74,7 @@ def _mcts_for(player_cfg):
     return _mcts_bots[key]
 
 
-def _act(player_cfg, state, move_num=0):
+def _act(player_cfg, state, move_num, temperature, temp_drop):
     strategy = player_cfg["strategy"]
     legal = state.legal_actions()
 
@@ -132,8 +93,8 @@ def _act(player_cfg, state, move_num=0):
         mask = np.asarray(state.legal_actions_mask(), dtype=bool)
         _, policy = _model_for(player_cfg).inference(obs, mask)
         probs = np.array([policy[a] for a in legal])
-        if MODEL_TEMPERATURE > 0:
-            probs = probs ** (1.0 / MODEL_TEMPERATURE)
+        if temperature > 0:
+            probs = probs ** (1.0 / temperature)
             probs /= probs.sum()
             return np.random.choice(legal, p=probs)
         return legal[int(np.argmax(probs))]
@@ -142,7 +103,7 @@ def _act(player_cfg, state, move_num=0):
         root = _mcts_for(player_cfg).mcts_search(state)
         visits = np.array([c.explore_count for c in root.children])
         probs = visits / visits.sum()
-        tau = 1.0 if move_num < MCTS_TEMP_DROP else MODEL_TEMPERATURE
+        tau = 1.0 if move_num < temp_drop else temperature
         probs = probs ** (1.0 / max(tau, 0.01))
         probs /= probs.sum()
         actions = [c.action for c in root.children]
@@ -151,22 +112,46 @@ def _act(player_cfg, state, move_num=0):
     raise ValueError(f"Unknown strategy: {strategy}")
 
 
-def main():
-    cfg0, cfg1 = PLAYER[0], PLAYER[1]
-    _load_if_needed(cfg0)
-    _load_if_needed(cfg1)
+# ── Core function ────────────────────────────────────────────────────────────
 
+def run_match(cfg0, cfg1, num_games=100, temperature=0.1, temp_drop=4,
+              quiet=True):
+    """Run a match between two strategies.
+
+    Args:
+        cfg0, cfg1: dicts with keys: strategy, checkpoint_dir, checkpoint_step,
+                    mcts_simulations, mcts_batch_size, mcts_uct_c.
+        num_games: number of games to play.
+        temperature: model/MCTS temperature after temp_drop.
+        temp_drop: first N moves use τ=1 for MCTS.
+        quiet: if True, suppress per-player load messages.
+
+    Returns:
+        (score_dict, sequences)
+        score_dict: {"name0": wins, "name1": wins, "draw": draws}
+        sequences: list of (label, tuple_of_actions)
+    """
     s0, s1 = cfg0["strategy"], cfg1["strategy"]
     st0 = cfg0.get("checkpoint_step", 0)
     st1 = cfg1.get("checkpoint_step", 0)
-    name0 = f"{s0}" if s0 in ("random","greedy") else f"{s0}(step{st0},{cfg0.get('mcts_simulations',0)}sim)"
-    name1 = f"{s1}" if s1 in ("random","greedy") else f"{s1}(step{st1},{cfg1.get('mcts_simulations',0)}sim)"
-    print(f"\nMatch: {name0} (black) vs {name1} (white), {NUM_GAMES} games\n")
+    name0 = (f"{s0}" if s0 in ("random", "greedy")
+             else f"{s0}(step{st0},{cfg0.get('mcts_simulations', 0)}sim)")
+    name1 = (f"{s1}" if s1 in ("random", "greedy")
+             else f"{s1}(step{st1},{cfg1.get('mcts_simulations', 0)}sim)")
+
+    # Pre-load models (unconditionally to populate caches)
+    for cfg in (cfg0, cfg1):
+        s = cfg["strategy"]
+        if s in ("model", "mcts"):
+            _model_for(cfg)
+
+    if not quiet:
+        print(f"\nMatch: {name0} (black) vs {name1} (white), {num_games} games\n")
 
     score = {name0: 0, name1: 0, "draw": 0}
-    sequences = []  # list of (label, [action, action, ...])
+    sequences = []
 
-    for i in range(NUM_GAMES):
+    for i in range(num_games):
         if i % 2 == 0:
             cfg_b, cfg_w = cfg0, cfg1
             label_b, label_w = name0, name1
@@ -180,7 +165,7 @@ def main():
         while not state.is_terminal():
             cur = state.current_player()
             cfg = cfg_b if cur == 0 else cfg_w
-            action = _act(cfg, state, move_num)
+            action = _act(cfg, state, move_num, temperature, temp_drop)
             state.apply_action(action)
             moves.append(action)
             move_num += 1
@@ -194,17 +179,47 @@ def main():
         else:
             score["draw"] += 1
 
-        if (i + 1) % 10 == 0:
-            print(f"  {i + 1:4d}/{NUM_GAMES}  "
+        if not quiet and (i + 1) % 10 == 0:
+            print(f"  {i + 1:4d}/{num_games}  "
                   f"{name0}={score[name0]:3d}  {name1}={score[name1]:3d}  "
                   f"draw={score['draw']:3d}")
 
-    n = NUM_GAMES
-    print(f"\n-- {name0}: {score[name0]} ({score[name0]/n:.1%})  "
-          f"{name1}: {score[name1]} ({score[name1]/n:.1%})  "
+    return score, sequences
+
+
+# ── Default config + main ────────────────────────────────────────────────────
+
+PLAYER = {
+    0: {"strategy": "model",
+        "checkpoint_dir": r"C:\Users\shouk\othello_train_v2",
+        "checkpoint_step": 5,
+        "mcts_simulations": 128, "mcts_batch_size": 6, "mcts_uct_c": 1.41},
+    1: {"strategy": "random",
+        "checkpoint_dir": r"C:\Users\shouk\othello_train_v2",
+        "checkpoint_step": 130,
+        "mcts_simulations": 128, "mcts_batch_size": 6, "mcts_uct_c": 1.41},
+}
+
+DEFAULT_NUM_GAMES = 100
+DEFAULT_TEMPERATURE = 0.1
+DEFAULT_TEMP_DROP = 4
+
+
+def main():
+    score, sequences = run_match(
+        PLAYER[0], PLAYER[1],
+        num_games=DEFAULT_NUM_GAMES,
+        temperature=DEFAULT_TEMPERATURE,
+        temp_drop=DEFAULT_TEMP_DROP,
+        quiet=False)
+
+    n = DEFAULT_NUM_GAMES
+    s0, s1 = list(score.keys())[:2]
+    print(f"\n-- {s0}: {score[s0]} ({score[s0]/n:.1%})  "
+          f"{s1}: {score[s1]} ({score[s1]/n:.1%})  "
           f"draw: {score['draw']} ({score['draw']/n:.1%})")
 
-    # ── Move diversity: prefix overlap ──────────────────────────────────────
+    # Move diversity
     print("\n[PREFIX OVERLAP]  unique prefixes / games  (most-common count)")
     max_len = max(len(m) for _, m in sequences)
     for L in range(1, min(max_len + 1, 61), 5):
