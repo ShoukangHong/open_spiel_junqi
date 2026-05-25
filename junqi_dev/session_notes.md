@@ -67,6 +67,8 @@ git clone -b develop --single-branch --depth 1 git@github.com:jblespiau/dds.git 
 mkdir build && cd build
 cmake -G "Visual Studio 17 2022" -DOPEN_SPIEL_BUILD_WITH_PYTHON=ON ../open_spiel
 cmake --build . --config Release -j
+cd ..
+Copy-Item -Path build\python\Release\pyspiel.pyd -Destination pyspiel.pyd -Force
 ```
 
 #### 2.3 创建 venv 并安装

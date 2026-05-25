@@ -32,17 +32,17 @@ PLAYER = {
     0: {  # Black (X)
         "strategy":   "mcts",
         "checkpoint_dir":  r"C:\Users\shouk\othello_train_v2",
-        "checkpoint_step": 90,
+        "checkpoint_step": 50,
         "mcts_simulations": 128,
-        "mcts_batch_size":  4,
+        "mcts_batch_size":  8,
         "mcts_uct_c":       1.41,
     },
     1: {  # White (O)
-        "strategy":   "mcts",
+        "strategy":   "model",
         "checkpoint_dir":  r"C:\Users\shouk\othello_train_v2",
         "checkpoint_step": 50,
         "mcts_simulations": 128,
-        "mcts_batch_size":  4,
+        "mcts_batch_size":  6,
         "mcts_uct_c":       1.41,
     },
 }
@@ -108,7 +108,7 @@ def _mcts_for(player_cfg):
             uct_c=player_cfg.get("mcts_uct_c", 1.41),
             policy_epsilon=0, verbose=False)
         _mcts_bots[key] = BatchMCTS(
-            game, cfg, ev, random_state=np.random.RandomState())
+            game, cfg, ev, random_state=np.random.RandomState(342))
     return _mcts_bots[key]
 
 
@@ -128,7 +128,7 @@ def _act(player_cfg, state):
 
     if strategy == "model":
         obs = np.asarray(state.observation_tensor(), dtype=np.float32)
-        mask = np.asarray(state.legal_actions_mask(), dtype=np.bool)
+        mask = np.asarray(state.legal_actions_mask(), dtype=bool)
         _, policy = _model_for(player_cfg).inference(obs, mask)
         probs = np.array([policy[a] for a in legal])
         if MODEL_TEMPERATURE > 0:

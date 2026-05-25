@@ -147,7 +147,7 @@ class PyTorchEvaluator(BatchEvaluator):
 
     def _make_cache_key(self, state):
         obs = np.asarray(state.observation_tensor(), dtype=np.float32)
-        mask = np.asarray(state.legal_actions_mask(), dtype=np.bool)
+        mask = np.asarray(state.legal_actions_mask(), dtype=bool)
         return obs.tobytes() + mask.tobytes()
 
     def _inference(self, state):
@@ -157,7 +157,7 @@ class PyTorchEvaluator(BatchEvaluator):
             key,
             lambda: self._model.inference(
                 np.asarray(state.observation_tensor(), dtype=np.float32),
-                np.asarray(state.legal_actions_mask(), dtype=np.bool)),
+                np.asarray(state.legal_actions_mask(), dtype=bool)),
         )
         return value, policy
 
@@ -207,7 +207,7 @@ class PyTorchEvaluator(BatchEvaluator):
             obs_list.append(
                 np.asarray(state.observation_tensor(), dtype=np.float32))
             mask_list.append(
-                np.asarray(state.legal_actions_mask(), dtype=np.bool))
+                np.asarray(state.legal_actions_mask(), dtype=bool))
 
         obs_batch = np.stack(obs_list, axis=0)
         mask_batch = np.stack(mask_list, axis=0)

@@ -11,7 +11,7 @@ import os
 
 import numpy as np
 
-BUFFER_FILE = r"C:\Users\shouk\othello_train_v2\buffer-checkpoint-5.npz"
+BUFFER_FILE = r"C:\Users\shouk\othello_train_v2\buffer-checkpoint-45.npz"
 
 COLS = 8
 

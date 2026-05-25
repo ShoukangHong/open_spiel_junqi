@@ -81,15 +81,14 @@ class Node:
         When virtual_visits > 0 the exploration bonus shrinks (larger N)
         and the penalty term pushes sibling threads elsewhere.
 
-        No ``inf`` shortcut for unexplored nodes — when explore_count=0
-        and virtual_visits=0 the formula reduces to c * P * sqrt(parent_N),
-        which matches the original PUCT and breaks ties by prior.
+        ``max(parent, 1)`` ensures prior information guides selection even
+        when the parent has zero real visits (first batch at root).
         """
         if self.outcome is not None:
             return self.outcome[self.player]
 
         n = self.visit_count
-        u = uct_c * self.prior * math.sqrt(parent_explore_count) / (n + 1)
+        u = uct_c * self.prior * math.sqrt(max(parent_explore_count, 1)) / (n + 1)
         vloss = -virtual_loss * self.virtual_visits / max(n, 1)
         return self.q_value + u + vloss
 

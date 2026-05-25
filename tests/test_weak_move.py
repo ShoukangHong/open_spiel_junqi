@@ -113,10 +113,8 @@ def _mk_weak_test(game_str, diff_val, threshold, weak_thresh):
 
     c = _cfg(rare_case_threshold=threshold, weak_move_threshold=weak_thresh,
              weak_move_prob=1.0, game=game_str)
-    rng = np.random.RandomState(42)
     a, tag, wc, rs, _wc = _try_weak_move(
-        m, st, root, c, rng, weak_side=st.current_player(), weak_count=0,
-        weak_max=c.weak_max_per_game)
+        m, st, root, c, weak_count=0, weak_max=c.weak_max_per_game)
     return a, tag, wc, rs, ra, wa, mv
 
 
@@ -170,7 +168,7 @@ def test_buffer_tags():
     print("Test E: buffer tag_counts() ...", end=" ")
     buf = ReplayBuffer(max_size=100)
     o = np.zeros((4, 8, 8), dtype=np.float32)
-    mk = np.ones(65, dtype=np.bool)
+    mk = np.ones(65, dtype=bool)
     po = np.zeros(65, dtype=np.float32)
     po[19] = 1.0
     buf.append(o, mk, po, 0.5, tag="")
@@ -199,8 +197,7 @@ def test_perspective():
     tto._nn_raw_after_move = lambda *_: 0.3
     try:
         _, tag, _, _, _ = _try_weak_move(
-            m, st, root, c, np.random.RandomState(42),
-            weak_side=1, weak_count=0, weak_max=1)
+            m, st, root, c, weak_count=0, weak_max=1)
         assert tag == ""  # nn_cur=-0.3, mcts≈0, diff≈-0.3 < 0.4
     finally:
         tto._nn_raw_after_move = _orig

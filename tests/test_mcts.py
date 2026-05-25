@@ -81,11 +81,12 @@ def test_vs_original():
 
     for i in range(10):
         state = game.new_initial_state()
+        rng_pre = np.random.RandomState(1000 + i)
         # Play 3 random moves to reach a mid-game position
         for _ in range(3):
             if state.is_terminal():
                 break
-            state.apply_action(np.random.choice(state.legal_actions()))
+            state.apply_action(rng_pre.choice(state.legal_actions()))
 
         if state.is_terminal():
             continue

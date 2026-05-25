@@ -111,6 +111,24 @@ class OthelloResNet(nn.Module):
         self.value_fc1 = nn.Linear(board_size * board_size, nn_width)
         self.value_fc2 = nn.Linear(nn_width, 1)
 
+        self._init_weights()
+
+    def _init_weights(self):
+        """Explicit kaiming init for all conv/linear layers."""
+        for name, m in self.named_modules():
+            if isinstance(m, (nn.Conv2d, nn.Linear)):
+                if name in ("policy_fc", "value_fc2"):
+                    # Output heads: small uniform for stable initial logits/values
+                    nn.init.uniform_(m.weight, -0.03, 0.03)
+                else:
+                    nn.init.kaiming_normal_(m.weight, mode="fan_out",
+                                            nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
     @property
     def device(self):
         return next(self.parameters()).device
@@ -159,7 +177,7 @@ class OthelloResNet(nn.Module):
         self.eval()
         with torch.no_grad():
             obs_t = torch.from_numpy(
-                np.asarray(observation, dtype=np.float32)).to(self.device)
+                np.ascontiguousarray(observation, dtype=np.float32)).to(self.device)
             if obs_t.dim() == 3:
                 obs_t = obs_t.unsqueeze(0)
             else:
@@ -167,16 +185,17 @@ class OthelloResNet(nn.Module):
                                       self.board_size, self.board_size)
 
             mask_t = torch.from_numpy(
-                np.asarray(legals_mask, dtype=np.bool)).to(self.device)
+                np.asarray(legals_mask, dtype=bool)).to(self.device)
             if mask_t.dim() == 1:
                 mask_t = mask_t.unsqueeze(0)
 
             policy_logits, value = self.forward(obs_t)
-
-            # Mask illegal actions
+            policy_logits = torch.clamp(policy_logits, -30, 30)
             policy_logits = torch.where(mask_t, policy_logits,
-                                        torch.full_like(policy_logits, torch.finfo(policy_logits.dtype).min))
+                                        torch.full_like(policy_logits, -1e9))
             policy = F.softmax(policy_logits, dim=-1)
+            policy = policy * mask_t
+            policy = policy / policy.sum(dim=-1, keepdims=True).clamp(min=1e-9)
 
             return value[0].item(), policy[0].cpu().numpy()
 
@@ -196,9 +215,9 @@ class OthelloResNet(nn.Module):
         self.eval()
         with torch.no_grad():
             obs_t = torch.from_numpy(
-                np.asarray(observations, dtype=np.float32)).to(self.device)
+                np.ascontiguousarray(observations, dtype=np.float32)).to(self.device)
             mask_t = torch.from_numpy(
-                np.asarray(legals_masks, dtype=np.bool)).to(self.device)
+                np.asarray(legals_masks, dtype=bool)).to(self.device)
 
             # NaN/Inf guard: corrupted weights produce NaN logits,
             # which cause CUDA unknown error in downstream ops.
@@ -217,9 +236,12 @@ class OthelloResNet(nn.Module):
             if not torch.isfinite(value).all():
                 raise RuntimeError("batch_inference: value contains NaN/Inf (model weights likely corrupted)")
 
+            policy_logits = torch.clamp(policy_logits, -30, 30)
             policy_logits = torch.where(mask_t, policy_logits,
-                                        torch.full_like(policy_logits, torch.finfo(policy_logits.dtype).min))
+                                        torch.full_like(policy_logits, -1e9))
             policies = F.softmax(policy_logits, dim=-1)
+            policies = policies * mask_t
+            policies = policies / policies.sum(dim=-1, keepdims=True).clamp(min=1e-9)
 
             return value.cpu().numpy(), policies.cpu().numpy()
 
@@ -283,10 +305,15 @@ class Model:
         """
         self._model.train()
 
-        obs = torch.from_numpy(np.asarray(batch.observation, dtype=np.float32))
-        mask = torch.from_numpy(np.asarray(batch.legals_mask, dtype=np.bool))
-        target_policy = torch.from_numpy(np.asarray(batch.policy, dtype=np.float32))
+        obs = torch.from_numpy(
+            np.ascontiguousarray(batch.observation, dtype=np.float32))
+        mask = torch.from_numpy(np.asarray(batch.legals_mask, dtype=bool))
+        target_policy = torch.from_numpy(
+            np.ascontiguousarray(batch.policy, dtype=np.float32))
         target_value = torch.from_numpy(np.asarray(batch.value, dtype=np.float32))
+
+        # Ensure policy targets are normalized
+        target_policy = target_policy / target_policy.sum(dim=-1, keepdims=True).clamp(min=1e-9)
 
         dev = self._device if self._device != "cpu" else self._model.device
         obs = obs.to(dev)
@@ -303,9 +330,10 @@ class Model:
 
         # AlphaZero policy loss: full soft cross-entropy with MCTS visit
         # distribution (equivalent to optax.softmax_cross_entropy).
+        policy_logits = torch.clamp(policy_logits, -30, 30)
         policy_logits_masked = torch.where(
             mask, policy_logits,
-            torch.full_like(policy_logits, torch.finfo(policy_logits.dtype).min))
+            torch.full_like(policy_logits, -1e9))
         log_probs = F.log_softmax(policy_logits_masked, dim=-1)
         policy_loss = -(target_policy * log_probs).sum(dim=-1).mean()
 
@@ -323,6 +351,7 @@ class Model:
 
         self._optimizer.zero_grad()
         total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
         self._optimizer.step()
 
         return Losses(policy=policy_loss.item(), value=value_loss.item(),

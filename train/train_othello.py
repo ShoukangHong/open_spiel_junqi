@@ -37,6 +37,7 @@ from train.batch_mcts.config import MCTSConfig
 from train.batch_mcts.evaluator import PyTorchEvaluator
 from train.batch_mcts.mcts import BatchMCTS
 from train.model.othello_resnet import Losses, Model, OthelloResNet, TrainInput
+from train.model.symmetry import OthelloSymmetry
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -101,6 +102,7 @@ class TrainConfig:
     # then trains the same number of random mini-batches (not full-buffer).
     replay_buffer_size: int = 50000
     buffer_sampling_frac: float = 0.1  # fraction of buffer sampled per step
+    symmetry: int = 1                 # symmetry augmentation multiplier (1=off)
 
     # Training loop
     num_actors: int = 1            # 1 = single-process; >1 = multi-process
@@ -161,7 +163,7 @@ class ReplayBuffer:
         if self._obs is None:
             # Lazy init — infer shapes from first sample
             self._obs = np.empty((self._max_size, *obs.shape), dtype=np.float32)
-            self._masks = np.empty((self._max_size, *mask.shape), dtype=np.bool)
+            self._masks = np.empty((self._max_size, *mask.shape), dtype=bool)
             self._policies = np.empty((self._max_size, *policy.shape),
                                        dtype=np.float32)
             self._values = np.empty((self._max_size,), dtype=np.float32)
@@ -224,7 +226,7 @@ class ReplayBuffer:
         mask_shape = data["masks"].shape[1:]
         policy_shape = data["policies"].shape[1:]
         self._obs = np.empty((self._max_size, *obs_shape), dtype=np.float32)
-        self._masks = np.empty((self._max_size, *mask_shape), dtype=np.bool)
+        self._masks = np.empty((self._max_size, *mask_shape), dtype=bool)
         self._policies = np.empty((self._max_size, *policy_shape), dtype=np.float32)
         self._values = np.empty((self._max_size,), dtype=np.float32)
         self._tags = np.empty((self._max_size,), dtype=object)
@@ -322,25 +324,19 @@ def _nn_raw_after_move(evaluator, state, action):
     return nn_val
 
 
-def _try_weak_move(mcts, state, root, config, rng, weak_side, weak_count,
-                   weak_max, logger=None):
-    """Attempt a weak move on the current state.  *root* must be a fresh
-    MCTS search result for *state*.
+def _try_weak_move(mcts, state, root, config, weak_count, weak_max,
+                   logger=None):
+    """Attempt a weak move on *state*.  Caller guarantees this is the
+    weak side and weak_count < weak_max.
 
     Returns (action, tag, weak_count, rare_state, weak_cat).
     """
     cur_player = state.current_player()
     mcts_action = root.best_child().action
-
-    # Default: no weak move
     action = mcts_action
     tag = ""
     rare_state = None
     weak_cat = ""
-
-    if (weak_side is None or cur_player != weak_side
-            or weak_count >= weak_max):
-        return action, tag, weak_count, rare_state, weak_cat
 
     # NN argmax as weak move candidate
     _, nn_policy_arr = mcts.evaluator._inference(state)
@@ -348,28 +344,26 @@ def _try_weak_move(mcts, state, root, config, rng, weak_side, weak_count,
     weak_a = max(legal, key=lambda a: nn_policy_arr[a])
 
     if weak_a == mcts_action:
-        return action, tag, weak_count, rare_state, weak_cat
+        return mcts_action, "", weak_count, None, ""
 
     # Evaluate state AFTER weak move
     nn_val_after = _nn_raw_after_move(mcts.evaluator, state, weak_a)
     mcts_val = root.total_reward / max(root.explore_count, 1)
     nn_cur = nn_val_after if cur_player == 0 else -nn_val_after
 
-    # Relative damage: how much win probability the weak move costs.
-    # prob = (val + 1) / 2, e.g. val=+0.2 → 60%, val=-0.5 → 25%.
+    # Relative drop in win probability: how much the weak move costs.
     def _to_prob(v):
         return max((v + 1.0) / 2.0, 0.005)
     p_before = _to_prob(mcts_val)
     p_after = _to_prob(nn_cur)
-    # Symmetric: denominator = larger of the two (the more optimistic estimate).
     rel_drop = abs(p_before - p_after) / max(p_before, p_after, 0.01)
-    # rel_drop > 0 means NN's assessment diverges from MCTS (either direction).
 
     if rel_drop > config.rare_case_threshold:
         weak_cat = "rare"
         rare_state = state.clone()
+        rare_state.apply_action(weak_a)  # fork from AFTER the weak move
         tag = "rare"
-        weak_count += 1
+        weak_count = weak_max + 1  # consume all weak attempts
         if logger:
             logger.log_line(
                 f"\n── Rare Case ──\n{state}\n"
@@ -383,8 +377,7 @@ def _try_weak_move(mcts, state, root, config, rng, weak_side, weak_count,
     else:
         weak_cat = "weak_final"
         action = weak_a
-        weak_count = weak_max
-        weak_count += 1
+        weak_count = weak_max + 1  # consume all weak attempts
 
     return action, tag, weak_count, rare_state, weak_cat
 
@@ -438,11 +431,13 @@ def play_game(game, mcts, config, rng, logger=None,
         # ── MCTS ────────────────────────────────────────────────────
         root = mcts.mcts_search(state)
 
-        # ── Weak-move (pre-rolled steps, +1 for turn alignment) ─────
-        if move_num in weak_steps or (move_num + 1) in weak_steps:
+        # ── Weak-move (pre-rolled steps) ─────────────────────────────
+        if ((move_num in weak_steps or (move_num + 1) in weak_steps)
+                and weak_side is not None
+                and cur_player == weak_side
+                and weak_count < weak_max):
             action, tag, weak_count, rare_state, weak_cat = _try_weak_move(
-                mcts, state, root, config, rng, weak_side, weak_count,
-                weak_max, logger)
+                mcts, state, root, config, weak_count, weak_max, logger)
         else:
             action, tag, weak_cat = root.best_child().action, "", ""
             rare_state = None
@@ -477,7 +472,7 @@ def play_game(game, mcts, config, rng, logger=None,
 
         # ── Store & apply ────────────────────────────────────────────
         obs = np.asarray(state.observation_tensor(), dtype=np.float32)
-        mask = np.asarray(state.legal_actions_mask(), dtype=np.bool)
+        mask = np.asarray(state.legal_actions_mask(), dtype=bool)
         states_info.append((obs, mask, policy, cur_player, tag))
 
         # Action selection: use temperature sample for MCTS moves,
@@ -526,7 +521,11 @@ def build_model(game, cfg):
 
 
 def actor_process(cfg_dict: dict, result_queue: mp.Queue, actor_id: int = 0):
-    """Subprocess: play self-play games, send trajectories to learner."""
+    """Subprocess: play self-play games, send trajectories to learner.
+
+    Uses a pending queue so rare-case forks are interleaved with fresh
+    games instead of being played all at once after each main game.
+    """
     # Reconstruct config (avoids pickling issues on Windows)
     cfg = TrainConfig(**cfg_dict)
     game = pyspiel.load_game(cfg.game)
@@ -544,6 +543,7 @@ def actor_process(cfg_dict: dict, result_queue: mp.Queue, actor_id: int = 0):
 
     loaded_step = 0
     _LATEST = -999  # sentinel for "latest" checkpoint
+    pending = []  # (init_state, allow_weak, tag_override)
 
     while True:
         # Check for new model weights
@@ -555,18 +555,25 @@ def actor_process(cfg_dict: dict, result_queue: mp.Queue, actor_id: int = 0):
                 evaluator.clear_cache()
                 loaded_step = mtime
 
-        result = play_game(game, mcts, cfg, rng, logger=logger)
-        states_info, returns, rare_games, wstats = result
+        # ── Decide what game to play next ──────────────────────────────
+        if pending:
+            init_state, allow_weak, tag_override = pending.pop()
+        else:
+            init_state, allow_weak, tag_override = None, True, ""
 
-        # Play out rare-case forked games (no weak moves in rare games)
-        for rare_state in rare_games:
-            rare_info, rare_returns, *_ = play_game(
-                game, mcts, cfg, rng, init_state=rare_state, allow_weak=False,
-                logger=logger)
-            for i in range(len(rare_info)):
-                obs, mask, policy, cp, _ = rare_info[i]
-                rare_info[i] = (obs, mask, policy, cp, "rare")
-            states_info.extend(rare_info)
+        states_info, returns, rare_games, wstats = play_game(
+            game, mcts, cfg, rng, logger=logger,
+            init_state=init_state, allow_weak=allow_weak)
+
+        # Enqueue rare states for future games
+        for rs in rare_games:
+            pending.append((rs, False, "rare"))
+
+        # Apply tag override so the learner knows this came from a fork
+        if tag_override:
+            for i in range(len(states_info)):
+                obs, mask, policy, cp, _tag = states_info[i]
+                states_info[i] = (obs, mask, policy, cp, tag_override)
 
         try:
             result_queue.put((states_info, returns, wstats), timeout=1)
@@ -713,7 +720,11 @@ def main():
     samples_per_step = max(
         int(cfg.replay_buffer_size * cfg.buffer_sampling_frac),
         cfg.train_batch_size)
-    n_updates = samples_per_step // cfg.train_batch_size
+    n_updates = samples_per_step * cfg.symmetry // cfg.train_batch_size
+    sym = OthelloSymmetry() if cfg.symmetry > 1 else None
+    print(f"[train] buffer_sampling_frac={cfg.buffer_sampling_frac}"
+          f"  symmetry={cfg.symmetry}"
+          f"  n_updates={n_updates}")
 
     # Resume from checkpoint
     start_step = 0
@@ -786,30 +797,32 @@ def main():
                                  random_state=np.random.RandomState(
                                      cfg.seed + step * 1000))
                 game_logger = GameLogger(cfg.path, 0)
+                pending = []  # (init_state, allow_weak, tag_override)
 
                 while total_states < samples_per_step:
+                    # ── Decide what game to play next ──────────────────
+                    if pending:
+                        init_state, allow_weak, tag_override = pending.pop()
+                    else:
+                        init_state, allow_weak, tag_override = None, True, ""
+
                     states_info, returns, rare_games, wstats = play_game(
-                        game, mcts, cfg, global_rng, logger=game_logger)
+                        game, mcts, cfg, global_rng, logger=game_logger,
+                        init_state=init_state, allow_weak=allow_weak)
                     _accum_wstats(cfg, wstats)
-                    # Play out rare-case forks
-                    for rare_state in rare_games:
-                        rare_info, rare_returns, *_ = play_game(
-                            game, mcts, cfg, global_rng,
-                            init_state=rare_state, allow_weak=False,
-                            logger=game_logger)
-                        for i in range(len(rare_info)):
-                            obs, mask, policy, cp, _ = rare_info[i]
-                            rare_info[i] = (obs, mask, policy, cp, "rare")
-                        states_info.extend(rare_info)
+
+                    # Enqueue rare states for future games
+                    for rs in rare_games:
+                        pending.append((rs, False, "rare"))
 
                     game_outcome_p0 = returns[0]
-
-                    game_outcome_p0 = returns[0]
-
                     for item in states_info:
                         obs, mask, policy, cur_player = item[:4]
                         tag = item[4] if len(item) > 4 else ""
-                        buffer.append(obs, mask, policy, game_outcome_p0, tag)
+                        if tag_override:
+                            tag = tag_override
+                        buffer.append(obs, mask, policy,
+                                      game_outcome_p0, tag)
 
                     if game_outcome_p0 > 0:
                         outcomes["p0"] += 1
@@ -860,6 +873,11 @@ def main():
 
             for _ in range(n_updates):
                 batch = buffer.sample(cfg.train_batch_size)
+                if sym is not None:
+                    obs, mask, policy = sym.augment_batch(
+                        batch.observation, batch.legals_mask, batch.policy)
+                    batch = TrainInput(observation=obs, legals_mask=mask,
+                                       policy=policy, value=batch.value)
                 loss = model.update(batch)
                 losses_list.append(loss)
 
