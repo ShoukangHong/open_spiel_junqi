@@ -635,9 +635,9 @@ def _run_eval_bg(cfg_path, current_step, ref_steps, num_games):
                              temperature=0.1, temp_drop=4, quiet=True)
         keys = [k for k in score if k != "draw"]
         wr = score[keys[0]] / max(num_games, 1)
-        print(f"    [eval] step{current_step} vs {ref_name}:  "
-              f"W={score[keys[0]]} L={score[keys[1]]} D={score['draw']} "
-              f"WR={wr:.1%}")
+        logging.info(f"    [eval] step{current_step} vs {ref_name}:  "
+                     f"W={score[keys[0]]} L={score[keys[1]]} D={score['draw']} "
+                     f"WR={wr:.1%}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -695,7 +695,8 @@ def main():
 
     # Init model
     model = build_model(game, cfg)
-    _log(f"[train] Model params: {model.num_trainable_variables}")
+    _log(f"[train] Model params: {model.num_trainable_variables}"
+         f"  lr={cfg.learning_rate:.0e}")
 
     # Replay buffer
     buffer = ReplayBuffer(max_size=cfg.replay_buffer_size)
@@ -865,10 +866,11 @@ def main():
                                        policy=policy, value=batch.value)
                 loss = model.update(batch)
                 losses_list.append(loss)
-                # Policy entropy (nats) of the target distribution
-                p = batch.policy[batch.policy > 0]
-                if len(p) > 0:
-                    entropies.append(float(-np.mean(p * np.log(p))))
+                # Policy entropy (nats) — per-sample, then averaged
+                p = batch.policy
+                p = np.where(p > 0, p, 1.0)  # log(1)=0, neutral for entropy
+                sample_ent = -np.sum(p * np.log(p), axis=-1)
+                entropies.append(float(np.mean(sample_ent)))
 
             if losses_list:
                 avg_loss = Losses(

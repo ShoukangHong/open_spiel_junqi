@@ -189,20 +189,9 @@ def run_match(cfg0, cfg1, num_games=100, temperature=0.1, temp_drop=4,
 
 # ── Default config + main ────────────────────────────────────────────────────
 
-PLAYER = {
-    0: {"strategy": "model",
-        "checkpoint_dir": r"C:\Users\shouk\othello_train_v2",
-        "checkpoint_step": 5,
-        "mcts_simulations": 128, "mcts_batch_size": 6, "mcts_uct_c": 1.41},
-    1: {"strategy": "random",
-        "checkpoint_dir": r"C:\Users\shouk\othello_train_v2",
-        "checkpoint_step": 130,
-        "mcts_simulations": 128, "mcts_batch_size": 6, "mcts_uct_c": 1.41},
-}
-
 DEFAULT_NUM_GAMES = 100
 DEFAULT_TEMPERATURE = 0.1
-DEFAULT_TEMP_DROP = 4
+DEFAULT_TEMP_DROP = 7
 
 
 def main():
@@ -233,6 +222,21 @@ def main():
         print(f"  first {L:>2d} moves:  {len(unique)} unique  "
               f"(top occurs {top_count}/{len(prefs)} = {pct:.0f}%)")
 
+
+PLAYER = {
+    # 0: {"strategy": "mcts",
+    #     "checkpoint_dir": r"C:\Users\shouk\othello_train_v2",
+    #     "checkpoint_step": 130,
+    #     "mcts_simulations": 128, "mcts_batch_size": 6, "mcts_uct_c": 1.41},
+    0: {"strategy": "mcts",
+        "checkpoint_dir": r"C:\Users\shouk\othello_train_cloud",
+        "checkpoint_step": 180,
+        "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+    1: {"strategy": "mcts",
+        "checkpoint_dir": r"C:\Users\shouk\othello_train_cloud",
+        "checkpoint_step": 180,
+        "mcts_simulations": 512, "mcts_batch_size": 32, "mcts_uct_c": 1.41},
+}
 
 if __name__ == "__main__":
     main()

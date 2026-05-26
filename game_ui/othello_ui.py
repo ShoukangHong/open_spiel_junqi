@@ -19,8 +19,9 @@ from train.batch_mcts.mcts import BatchMCTS
 from train.model.othello_resnet import Model, OthelloResNet
 
 # ── Config — paths only, model settings read from checkpoint dir ────────
-CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_v2"
-CHECKPOINT_STEP = 120             # checkpoint step to load (must exist)
+# CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_v2"
+CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_cloud"
+CHECKPOINT_STEP = 180             # checkpoint step to load (must exist)
 MCTS_SIMULATIONS = 128          # MCTS search budget per move
 HINT_MAX_SIM = 12800
 MCTS_BATCH_SIZE = 8             # leaf evaluation batch size

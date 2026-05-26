@@ -16,7 +16,7 @@ import numpy as np
 import pygame
 
 # ── Config ──────────────────────────────────────────────────────────────────────
-BUFFER_FILE = r"C:\Users\shouk\othello_train_v2\buffer-checkpoint-80.npz"
+BUFFER_FILE = r"C:\Users\shouk\othello_train_cloud\buffer-checkpoint-140.npz"
 
 # ── Constants ───────────────────────────────────────────────────────────────────
 ROWS = COLS = 8
