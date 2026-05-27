@@ -28,5 +28,8 @@ class MCTSConfig:
     # Solver
     solve: bool = True           # Whether to back up proven terminal values
 
+    # Value head format
+    value_classes: int = 1       # 1 = scalar [-1,1]; 3 = WDL softmax
+
     # Debug
     verbose: bool = False

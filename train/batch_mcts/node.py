@@ -30,6 +30,7 @@ class Node:
         "prior",
         "explore_count",
         "total_reward",
+        "draw_reward",     # accumulated draw probability (WDL mode only)
         "virtual_visits",
         "outcome",
         "children",
@@ -43,6 +44,7 @@ class Node:
         self.prior = prior
         self.explore_count = 0
         self.total_reward = 0.0
+        self.draw_reward = 0.0
         self.virtual_visits = 0
         self.outcome = None
         self.children = []
@@ -62,6 +64,13 @@ class Node:
         if self.explore_count == 0:
             return 0.0
         return self.total_reward / self.explore_count
+
+    @property
+    def draw_rate(self) -> float:
+        """Mean draw probability through this node (WDL mode)."""
+        if self.explore_count == 0:
+            return 0.0
+        return self.draw_reward / self.explore_count
 
     def puct_value(self, parent_explore_count: int, uct_c: float) -> float:
         """Standard PUCT used by original MCTS (no virtual loss)."""

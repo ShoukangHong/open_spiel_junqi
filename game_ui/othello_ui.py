@@ -20,8 +20,9 @@ from train.model.othello_resnet import Model, OthelloResNet
 
 # ── Config — paths only, model settings read from checkpoint dir ────────
 # CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_v2"
-CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_cloud"
-CHECKPOINT_STEP = 180             # checkpoint step to load (must exist)
+# CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_cloud"
+CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_fast"
+CHECKPOINT_STEP = 10             # checkpoint step to load (must exist)
 MCTS_SIMULATIONS = 128          # MCTS search budget per move
 HINT_MAX_SIM = 12800
 MCTS_BATCH_SIZE = 8             # leaf evaluation batch size
@@ -29,39 +30,28 @@ UCT_C = 1.41
 
 
 def load_model(game):
-    """Build PyTorch OthelloResNet, reading model config from train_config.json."""
+    """Build PyTorch OthelloResNet using core model builder."""
     config_path = os.path.join(CHECKPOINT_DIR, "train_config.json")
     with open(config_path) as f:
         train_cfg = json.load(f)
-    nn_width = train_cfg["nn_width"]
-    nn_depth = train_cfg["nn_depth"]
-    device = train_cfg.get("device", "cpu")
-
-    obs_shape = game.observation_tensor_shape()
-    num_actions = game.num_distinct_actions()
-    net = OthelloResNet(
-        input_channels=obs_shape[0],
-        board_size=obs_shape[1],
-        output_size=num_actions,
-        nn_width=nn_width,
-        nn_depth=nn_depth,
-    )
-    model = Model(net, device=device, checkpoint_path=CHECKPOINT_DIR)
+    from train.core.model_builder import build_othello_model
+    model = build_othello_model(game, train_cfg)
     model.load_checkpoint(CHECKPOINT_STEP)
     print(f"Loaded checkpoint-{CHECKPOINT_STEP} from {CHECKPOINT_DIR}")
-    print(f"  nn_width={nn_width}  nn_depth={nn_depth}  device={device}")
     print(f"  params={model.num_trainable_variables}")
     return model
 
 
 def create_bot(game, model):
     """Create a BatchMCTS bot backed by the PyTorch model."""
-    evaluator = PyTorchEvaluator(game, model)
+    vc = model._model.num_value_classes
+    evaluator = PyTorchEvaluator(game, model, value_classes=vc)
     mcts_cfg = MCTSConfig(
         max_simulations=MCTS_SIMULATIONS,
         batch_size=MCTS_BATCH_SIZE,
         uct_c=UCT_C,
-        policy_epsilon=0,           # no noise during play
+        value_classes=vc,
+        policy_epsilon=0,
         verbose=False,
     )
     bot = BatchMCTS(game, mcts_cfg, evaluator,
@@ -115,14 +105,25 @@ def print_mcts_info(root, state, evaluator=None):
         root_val = root.outcome[player]
     else:
         root_val = root.total_reward / max(root.explore_count, 1)
-    print(f"  value = {root_val:+.4f}    sims = {root.explore_count}"
+    draw_info = f"  draw={root.draw_rate:.3f}" if root.draw_rate > 0.001 else ""
+    print(f"  value = {root_val:+.4f}{draw_info}    sims = {root.explore_count}"
           f"{'  (solved)' if root.outcome is not None else ''}")
 
     # Build combined: NN raw + MCTS side by side
     nn_policy = None
     if evaluator is not None:
         nn_value, nn_policy = evaluator._inference(state)
-        print(f"  ── NN raw value={nn_value:+.4f}    MCTS value={root_val:+.4f}    sims={root.explore_count} ──")
+        if hasattr(nn_value, '__len__') and not isinstance(nn_value, float):
+            # WDL output: (w, d, l)
+            w, d, l = float(nn_value[0]), float(nn_value[1]), float(nn_value[2])
+            nn_val = (w - l)
+            nn_str = f"w={w:.3f} d={d:.3f} l={l:.3f}"
+        else:
+            nn_val = float(nn_value)
+            nn_str = f"{nn_val:+.4f}"
+        print(f"  ── NN raw {nn_str}    "
+              f"MCTS value={root_val:+.4f}{draw_info}    "
+              f"sims={root.explore_count} ──")
 
     # Gather all legal actions with both policies
     legal = state.legal_actions()
@@ -201,7 +202,7 @@ def draw_board(screen, board, legal_actions=None, hints=None):
 
 
 def draw_panel(screen, black_count, white_count, current_player, message="",
-               value=None, draw_hints=False):
+               value=None, draw_rate=0.0):
     """Draw info panel below the board."""
     small_font = pygame.font.Font(None, 26)
     font = pygame.font.Font(None, 30)
@@ -212,8 +213,14 @@ def draw_panel(screen, black_count, white_count, current_player, message="",
         f"Black: {black_count}    White: {white_count}    Turn: {turn}",
     ]
     if value is not None:
-        win_pct = (1 + value) * 50
-        texts.append(f"Value: {value:+.3f}  (win rate: {win_pct:.1f}%)")
+        # Convert to black perspective
+        bq = value if current_player == 0 else -value
+        if draw_rate > 0.001:
+            bw = max(0.0, (bq + 1.0 - draw_rate) / 2.0)
+            bl = max(0.0, (1.0 - bq - draw_rate) / 2.0)
+            texts.append(f"Black W/D/L: {bw:.1%} / {draw_rate:.1%} / {bl:.1%}")
+        else:
+            texts.append(f"Value (black): {bq:+.3f}  ({((1+bq)*50):.1f}%)")
     texts.append(message)
     texts.append("H: hint   F: freeze   R: restart   Q: quit")
 
@@ -365,6 +372,7 @@ def main():
         freeze_hint = False
         hints = None
         ai_value = None
+        hint_draw_rate = 0.0
         hint_root = None
         hint_state = None
         message = ""
@@ -402,6 +410,7 @@ def main():
                                 evaluator.clear_cache()
                                 hints = None
                                 ai_value = None
+                                hint_draw_rate = 0.0
                                 hint_root = None
                                 message = ""
                                 break
@@ -414,6 +423,7 @@ def main():
                             if not showing_hints:
                                 hints = None
                                 ai_value = None
+                                hint_draw_rate = 0.0
                                 hint_root = None
                             else:
                                 hint_root = None  # force fresh search
@@ -435,7 +445,8 @@ def main():
                     if hint_root is None or hint_state != str(state):
                         hint_cfg = MCTSConfig(
                             max_simulations=64, batch_size=MCTS_BATCH_SIZE,
-                            uct_c=UCT_C, policy_epsilon=0, verbose=False)
+                            uct_c=UCT_C, value_classes=evaluator._value_classes,
+                            policy_epsilon=0, verbose=False)
                         hint_mcts = BatchMCTS(game, hint_cfg, evaluator,
                                               random_state=np.random.RandomState())
                         hint_root = hint_mcts.mcts_search(state)
@@ -446,15 +457,17 @@ def main():
                     hints = get_hints_from_root(hint_root)
                     if hint_root.outcome is not None:
                         ai_value = hint_root.outcome[current]
+                        hint_draw_rate = hint_root.draw_rate
                     else:
                         ai_value = hint_root.total_reward / max(hint_root.explore_count, 1)
+                        hint_draw_rate = hint_root.draw_rate
             else:
                 # AI turn
                 message = "AI thinking..."
                 draw_board(screen, board, state.legal_actions(), hints)
                 draw_hints_on_board(screen, hints)
                 draw_panel(screen, black_c, white_c, current, message,
-                           value=ai_value)
+                           value=ai_value, draw_rate=hint_draw_rate)
                 pygame.display.flip()
 
                 # Run MCTS and display info
@@ -470,11 +483,14 @@ def main():
                     hints = get_hints_from_root(root)
                     if root.outcome is not None:
                         ai_value = root.outcome[current]
+                        hint_draw_rate = root.draw_rate
                     else:
                         ai_value = root.total_reward / max(root.explore_count, 1)
+                        hint_draw_rate = root.draw_rate
                 else:
                     hints = None
                     ai_value = None
+                    hint_draw_rate = 0.0
                 message = f"AI played: {state.action_to_string(current, action)}"
 
             # Render
@@ -486,7 +502,7 @@ def main():
                 draw_board(screen, board, legal, hints)
                 draw_hints_on_board(screen, hints)
                 draw_panel(screen, black_c, white_c, state.current_player(), message,
-                           value=ai_value)
+                           value=ai_value, draw_rate=hint_draw_rate)
 
             clock.tick(30)
             pygame.display.flip()

@@ -41,508 +41,64 @@ import pyspiel
 from train.batch_mcts.config import MCTSConfig
 from train.batch_mcts.evaluator import PyTorchEvaluator
 from train.batch_mcts.mcts import BatchMCTS
+from train.core.base_config import BaseTrainConfig
+from train.core.checkpoint import find_latest_checkpoint
+from train.core.game_logger import GameLogger
+from train.core.replay_buffer import ReplayBuffer
+from train.core.train_utils import (
+    init_training, maybe_trigger_eval, run_eval_background,
+    setup_config_and_logging)
+from train.core.weak_move import (
+    accum_wstats, nn_raw_after_move, reset_wstats, try_weak_move,
+    wstats_summary)
+from train.games.othello.config import OthelloTrainConfig
+from train.games.othello.play import play_game
+
+TrainConfig = OthelloTrainConfig  # backward compat
+_nn_raw_after_move = nn_raw_after_move    # backward compat
+_try_weak_move = try_weak_move            # backward compat
+_accum_wstats = accum_wstats              # backward compat
+_wstats_summary = wstats_summary          # backward compat
+_reset_wstats = reset_wstats              # backward compat
 from train.model.othello_resnet import Losses, Model, OthelloResNet, TrainInput
 from train.model.symmetry import OthelloSymmetry
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-# ── Config ──────────────────────────────────────────────────────────────────
 
-@dataclass
-class TrainConfig:
-    # Game
-    game: str = "othello"
 
-    # Model
-    nn_width: int = 24
-    nn_depth: int = 6
+def _make_value(ret, value_classes):
+    if value_classes == 1:
+        return float(ret)
+    r = float(ret)
+    if r > 0.1:      return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    elif r < -0.1:   return np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    else:            return np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
-    # Optimizer
-    learning_rate: float = 3e-4
-    weight_decay: float = 1e-4
-    train_batch_size: int = 128
 
-    # MCTS
-    max_simulations: int = 64          # simulations per move
-    mcts_batch_size: int = 32          # leaf evaluation batch size
-    uct_c: float = 1.41
-    policy_epsilon: float = 0.25       # Dirichlet noise weight
-    policy_alpha: float = 1.0          # Dirichlet concentration
-    # Temperature: temp=1 for first N moves (exploration), then switches
-    # to `temperature` (near-greedy).  AlphaGo Zero: τ=1 for 30 moves, then τ→0.
-    temperature: float = 0.01         # temperature after drop (near argmax)
-    temperature_drop: int = 30        # moves before switching temperature
+from train.core.model_builder import build_othello_model as build_model
 
-    # Weak-move exploration: deliberately play suboptimal moves to
-    # discover rare/dangerous states the model has never seen.
-    weak_side_prob: float = 0.5        # probability of picking a weak side
-    weak_move_prob: float = 0.5        # P(N=k) = p^(k-1)*(1-p), E[N] = 1/(1-p). p=0.5→E=2
-    rare_case_threshold: float = 0.4   # rel win-prob drop > this → fork rare game
-    weak_move_threshold: float = 0.2   # rel win-prob drop < this → allow weak freely
-    weak_max_per_game: int = 3         # max weak moves per game (0 = disabled)
-    weak_move_max_step: int = 100      # weak moves only before this move number
 
-    # Replay buffer: large capacity + continuous random sampling.
-    # Each step collects buffer_sampling_frac * buffer_size new states,
-    # then trains the same number of random mini-batches (not full-buffer).
-    replay_buffer_size: int = 50000
-    buffer_sampling_frac: float = 0.1  # fraction of buffer sampled per step
-    symmetry: int = 1                 # symmetry augmentation multiplier (1=off)
-
-    # Training loop
-    num_actors: int = 1            # 1 = single-process; >1 = multi-process
-    max_steps: int = 300
-    checkpoint_freq: int = 10
-
-    # Evaluation
-    evaluation_window: int = 50        # games per eval per reference
-    eval_reference_count: int = 3      # compare against last N checkpoints
-    eval_min_interval: int = 1800      # seconds between evals (0 = every ckpt)
-
-    # Misc
-    path: str = "othello_train_v2"
-    seed: int = 42
-    device: str = "cpu"
-
-    def __post_init__(self):
-        if not os.path.isabs(self.path):
-            self.path = os.path.join(_SCRIPT_DIR, self.path)
-
-
-def _default_config() -> TrainConfig:
-    return TrainConfig()
-
-
-def load_config(path: str) -> TrainConfig:
-    """Load TrainConfig from JSON file, overlaid on defaults."""
-    cfg = _default_config()
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        for k, v in d.items():
-            if hasattr(cfg, k):
-                setattr(cfg, k, v)
-        print(f"[config] Loaded {path}")
-    else:
-        print(f"[config] {path} not found, using defaults")
-    return cfg
-
-
-# ── Replay Buffer ───────────────────────────────────────────────────────────
-
-class ReplayBuffer:
-    """Fixed-size FIFO ring buffer for (obs, mask, policy, value) tuples."""
-
-    def __init__(self, max_size: int):
-        self._max_size = max_size
-        self._obs = None       # shape from observation_tensor()
-        self._masks = None     # (max_size, 65)
-        self._policies = None  # (max_size, 65)
-        self._values = None    # (max_size,)
-        self._tags = None      # (max_size,) — "" = normal, "rare" = rare case
-        self._index = 0
-        self._size = 0
-
-    def append(self, obs: np.ndarray, mask: np.ndarray,
-               policy: np.ndarray, value: float, tag: str = ""):
-        """Add one training sample."""
-        if self._obs is None:
-            # Lazy init — infer shapes from first sample
-            self._obs = np.empty((self._max_size, *obs.shape), dtype=np.float32)
-            self._masks = np.empty((self._max_size, *mask.shape), dtype=bool)
-            self._policies = np.empty((self._max_size, *policy.shape),
-                                       dtype=np.float32)
-            self._values = np.empty((self._max_size,), dtype=np.float32)
-            self._tags = np.empty((self._max_size,), dtype=object)
-
-        idx = self._index % self._max_size
-        self._obs[idx] = obs.astype(np.float32)
-        self._masks[idx] = mask
-        self._policies[idx] = policy.astype(np.float32)
-        self._values[idx] = float(value)
-        self._tags[idx] = tag
-        self._index += 1
-        self._size = min(self._size + 1, self._max_size)
-
-    def sample(self, n: int):
-        """Sample a batch of n transitions uniformly."""
-        indices = np.random.randint(0, self._size, size=n)
-        return TrainInput(
-            observation=self._obs[indices],
-            legals_mask=self._masks[indices],
-            policy=self._policies[indices],
-            value=self._values[indices],
-        )
-
-    def tag_counts(self) -> dict:
-        """Return count of each tag as plain Python types."""
-        if self._tags is None:
-            return {}
-        tags = self._tags[:self._size]
-        valid = [str(t) for t in tags if t is not None]
-        if not valid:
-            return {}
-        unique, counts = np.unique(valid, return_counts=True)
-        return {str(k): int(v) for k, v in zip(unique, counts)}
-
-    def save(self, filepath: str):
-        """Serialize buffer to a .npz file."""
-        if self._obs is None:
-            return  # nothing to save
-        tags_arr = np.array(self._tags[:self._size], dtype=str)
-        np.savez_compressed(
-            filepath,
-            obs=self._obs[:self._size],
-            masks=self._masks[:self._size],
-            policies=self._policies[:self._size],
-            values=self._values[:self._size],
-            tags=tags_arr,
-            index=self._index,
-            size=self._size,
-        )
-
-    def load(self, filepath: str):
-        """Restore buffer from a .npz file."""
-        data = np.load(filepath)
-        self._size = int(data["size"])
-        self._index = int(data["index"])
-        self._max_size = max(self._max_size, self._size)
-        # Re-allocate to max_size (ring buffer may grow)
-        obs_shape = data["obs"].shape[1:]
-        mask_shape = data["masks"].shape[1:]
-        policy_shape = data["policies"].shape[1:]
-        self._obs = np.empty((self._max_size, *obs_shape), dtype=np.float32)
-        self._masks = np.empty((self._max_size, *mask_shape), dtype=bool)
-        self._policies = np.empty((self._max_size, *policy_shape), dtype=np.float32)
-        self._values = np.empty((self._max_size,), dtype=np.float32)
-        self._tags = np.empty((self._max_size,), dtype=object)
-        self._obs[:self._size] = data["obs"]
-        self._masks[:self._size] = data["masks"]
-        self._policies[:self._size] = data["policies"]
-        self._values[:self._size] = data["values"]
-        if "tags" in data:
-            self._tags[:self._size] = data["tags"]
-
-    def __len__(self) -> int:
-        return self._size
-
-    @property
-    def total_seen(self) -> int:
-        return self._index
-
-    @property
-    def unique_states(self) -> int:
-        """Count unique states in the buffer (by hash)."""
-        if self._obs is None or self._size == 0:
-            return 0
-        seen = set()
-        for i in range(self._size):
-            seen.add(self._obs[i].tobytes())
-        return len(seen)
-
-
-# ── Actor game logger ────────────────────────────────────────────────────────
-
-class GameLogger:
-    """Per-actor logger, writes one file per actor in the checkpoint dir."""
-
-    def __init__(self, log_dir: str, actor_id: int, sample_rate: int = 100):
-        os.makedirs(log_dir, exist_ok=True)
-        self._path = os.path.join(log_dir, f"actor_{actor_id}.log")
-        self._file = open(self._path, "a", encoding="utf-8", buffering=1)
-        self._game_count = 0
-        self._sample_rate = sample_rate
-        self._verbose_game = False  # current game is a sampled full-log game
-
-    def log_game_start(self, weak_side=None):
-        self._game_count += 1
-        self._verbose_game = (self._game_count % self._sample_rate == 1)
-        self._summary = []  # accumulate brief per-game info
-        ts = time.strftime("%Y-%m-%d %H:%M:%S")
-        if self._verbose_game:
-            parts = [f"\n{'=' * 60}",
-                     f"Game {self._game_count}  {ts}"]
-            if weak_side is not None:
-                parts.append(f"  weak_side = {weak_side}")
-            self._write("\n".join(parts))
-        self._summary.append(f"Game {self._game_count}  {ts}")
-        if weak_side is not None:
-            self._summary.append(f" weak_side={weak_side}")
-
-    def log_move(self, move_num, player, state, mcts_top5, chosen_action,
-                 tag="", tau=1.0):
-        if self._verbose_game:
-            pname = "BLACK(p0)" if player == 0 else "WHITE(p1)"
-            extra = f"  [{tag}]" if tag else ""
-            self._write(
-                f"\n── Move {move_num}  {pname}  tau={tau:.2f}{extra} ──\n"
-                f"{state}\n"
-                f"MCTS top-5: {mcts_top5}\n"
-                f"Chosen: {chosen_action}"
-            )
-
-    def log_game_end(self, returns, move_count, rare_games=0):
-        if self._verbose_game:
-            self._write(
-                f"\n── Final (move {move_count}) ──\n"
-                f"Returns: {returns[0]:+.0f}/{returns[1]:+.0f}"
-                f"  rare_games: {rare_games}"
-            )
-        else:
-            # Brief one-liner for non-sampled games
-            self._summary.append(
-                f" moves={move_count} "
-                f"ret={returns[0]:+.0f}/{returns[1]:+.0f}"
-                f" rare_games={rare_games}")
-            self._write("  ".join(self._summary))
-
-    def log_line(self, msg: str):
-        self._write(msg)
-
-    def _write(self, text: str):
-        self._file.write(text + "\n")
-        self._file.flush()
-
-    def close(self):
-        self._file.close()
-
-
-# ── Self-play ───────────────────────────────────────────────────────────────
-
-def _nn_raw_after_move(evaluator, state, action):
-    """Apply *action* to a clone of *state*, then evaluate with NN.
-
-    Returns (nn_value_from_black_perspective).
-    """
-    s = state.clone()
-    s.apply_action(action)
-    nn_val, _ = evaluator._inference(s)
-    return nn_val
-
-
-def _try_weak_move(mcts, state, root, config, weak_count, weak_max,
-                   logger=None):
-    """Attempt a weak move on *state*.  Caller guarantees this is the
-    weak side and weak_count < weak_max.
-
-    Returns (action, tag, weak_count, rare_state, weak_cat).
-    """
-    cur_player = state.current_player()
-    mcts_action = root.best_child().action
-    action = mcts_action
-    tag = ""
-    rare_state = None
-    weak_cat = ""
-
-    # NN argmax as weak move candidate
-    _, nn_policy_arr = mcts.evaluator._inference(state)
-    legal = state.legal_actions()
-    weak_a = max(legal, key=lambda a: nn_policy_arr[a])
-
-    if weak_a == mcts_action:
-        return mcts_action, "", weak_count, None, ""
-
-    # Evaluate state AFTER weak move
-    nn_val_after = _nn_raw_after_move(mcts.evaluator, state, weak_a)
-    mcts_val = root.total_reward / max(root.explore_count, 1)
-    nn_cur = nn_val_after if cur_player == 0 else -nn_val_after
-
-    # Relative drop in win probability: how much the weak move costs.
-    def _to_prob(v):
-        return max((v + 1.0) / 2.0, 0.005)
-    p_before = _to_prob(mcts_val)
-    p_after = _to_prob(nn_cur)
-    rel_drop = abs(p_before - p_after) / max(p_before, p_after, 0.01)
-
-    if rel_drop > config.rare_case_threshold:
-        weak_cat = "rare"
-        rare_state = state.clone()
-        rare_state.apply_action(weak_a)  # fork from AFTER the weak move
-        tag = "rare"
-        weak_count = weak_max + 1  # consume all weak attempts
-        if logger:
-            logger.log_line(
-                f"\n── Rare Case ──\n{state}\n"
-                f"  weak action  : {state.action_to_string(cur_player, weak_a)} (a{weak_a})\n"
-                f"  MCTS action  : {state.action_to_string(cur_player, mcts_action)} (a{mcts_action})\n"
-                f"  nn_cur={nn_cur:.3f}  mcts_val={mcts_val:.3f}  rel_drop={rel_drop:.3f}")
-    elif rel_drop < config.weak_move_threshold:
-        weak_cat = "weak"
-        action = weak_a
-        weak_count += 1
-    else:
-        weak_cat = "weak_final"
-        action = weak_a
-        weak_count = weak_max + 1  # consume all weak attempts
-
-    return action, tag, weak_count, rare_state, weak_cat
-
-
-def play_game(game, mcts, config, rng, logger=None,
-              init_state=None, allow_weak=True):
-    """Play one self-play game using BatchMCTS.
-
-    If *init_state* is given, start from that state (no weak moves).
-    *logger*: GameLogger instance for per-game logging.
-    """
-    states_info = []
-    rare_games = []
-    wstats = {"rare": 0, "weak": 0, "weak_final": 0}
-    state = game.new_initial_state() if init_state is None else init_state.clone()
-    move_num = 0
-    weak_enabled = allow_weak and init_state is None
-
-    # Weak-move setup (only for fresh games)
-    weak_side = None
-    weak_count = 0
-    weak_max = config.weak_max_per_game if weak_enabled else 0
-    weak_steps = set()  # pre-rolled move numbers for weak move attempts
-
-    if weak_max > 0 and rng.random() < config.weak_side_prob:
-        weak_side = rng.choice([0, 1])
-        # Geometric-like: 1 most common, N least common, capped at weak_max.
-        n_weak = 1
-        while n_weak < weak_max and rng.random() < config.weak_move_prob:
-            n_weak += 1
-        # Pick n_weak distinct steps between temperature_drop and weak_move_max_step
-        max_step = max(config.temperature_drop + 1, config.weak_move_max_step)
-        cand = list(range(config.temperature_drop, max_step))
-        if len(cand) >= n_weak:
-            weak_steps = set(rng.choice(cand, size=n_weak, replace=False))
-
-    if logger is not None:
-        logger.log_game_start(weak_side)
-        if weak_steps:
-            logger.log_line(f"[weak steps = {sorted(weak_steps)}]")
-
-    while not state.is_terminal():
-        cur_player = state.current_player()
-        if state.is_chance_node():
-            outcomes = state.chance_outcomes()
-            action_list, prob_list = zip(*outcomes)
-            action = rng.choice(action_list, p=prob_list)
-            state.apply_action(action)
-            continue
-
-        # ── MCTS ────────────────────────────────────────────────────
-        root = mcts.mcts_search(state)
-
-        # ── Weak-move (pre-rolled steps) ─────────────────────────────
-        if ((move_num in weak_steps or (move_num + 1) in weak_steps)
-                and weak_side is not None
-                and cur_player == weak_side
-                and weak_count < weak_max):
-            action, tag, weak_count, rare_state, weak_cat = _try_weak_move(
-                mcts, state, root, config, weak_count, weak_max, logger)
-        else:
-            action, tag, weak_cat = root.best_child().action, "", ""
-            rare_state = None
-        if weak_cat in wstats:
-            wstats[weak_cat] += 1
-        if rare_state is not None:
-            rare_games.append(rare_state)
-
-        mcts_action = root.best_child().action
-
-        from train.batch_mcts.mcts import compute_solved_policy
-        policy_dict = compute_solved_policy(
-            root.children, state.current_player(), game.max_utility())
-        policy = np.zeros(game.num_distinct_actions(), dtype=np.float32)
-        for a, p in policy_dict.items():
-            policy[a] = p
-        p_sum = policy.sum()
-        if p_sum > 0:
-            policy /= p_sum
-        else:
-            for a in state.legal_actions():
-                policy[a] = 1.0
-            policy /= policy.sum()
-
-        # ── Store raw visit-proportional policy ────────────────────────
-        obs = np.asarray(state.observation_tensor(), dtype=np.float32)
-        mask = np.asarray(state.legal_actions_mask(), dtype=bool)
-        states_info.append((obs, mask, policy, cur_player, tag))
-
-        # ── Action selection (temperature sharpens for play, not storage)
-        after_drop = move_num >= config.temperature_drop
-        tau_sel = config.temperature if after_drop else 1.0
-        if tau_sel > 0 and tau_sel != 1.0:
-            sel_probs = policy.astype(np.float64) ** (1.0 / tau_sel)
-            sel_probs /= sel_probs.sum()
-        else:
-            sel_probs = policy
-
-        if tag == "rare" or action != mcts_action:
-            pass  # rare / weak already set
-        elif after_drop:
-            action = mcts_action
-        else:
-            action = rng.choice(len(sel_probs), p=sel_probs)
-
-        if logger is not None:
-            children_sorted = sorted(
-                root.children, key=lambda c: c.explore_count, reverse=True)
-            top5 = []
-            for c in children_sorted[:5]:
-                a_str = state.action_to_string(cur_player, c.action)
-                top5.append(f"{a_str}(N={c.explore_count} Q={c.q_value:+.3f})")
-            mcts_info = " | ".join(top5)
-            action_str = state.action_to_string(cur_player, action)
-            logger.log_move(move_num + 1, cur_player, state, mcts_info,
-                            action_str, tag=tag, tau=tau_sel)
-
-        state.apply_action(action)
-        move_num += 1
-
-    returns = state.returns()
-    if logger is not None:
-        logger.log_game_end(returns, move_num, len(rare_games))
-    return states_info, returns, rare_games, wstats
-
-
-# ── Multi-actor support ─────────────────────────────────────────────────────
-
-def build_model(game, cfg):
-    """Create a fresh Model from config (used by actors and learner)."""
-    obs_shape = game.observation_tensor_shape()
-    num_actions = game.num_distinct_actions()
-    net = OthelloResNet(
-        input_channels=obs_shape[0], board_size=obs_shape[1],
-        output_size=num_actions,
-        nn_width=cfg.nn_width, nn_depth=cfg.nn_depth)
-    return Model(net, learning_rate=cfg.learning_rate,
-                 weight_decay=cfg.weight_decay, device=cfg.device,
-                 checkpoint_path=cfg.path)
-
-
-def actor_process(cfg_dict: dict, result_queue: mp.Queue, actor_id: int = 0):
-    """Subprocess: play self-play games, send trajectories to learner.
-
-    Uses a pending queue so rare-case forks are interleaved with fresh
-    games instead of being played all at once after each main game.
-    """
-    # Reconstruct config (avoids pickling issues on Windows)
-    cfg = TrainConfig(**cfg_dict)
+def actor_process(cfg_dict, result_queue, actor_id=0):
+    cfg = OthelloTrainConfig(**cfg_dict)
     game = pyspiel.load_game(cfg.game)
     model = build_model(game, cfg)
     mcts_cfg = MCTSConfig(
         max_simulations=cfg.max_simulations, batch_size=cfg.mcts_batch_size,
         uct_c=cfg.uct_c, policy_epsilon=cfg.policy_epsilon,
-        policy_alpha=cfg.policy_alpha, verbose=False)
-
-    evaluator = PyTorchEvaluator(game, model)
+        policy_alpha=cfg.policy_alpha,
+        value_classes=cfg.value_classes, verbose=False)
+    evaluator = PyTorchEvaluator(game, model,
+                             value_classes=cfg.value_classes)
     mcts = BatchMCTS(game, mcts_cfg, evaluator,
                      random_state=np.random.RandomState())
     rng = np.random.RandomState()
     logger = GameLogger(cfg.path, actor_id)
-
     loaded_step = 0
-    _LATEST = -999  # sentinel for "latest" checkpoint
-    pending = []  # (init_state, allow_weak, tag_override)
-
+    _LATEST = -999
+    pending = []
     while True:
-        # Check for new model weights
         latest_path = os.path.join(cfg.path, f"checkpoint-{_LATEST}.pt")
         if os.path.exists(latest_path):
             mtime = os.path.getmtime(latest_path)
@@ -550,94 +106,23 @@ def actor_process(cfg_dict: dict, result_queue: mp.Queue, actor_id: int = 0):
                 model.load_checkpoint(_LATEST)
                 evaluator.clear_cache()
                 loaded_step = mtime
-
-        # ── Decide what game to play next ──────────────────────────────
         if pending:
             init_state, allow_weak, tag_override = pending.pop()
         else:
             init_state, allow_weak, tag_override = None, True, ""
-
         states_info, returns, rare_games, wstats = play_game(
             game, mcts, cfg, rng, logger=logger,
             init_state=init_state, allow_weak=allow_weak)
-
-        # Enqueue rare states for future games
         for rs in rare_games:
             pending.append((rs, False, "rare"))
-
-        # Apply tag override so the learner knows this came from a fork
         if tag_override:
             for i in range(len(states_info)):
                 obs, mask, policy, cp, _tag = states_info[i]
                 states_info[i] = (obs, mask, policy, cp, tag_override)
-
         try:
             result_queue.put((states_info, returns, wstats), timeout=1)
         except queue.Full:
             print("[actor] WARNING: queue full, dropping game", flush=True)
-
-
-# ── Weak-move stats accumulator ────────────────────────────────────────────
-
-def _accum_wstats(cfg, per_game):
-    """Aggregate per-game weak-move counts into config for log output."""
-    if not hasattr(cfg, "_wstats_total"):
-        cfg._wstats_total = {"rare": 0, "weak": 0, "weak_final": 0}
-        cfg._wstats_games = 0
-    for k in cfg._wstats_total:
-        cfg._wstats_total[k] += per_game.get(k, 0)
-    cfg._wstats_games += 1
-
-
-def _wstats_summary(cfg):
-    """Return a one-line string like 'rare=3 weak=12 weak_final=1'."""
-    if not hasattr(cfg, "_wstats_total") or cfg._wstats_games == 0:
-        return "weak=(none)"
-    total = cfg._wstats_total
-    games = cfg._wstats_games
-    return (f"rare={total['rare']:d} wf={total['weak_final']:d}"
-            f" weak={total['weak']:d}  ({games}d games)"
-            f"  |  rare/g={total['rare']/games:.1f}"
-            f" wf/g={total['weak_final']/games:.1f}"
-            f" weak/g={total['weak']/games:.1f}")
-
-def _reset_wstats(cfg):
-    if hasattr(cfg, "_wstats_total"):
-        del cfg._wstats_total
-        del cfg._wstats_games
-
-
-# ── Evaluation ──────────────────────────────────────────────────────────────
-
-def _run_eval_bg(cfg_path, current_step, ref_steps, num_games):
-    """Run model-vs-model eval against multiple references (background)."""
-    from train.eval_match import run_match
-
-    mcts_cfg = {"strategy": "mcts",
-                "checkpoint_dir": cfg_path,
-                "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41}
-    cur = dict(mcts_cfg, checkpoint_step=current_step)
-
-    for ref_step in ref_steps:
-        if ref_step < 0:
-            ref = {"strategy": "random"}
-            ref_name = "random"
-        else:
-            ckpt = os.path.join(cfg_path, f"checkpoint-{ref_step}.pt")
-            if os.path.exists(ckpt):
-                ref = dict(mcts_cfg, checkpoint_step=ref_step)
-                ref_name = f"step{ref_step}"
-            else:
-                ref = {"strategy": "random"}
-                ref_name = "random"
-
-        score, _ = run_match(cur, ref, num_games=num_games,
-                             temperature=0.1, temp_drop=4, quiet=True)
-        keys = [k for k in score if k != "draw"]
-        wr = score[keys[0]] / max(num_games, 1)
-        logging.info(f"    [eval] step{current_step} vs {ref_name}:  "
-                     f"W={score[keys[0]]} L={score[keys[1]]} D={score['draw']} "
-                     f"WR={wr:.1%}")
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -645,106 +130,21 @@ def _run_eval_bg(cfg_path, current_step, ref_steps, num_games):
 def main():
     parser = argparse.ArgumentParser(
         description="Othello AlphaZero training (BatchMCTS + PyTorch)")
-    parser.add_argument("--config", default="train_othello_config.json",
-                        help="Path to JSON config file")
-    parser.add_argument("--fresh", action="store_true",
-                        help="Start fresh (ignore checkpoint)")
+    parser.add_argument("--config", default="train_othello_config.json")
+    parser.add_argument("--fresh", action="store_true")
     args = parser.parse_args()
 
-    # Load config
-    cfg = _default_config()
-    if args.config:
-        cfg = load_config(args.config)
+    cfg = setup_config_and_logging(
+        args.config, OthelloTrainConfig, args.fresh)
 
-    os.makedirs(cfg.path, exist_ok=True)
-
-    # Logging: file gets timestamps, terminal stays clean.
-    log_file = os.path.join(cfg.path, "train.log")
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s] %(message)s",
-        datefmt="%m-%d %H:%M:%S",
-        handlers=[logging.FileHandler(log_file),
-                  logging.StreamHandler(sys.stdout)])
+    game, model, buffer, sym, n_updates, start_step, mcts_config = \
+        init_training(cfg, None, build_model, ReplayBuffer, OthelloSymmetry)
     _log = logging.info
-
-    # On resume, reload everything from the stored config (allows editing
-    # train_config.json in the output dir between runs).
-    saved_config = os.path.join(cfg.path, "train_config.json")
-    if not args.fresh and os.path.exists(saved_config):
-        cfg = load_config(saved_config)
-        _log(f"[train] Reloaded config from {saved_config}")
-
-    # Save merged config for future resumes
-    with open(os.path.join(cfg.path, "train_config.json"), "w") as f:
-        json.dump({k: v for k, v in cfg.__dict__.items()
-                   if not k.startswith("_")}, f, indent=2, default=str)
-
-    _log(f"[train] game={cfg.game}  nn_width={cfg.nn_width}"
-         f"  nn_depth={cfg.nn_depth}")
-    _log(f"[train] max_sim={cfg.max_simulations}"
-         f"  mcts_batch={cfg.mcts_batch_size}  buffer={cfg.replay_buffer_size}")
-    _log(f"[train] max_steps={cfg.max_steps}  ckpt_freq={cfg.checkpoint_freq}")
-    _log(f"[train] path={cfg.path}")
-
-    # Init game
-    game = pyspiel.load_game(cfg.game)
-    obs_shape = game.observation_tensor_shape()
-    num_actions = game.num_distinct_actions()
-    _log(f"[train] obs_shape={obs_shape}  num_actions={num_actions}")
-
-    # Init model
-    model = build_model(game, cfg)
-    _log(f"[train] Model params: {model.num_trainable_variables}"
-         f"  lr={cfg.learning_rate:.0e}")
-
-    # Replay buffer
-    buffer = ReplayBuffer(max_size=cfg.replay_buffer_size)
     samples_per_step = max(
         int(cfg.replay_buffer_size * cfg.buffer_sampling_frac),
         cfg.train_batch_size)
-    n_updates = samples_per_step * cfg.symmetry // cfg.train_batch_size
-    sym = OthelloSymmetry() if cfg.symmetry > 1 else None
-    _log(f"[train] buffer_sampling_frac={cfg.buffer_sampling_frac}"
-         f"  symmetry={cfg.symmetry}"
-         f"  n_updates={n_updates}")
 
-    # Resume from checkpoint
-    start_step = 0
-    if not args.fresh:
-        for name in os.listdir(cfg.path):
-            if name.startswith("checkpoint-") and name.endswith(".pt"):
-                try:
-                    s = int(name.split("-")[1].split(".")[0])
-                    if s > start_step:
-                        start_step = s
-                except ValueError:
-                    pass
-        if start_step > 0:
-            model.load_checkpoint(start_step)
-            buf_path = os.path.join(
-                cfg.path, f"buffer-checkpoint-{start_step}.npz")
-            if os.path.exists(buf_path):
-                buffer.load(buf_path)
-                _log(f"[train] Resumed from checkpoint-{start_step}"
-                      f" (buffer: {len(buffer)} states)")
-            else:
-                _log(f"[train] Resumed from checkpoint-{start_step}"
-                      f" (buffer file not found, starting empty)")
-        else:
-            _log("[train] No checkpoint found, starting fresh")
-
-    # MCTS config
-    mcts_config = MCTSConfig(
-        max_simulations=cfg.max_simulations,
-        batch_size=cfg.mcts_batch_size,
-        uct_c=cfg.uct_c,
-        policy_epsilon=cfg.policy_epsilon,
-        policy_alpha=cfg.policy_alpha,
-        verbose=False,
-    )
-
-    _LATEST = -999  # sentinel step for "latest" weights (actors reload this)
+    _LATEST = -999
 
     # ── Spawn actors (if multi-process) ──────────────────────────────────
     actors = []
@@ -763,7 +163,7 @@ def main():
 
     # Training state
     global_rng = np.random.RandomState(cfg.seed + start_step)
-    _last_eval_time = 0.0   # force first eval immediately
+    _last_eval_time = -cfg.eval_min_interval  # force first eval immediately
     _eval_thread = None     # track running eval
 
     try:
@@ -777,7 +177,8 @@ def main():
 
             if cfg.num_actors == 1:
                 # Single-process path
-                evaluator = PyTorchEvaluator(game, model)
+                evaluator = PyTorchEvaluator(game, model,
+                             value_classes=cfg.value_classes)
                 mcts = BatchMCTS(game, mcts_config, evaluator,
                                  random_state=np.random.RandomState(
                                      cfg.seed + step * 1000))
@@ -794,7 +195,7 @@ def main():
                     states_info, returns, rare_games, wstats = play_game(
                         game, mcts, cfg, global_rng, logger=game_logger,
                         init_state=init_state, allow_weak=allow_weak)
-                    _accum_wstats(cfg, wstats)
+                    accum_wstats(cfg, wstats)
 
                     # Enqueue rare states for future games
                     for rs in rare_games:
@@ -806,8 +207,8 @@ def main():
                         tag = item[4] if len(item) > 4 else ""
                         if tag_override:
                             tag = tag_override
-                        buffer.append(obs, mask, policy,
-                                      game_outcome_p0, tag)
+                        val = _make_value(returns[cur_player], cfg.value_classes)
+                        buffer.append(obs, mask, policy, val, tag)
 
                     if game_outcome_p0 > 0:
                         outcomes["p0"] += 1
@@ -828,14 +229,14 @@ def main():
                             states_info, returns, wstats = q.get_nowait()
                         except queue.Empty:
                             continue
-                        _accum_wstats(cfg, wstats)
+                        accum_wstats(cfg, wstats)
                         game_outcome_p0 = returns[0]
 
                         for item in states_info:
                             obs, mask, policy, cur_player = item[:4]
                             tag = item[4] if len(item) > 4 else ""
-                            buffer.append(obs, mask, policy,
-                                          game_outcome_p0, tag)
+                            val = _make_value(returns[cur_player], cfg.value_classes)
+                            buffer.append(obs, mask, policy, val, tag)
 
                         if game_outcome_p0 > 0:
                             outcomes["p0"] += 1
@@ -894,7 +295,7 @@ def main():
                 f"buffer={len(buffer):5d}/{buffer.total_seen:5d}"
                 f" unique={buffer.unique_states}"
                 f"  tags={buffer.tag_counts()}"
-                f"  weak={_wstats_summary(cfg)}  "
+                f"  weak={wstats_summary(cfg)}  "
                 f"states/s={states_per_s:.1f}  "
                 f"selfplay={selfplay_time:.1f}s  train={train_time:.1f}s"
             )
@@ -906,7 +307,7 @@ def main():
                          f"  p1={outcomes['p1']/g:.1%}"
                          f"  draw={outcomes['draw']/g:.1%}")
             _log(log_line)
-            _reset_wstats(cfg)
+            reset_wstats(cfg)
 
             # ── Checkpoint ─────────────────────────────────────────────
             if step % cfg.checkpoint_freq == 0:
@@ -920,33 +321,9 @@ def main():
                 model.save_checkpoint(_LATEST)
 
             # ── Evaluation ─────────────────────────────────────────────
-            if step % cfg.checkpoint_freq == 0 and step > 0:
-                now = time.time()
-                eval_idle = (_eval_thread is None
-                             or not _eval_thread.is_alive())
-                if (eval_idle
-                        and now - _last_eval_time >= cfg.eval_min_interval):
-                    _last_eval_time = now
-                    # Collect last N checkpoints (before current) as references
-                    ckpts = []
-                    for f in os.listdir(cfg.path):
-                        if not (f.startswith("checkpoint-") and f.endswith(".pt")):
-                            continue
-                        try:
-                            s = int(f.split("-")[1].split(".")[0])
-                            if s < step:
-                                ckpts.append(s)
-                        except (ValueError, IndexError):
-                            pass
-                    ckpts.sort(reverse=True)
-                    refs = ckpts[:cfg.eval_reference_count]
-                    if not refs:
-                        refs = [-1]  # sentinel: no checkpoints → random
-                    _eval_thread = threading.Thread(
-                        target=_run_eval_bg,
-                        args=(cfg.path, step, refs, cfg.evaluation_window),
-                        daemon=True)
-                    _eval_thread.start()
+            _eval_thread, _last_eval_time = maybe_trigger_eval(
+                step, cfg, _eval_thread, _last_eval_time,
+                run_eval_background)
 
         # Final save
         model.save_checkpoint(cfg.max_steps)

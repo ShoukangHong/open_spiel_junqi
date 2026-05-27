@@ -81,3 +81,27 @@ MCTS + `best_child()` 是确定性的。两个接近的模型对弈时，每局�
 
 - **计算几何分布的手雷**：`P(N=k)=p^{k-1}(1-p)`, `E[N]=1/(1-p)`。
   p=0.5 期望 2 次，但分布始终从 1 开始，`p/(1-p)` 是不一样的公式。
+
+### 14. Value 输出的视角约定（WDL vs 标量）
+
+MCTS 回传时用 `returns = [p0_value, p1_value]` 形式的零和向量，通过 `returns[decision_player]` 取对应玩家回报。关键约束：`returns[0]` 必须是 p0 视角的值，`returns[1]` 必须是 p1 视角的值。
+
+**标量模型**输出的是 p0（黑棋）视角的单值 v，eval 返回 `[v, -v]` 天然满足约束。
+
+**WDL 模型**输出的是**当前走子方视角**的 `[w, d, l]`。MCTS 将其转为标量 `Q = (w-l) × max_utility`。但 Q 是谁的视角取决于叶节点的玩家：叶节点是 p0 时 Q 是 p0 视角，叶节点是 p1 时 Q 是 p1 视角。此时 `[Q, -Q]` 作为零和向量是错误的——当叶节点是 p1 时，`returns[1]` 应该是 `+Q`（p1 自己的估值），而非 `-Q`。
+
+**修复原则**：WDL 模式下根据叶节点玩家拼装 returns——`returns[leaf_player]=Q, returns[opponent]=-Q`。标量模式保持 `[v, -v]` 不变。
+
+**教训**：value 的输出视角是全系统的隐含契约。改动训练 target（从 `returns[0]` 改为 `returns[cur_player]`）时，MCTS 的视角处理必须同步修改。测试中所有 WDL evaluator 也必须按当前走子方视角生成 WDL 值，不能返回常量。
+
+### 15. Policy target 存原始分布，不 sharpen
+
+训练存储的是 MCTS 原始访问比例分布（如 `{a:0.67, b:0.18, c:0.09}`），不做温度 sharpen。温度只在走子选择时生效——drop 前 `τ=1` 按比例采样，drop 后直接选 `best_child()`。之前存入 buffer 的 policy 是经过 `** (1/τ)` sharpen 后的近 one-hot，导致模型学不到搜索的不确定性，eval 时走法缺乏多样性。
+
+### 16. Symmetry 变换方向一致性
+
+D4 变换是用 `np.rot90`（默认逆时针，CCW）做空间变换，action 映射必须用相同的旋转方向。曾出现过 action 映射用 CW 公式 `(r,c)→(c,7-r)` 但 obs 变换用 CCW 的情况，导致增强后的 obs 和 policy 不匹配。测试必须用**不对称棋子**验证所有 8 种变换的方向一致性——用对称棋子（如两黑子）无法检测方向错误。
+
+### 17. 模型构建统一入口
+
+所有需要加载 checkpoint 建模型的地方（训练、eval_match、游戏 UI）统一走 `train/core/model_builder.py` 的 `build_othello_model()`。避免各处手写 `OthelloResNet(...)` 导致参数遗漏（尤其是 `num_value_classes` 和 `value_classes`）。

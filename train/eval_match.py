@@ -41,14 +41,8 @@ def _model_for(player_cfg):
         config_path = os.path.join(player_cfg["checkpoint_dir"], "train_config.json")
         with open(config_path) as f:
             tc = json.load(f)
-        net = OthelloResNet(
-            input_channels=game.observation_tensor_shape()[0],
-            board_size=game.observation_tensor_shape()[1],
-            output_size=game.num_distinct_actions(),
-            nn_width=tc.get("nn_width", 32),
-            nn_depth=tc.get("nn_depth", 6))
-        m = Model(net, device=tc.get("device", "cpu"),
-                  checkpoint_path=player_cfg["checkpoint_dir"])
+        from train.core.model_builder import build_othello_model
+        m = build_othello_model(game, tc)
         step = player_cfg.get("checkpoint_step", 0)
         if step > 0:
             m.load_checkpoint(step)
@@ -62,12 +56,15 @@ def _mcts_for(player_cfg):
     key = id(player_cfg)
     if key not in _mcts_bots:
         game = _game_obj()
-        ev = PyTorchEvaluator(game, _model_for(player_cfg))
+        model = _model_for(player_cfg)
+        vc = model._model.num_value_classes
+        ev = PyTorchEvaluator(game, model, value_classes=vc)
         _mcts_evaluators[key] = ev
         cfg = MCTSConfig(
             max_simulations=player_cfg.get("mcts_simulations", 128),
             batch_size=player_cfg.get("mcts_batch_size", 4),
             uct_c=player_cfg.get("mcts_uct_c", 1.41),
+            value_classes=vc,
             policy_epsilon=0, verbose=False)
         _mcts_bots[key] = BatchMCTS(
             game, cfg, ev, random_state=np.random.RandomState(42))
@@ -229,10 +226,10 @@ PLAYER = {
     #     "checkpoint_step": 130,
     #     "mcts_simulations": 128, "mcts_batch_size": 6, "mcts_uct_c": 1.41},
     0: {"strategy": "mcts",
-        "checkpoint_dir": r"C:\Users\shouk\othello_train_cloud",
-        "checkpoint_step": 180,
+        "checkpoint_dir": r"C:\Users\shouk\othello_train_fast",
+        "checkpoint_step": -999,
         "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
-    1: {"strategy": "mcts",
+    1: {"strategy": "random",
         "checkpoint_dir": r"C:\Users\shouk\othello_train_cloud",
         "checkpoint_step": 180,
         "mcts_simulations": 512, "mcts_batch_size": 32, "mcts_uct_c": 1.41},

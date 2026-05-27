@@ -612,14 +612,20 @@ class BatchMCTS:
                     node_to_idx[leaf_node] = len(unique_nodes)
                     unique_nodes.append(leaf_node)
 
-            values_map = {}   # leaf_node -> (value_scalar, prior_list)
+            values_map = {}   # leaf_node -> (value_scalar, prior_list, draw_prob)
             if unique_nodes:
                 states_to_eval = [n.state for n in unique_nodes]
                 values_arr, priors_list = self.evaluator.batch_inference_raw(
                     states_to_eval)
-                for node, value, prior in zip(unique_nodes, values_arr,
-                                              priors_list):
-                    values_map[node] = (value, prior)
+                wdl = (self.config.value_classes == 3)
+                for node, out, prior in zip(unique_nodes, values_arr,
+                                            priors_list):
+                    if wdl:
+                        w, d, l = float(out[0]), float(out[1]), float(out[2])
+                        value = (w - l) * self.max_utility
+                        values_map[node] = (value, prior, d)
+                    else:
+                        values_map[node] = (float(out), prior, 0.0)
 
             # ── Phase 3: Expand + Backprop ────────────────────────────
             expanded_this_batch = set()
@@ -628,15 +634,21 @@ class BatchMCTS:
                 if leaf_state.is_terminal():
                     returns = np.array(leaf_state.returns())
                     leaf_node.outcome = returns
+                    draw_prob = 1.0 if all(r == 0 for r in returns) else 0.0
                 else:
-                    value, prior = values_map[leaf_node]
+                    value, prior, draw_prob = values_map[leaf_node]
                     if leaf_node not in expanded_this_batch:
                         self._expand(leaf_node, leaf_state, prior)
                         expanded_this_batch.add(leaf_node)
-                    # zero-sum: opposing player gets -value
-                    returns = np.array([value, -value])
+                    if wdl:
+                        lp = leaf_state.current_player()
+                        returns = np.zeros(2)
+                        returns[lp] = value
+                        returns[1 - lp] = -value
+                    else:
+                        returns = np.array([value, -value])
 
-                self._backprop(path_nodes, returns)
+                self._backprop(path_nodes, returns, draw_prob)
 
                 # Propagate solved outcomes upward (MCTS-Solver)
                 for node in reversed(path_nodes):
@@ -783,28 +795,19 @@ class BatchMCTS:
             child.state = state.clone()
             child.state.apply_action(child.action)
 
-    def _backprop(self, path, returns):
-        """Backpropagate *returns* along *path*, removing virtual losses.
-
-        Each node receives the target return for ITS OWN player (handled
-        identically to the original MCTS code). Virtual visits that were
-        added during selection are decremented.
-
-        Does NOT mutate *path* — the caller needs it for solver.
-        """
+    def _backprop(self, path, returns, draw_prob=0.0):
+        """Backpropagate *returns* and *draw_prob* along *path*."""
         for i in range(len(path) - 1, -1, -1):
             node = path[i]
-            # Find nearest decision-maker (skip chance nodes)
             decision_idx = i
             while path[decision_idx].player == pyspiel.PlayerId.CHANCE:
                 decision_idx -= 1
             target = returns[path[decision_idx].player]
 
-            # Remove virtual loss
             if node.virtual_visits > 0:
                 node.virtual_visits -= 1
-            # Apply real reward
             node.total_reward += target
+            node.draw_reward += draw_prob
             node.explore_count += 1
 
     def _check_solved(self, node):
@@ -820,6 +823,7 @@ class BatchMCTS:
             if outcome is not None and all(
                     np.array_equal(c.outcome, outcome) for c in node.children):
                 node.outcome = outcome
+                self._clamp_draw(node)
                 return True
         else:
             best_child = None
@@ -833,5 +837,10 @@ class BatchMCTS:
             if best_child is not None and (
                     all_solved or best_child.outcome[player] == self.max_utility):
                 node.outcome = best_child.outcome
+                self._clamp_draw(node)
                 return True
         return False
+
+    def _clamp_draw(self, node):
+        if all(r == 0 for r in node.outcome):
+            node.draw_reward = float(node.explore_count)

@@ -16,8 +16,8 @@ import numpy as np
 import pygame
 
 # ── Config ──────────────────────────────────────────────────────────────────────
-BUFFER_FILE = r"C:\Users\shouk\othello_train_cloud\buffer-checkpoint-140.npz"
-
+# BUFFER_FILE = r"C:\Users\shouk\othello_train_cloud\buffer-checkpoint-140.npz"
+BUFFER_FILE = r"C:\Users\shouk\othello_train_fast\buffer-checkpoint-10.npz"
 # ── Constants ───────────────────────────────────────────────────────────────────
 ROWS = COLS = 8
 SQ_SIZE = 74
@@ -131,9 +131,15 @@ def build_display_data(board, policy, legal_mask, value, tag, cur_player):
     d["black_c"] = int((board == 1).sum())
     d["white_c"] = int((board == -1).sum())
 
-    # Value
-    d["value"] = value
-    d["win_pct"] = (1 + value) * 50
+    # Value — detect scalar vs WDL
+    v = np.asarray(value, dtype=np.float32).ravel()
+    if len(v) == 3:
+        d["wdl"] = (float(v[0]), float(v[1]), float(v[2]))
+        d["value"] = float(v[0] - v[2])
+    else:
+        d["wdl"] = None
+        d["value"] = float(v[0])
+    d["win_pct"] = (1 + d["value"]) * 50
 
     # Tag
     d["tag_label"] = _tag_display(tag)
@@ -266,7 +272,12 @@ def draw_side_panel(screen, index, total, global_idx, tag_filter,
     pname = ("BLACK" if disp["cur_player"] == 0
              else ("WHITE" if disp["cur_player"] == 1 else "?"))
     _line(f"Turn: {pname}    B:{disp['black_c']}  W:{disp['white_c']}")
-    _line(f"Value: {disp['value']:+.3f}  ({disp['win_pct']:.1f}%)")
+    if disp["wdl"] is not None:
+        w, d, l = disp["wdl"]
+        _line(f"Value: {disp['value']:+.3f}  ({disp['win_pct']:.1f}%)"
+              f"  W/D/L: {w:.1%}/{d:.1%}/{l:.1%}")
+    else:
+        _line(f"Value: {disp['value']:+.3f}  ({disp['win_pct']:.1f}%)")
 
     _line("Tag: ", advance=False)
     x_after = x0 + f.render("Tag: ", True, BLACK).get_width()

@@ -86,13 +86,15 @@ class OthelloResNet(nn.Module):
     """
 
     def __init__(self, input_channels: int = 4, board_size: int = 8,
-                 output_size: int = 65, nn_width: int = 32, nn_depth: int = 5):
+                 output_size: int = 65, nn_width: int = 32, nn_depth: int = 5,
+                 num_value_classes: int = 1):
         super().__init__()
         self.input_channels = input_channels
         self.board_size = board_size
         self.output_size = output_size
         self.nn_width = nn_width
         self.nn_depth = nn_depth
+        self.num_value_classes = num_value_classes
 
         # Torso
         self.conv_in = ConvBlock(input_channels, nn_width, kernel_size=3)
@@ -105,11 +107,12 @@ class OthelloResNet(nn.Module):
         self.policy_bn = nn.BatchNorm2d(2)
         self.policy_fc = nn.Linear(2 * board_size * board_size, output_size)
 
-        # Value head
-        self.value_conv = nn.Conv2d(nn_width, 1, 1, bias=False)
-        self.value_bn = nn.BatchNorm2d(1)
-        self.value_fc1 = nn.Linear(board_size * board_size, nn_width)
-        self.value_fc2 = nn.Linear(nn_width, 1)
+        # Value head — wider for WDL to avoid bottleneck
+        vch = 1 if num_value_classes == 1 else 4
+        self.value_conv = nn.Conv2d(nn_width, vch, 1, bias=False)
+        self.value_bn = nn.BatchNorm2d(vch)
+        self.value_fc1 = nn.Linear(vch * board_size * board_size, nn_width)
+        self.value_fc2 = nn.Linear(nn_width, num_value_classes)
 
         self._init_weights()
 
@@ -118,7 +121,6 @@ class OthelloResNet(nn.Module):
         for name, m in self.named_modules():
             if isinstance(m, (nn.Conv2d, nn.Linear)):
                 if name in ("policy_fc", "value_fc2"):
-                    # Output heads: small uniform for stable initial logits/values
                     nn.init.uniform_(m.weight, -0.03, 0.03)
                 else:
                     nn.init.kaiming_normal_(m.weight, mode="fan_out",
@@ -141,7 +143,8 @@ class OthelloResNet(nn.Module):
 
         Returns:
             policy_logits: (batch, output_size)
-            value: (batch,) in [-1, 1]
+            value: (batch,) scalar or (batch, num_value_classes)
+                   depending on num_value_classes.
         """
         batch = x.shape[0]
 
@@ -158,7 +161,9 @@ class OthelloResNet(nn.Module):
         v = F.relu(self.value_bn(self.value_conv(x)))
         v = v.reshape(batch, -1)
         v = F.relu(self.value_fc1(v))
-        value = torch.tanh(self.value_fc2(v)).squeeze(-1)
+        value = self.value_fc2(v)
+        if self.num_value_classes == 1:
+            value = torch.tanh(value).squeeze(-1)
 
         return policy_logits, value
 
@@ -197,7 +202,11 @@ class OthelloResNet(nn.Module):
             policy = policy * mask_t
             policy = policy / policy.sum(dim=-1, keepdims=True).clamp(min=1e-9)
 
-            return value[0].item(), policy[0].cpu().numpy()
+            if self.num_value_classes > 1:
+                val = F.softmax(value, dim=-1)[0].cpu().numpy()
+            else:
+                val = value[0].item()
+            return val, policy[0].cpu().numpy()
 
     def batch_inference(self, observations: np.ndarray,
                         legals_masks: np.ndarray) -> tuple:
@@ -243,6 +252,8 @@ class OthelloResNet(nn.Module):
             policies = policies * mask_t
             policies = policies / policies.sum(dim=-1, keepdims=True).clamp(min=1e-9)
 
+            if self.num_value_classes > 1:
+                value = F.softmax(value, dim=-1)
             return value.cpu().numpy(), policies.cpu().numpy()
 
 
@@ -338,8 +349,13 @@ class Model:
         log_probs = F.log_softmax(policy_logits_masked, dim=-1)
         policy_loss = -(target_policy * log_probs).sum(dim=-1).mean()
 
-        # Value loss: MSE
-        value_loss = F.mse_loss(value_pred, target_value)
+        # Value loss: MSE (scalar) or CrossEntropy (WDL)
+        if self._model.num_value_classes == 1:
+            value_loss = F.mse_loss(value_pred, target_value)
+        else:
+            value_loss = -(target_value *
+                           F.log_softmax(value_pred, dim=-1)
+                           ).sum(dim=-1).mean()
 
         # Track L2 loss contribution (matching JAX formula)
         l2_reg = sum(
@@ -386,7 +402,8 @@ class Model:
         filepath = os.path.join(self._checkpoint_path, f"checkpoint-{step}.pt")
         if os.path.exists(filepath):
             ckpt = torch.load(filepath, map_location=self._device, weights_only=False)
-            self._model.load_state_dict(ckpt["model_state_dict"])
+            self._model.load_state_dict(ckpt["model_state_dict"],
+                                        strict=False)
             self._optimizer.load_state_dict(ckpt["optimizer_state_dict"])
             # Keep LR from the current config, not from the checkpoint
             for pg in self._optimizer.param_groups:

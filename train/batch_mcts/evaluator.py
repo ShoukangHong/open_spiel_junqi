@@ -4,8 +4,6 @@ Provides:
   - BatchEvaluator (abstract) — interface for batch NN evaluation
   - RandomRolloutEvaluator — baseline (mirrors original MCTS version)
   - PyTorchEvaluator — wraps PyTorch model for batch MCTS
-
-The original AlphaZeroEvaluator (JAX) from OpenSpiel is kept for reference.
 """
 
 from typing import Any
@@ -16,7 +14,7 @@ from open_spiel.python.algorithms import mcts as orig_mcts
 import pyspiel
 from open_spiel.python.utils import lru_cache
 
-# Re-export original classes so existing tests still work.
+# Re-export original classes
 Evaluator = orig_mcts.Evaluator
 RandomRolloutEvaluator = orig_mcts.RandomRolloutEvaluator
 SearchNode = orig_mcts.SearchNode
@@ -26,46 +24,31 @@ MCTSBot = orig_mcts.MCTSBot
 # ── Batch Evaluator interface ──────────────────────────────────────────────
 
 class BatchEvaluator:
-    """Abstract evaluator that supports batched inference.
+    """Abstract evaluator that supports batched inference."""
 
-    The batch methods are the primary interface for BatchMCTS.
-    Single-sample methods delegate to batch for convenience.
-    """
+    def scalar_value(self, state) -> float:
+        """Return a scalar Q in [-1, 1] regardless of value format.
 
-    def batch_evaluate(self, states: list) -> np.ndarray:
-        """Returns values for a list of states.
-
-        Args:
-            states: list of pyspiel.State.
-
-        Returns:
-            ndarray of shape (len(states), num_players) or (len(states),).
+        Subclasses may override for efficiency; default uses _inference.
         """
+        value, _ = self._inference(state)
+        if hasattr(value, '__len__'):
+            v = np.asarray(value, dtype=np.float32).ravel()
+            return float(v[0] - v[2])
+        return float(value)
+
+    def batch_evaluate(self, states):
         raise NotImplementedError
 
-    def batch_prior(self, states: list) -> list:
-        """Returns priors for a list of states.
-
-        Args:
-            states: list of pyspiel.State.
-
-        Returns:
-            list of [(action, prob), ...] — one per state.
-        """
+    def batch_prior(self, states):
         raise NotImplementedError
 
 
 # ── Random rollout evaluator (batch-aware, for testing) ────────────────────
 
 class BatchRandomRolloutEvaluator(BatchEvaluator):
-    """Random rollout evaluator exposing the BatchEvaluator interface.
 
-    No NN involved — useful for correctness testing of BatchMCTS.
-    """
-
-    def __init__(self, n_rollouts: int = 1,
-                 random_state: np.random.RandomState = None,
-                 max_length: int = None):
+    def __init__(self, n_rollouts=1, random_state=None, max_length=None):
         self.n_rollouts = n_rollouts
         self.max_length = max_length
         self._random_state = random_state or np.random.RandomState()
@@ -104,22 +87,13 @@ class BatchRandomRolloutEvaluator(BatchEvaluator):
         return results
 
     def batch_inference_raw(self, states):
-        """Batch evaluate + prior.
-
-        Returns:
-            values: (len(states),) scalar values from each state's
-                    current player's perspective.
-            priors: list of [(action, prob), ...].
-        """
-        full_returns = self.batch_evaluate(states)  # (batch, 2)
-        # Pick the return for the player about to move at each leaf.
+        full_returns = self.batch_evaluate(states)
         scalar_values = np.array([
             float(full_returns[i, state.current_player()])
             for i, state in enumerate(states)
         ])
         return scalar_values, self.batch_prior(states)
 
-    # Single-sample interface (for compat with OriginalMCTS)
     def evaluate(self, state):
         return self._eval_one(state)
 
@@ -130,14 +104,13 @@ class BatchRandomRolloutEvaluator(BatchEvaluator):
 # ── PyTorch model evaluator ────────────────────────────────────────────────
 
 class PyTorchEvaluator(BatchEvaluator):
-    """Wraps a PyTorch Model for batch MCTS evaluation."""
 
-    def __init__(self, game: pyspiel.Game, model: Any,
-                 cache_size: int = 2**16):
+    def __init__(self, game, model, cache_size=2**16, value_classes=1):
         self._game = game
         self._model = model
         self._cache = lru_cache.LRUCache(cache_size)
         self._output_size = game.num_distinct_actions()
+        self._value_classes = value_classes
 
     def cache_info(self):
         return self._cache.info()
@@ -151,7 +124,6 @@ class PyTorchEvaluator(BatchEvaluator):
         return obs.tobytes() + mask.tobytes()
 
     def _inference(self, state):
-        """Single-state inference with LRU cache."""
         key = self._make_cache_key(state)
         value, policy = self._cache.make(
             key,
@@ -161,9 +133,18 @@ class PyTorchEvaluator(BatchEvaluator):
         )
         return value, policy
 
-    def evaluate(self, state):
-        """Single-state value."""
+    def scalar_value(self, state) -> float:
+        """Override: use _inference with WDL conversion."""
         value, _ = self._inference(state)
+        if self._value_classes == 3:
+            v = np.asarray(value, dtype=np.float32).ravel()
+            return float(v[0] - v[2])
+        return float(value)
+
+    def evaluate(self, state):
+        value, _ = self._inference(state)
+        if self._value_classes == 3:
+            return np.array(value)
         return np.array([value, -value])
 
     def prior(self, state):
@@ -173,7 +154,6 @@ class PyTorchEvaluator(BatchEvaluator):
         return [(a, float(policy[a])) for a in state.legal_actions()]
 
     def batch_evaluate(self, states):
-        """Batch value evaluation (cached single-inference per state)."""
         values = []
         for state in states:
             value, _ = self._inference(state)
@@ -181,7 +161,6 @@ class PyTorchEvaluator(BatchEvaluator):
         return np.array(values)
 
     def batch_prior(self, states):
-        """Batch prior evaluation."""
         results = []
         for state in states:
             if state.is_chance_node():
@@ -193,11 +172,6 @@ class PyTorchEvaluator(BatchEvaluator):
         return results
 
     def batch_inference_raw(self, states):
-        """Direct batch inference bypassing the LRU cache.
-
-        Used inside BatchMCTS for fresh leaf nodes.
-        Returns (values_array, list_of_policy_lists).
-        """
         if not states:
             return np.array([]), []
 
@@ -214,52 +188,8 @@ class PyTorchEvaluator(BatchEvaluator):
 
         values, policies = self._model.batch_inference(obs_batch, mask_batch)
 
-        # Convert policies array → list of [(action, prob), ...]
         prior_list = []
         for state, policy_arr in zip(states, policies):
             prior_list.append(
                 [(a, float(policy_arr[a])) for a in state.legal_actions()])
         return values, prior_list
-
-
-# ── Original JAX AlphaZeroEvaluator (kept for reference) ───────────────────
-
-class AlphaZeroEvaluator(orig_mcts.Evaluator):
-    """Original JAX AlphaZero MCTS Evaluator — unchanged from OpenSpiel."""
-
-    def __init__(self, game: pyspiel.Game, model: Any,
-                 cache_size: int = 2**16) -> None:
-        if game.num_players() != 2:
-            raise ValueError("Game must be for two players.")
-        game_type = game.get_type()
-        if game_type.reward_model != pyspiel.GameType.RewardModel.TERMINAL:
-            raise ValueError("Game must have terminal rewards.")
-        if game_type.dynamics != pyspiel.GameType.Dynamics.SEQUENTIAL:
-            raise ValueError("Game must have sequential turns.")
-
-        self._model = model
-        self._cache = lru_cache.LRUCache(cache_size)
-
-    def cache_info(self):
-        return self._cache.info()
-
-    def clear_cache(self):
-        self._cache.clear()
-
-    def _inference(self, state):
-        obs = np.asarray(state.observation_tensor())
-        mask = np.asarray(state.legal_actions_mask())
-        cache_key = obs.tobytes() + mask.tobytes()
-        value, policy = self._cache.make(
-            cache_key, lambda: self._model.inference(obs, mask))
-        return value, policy
-
-    def evaluate(self, state):
-        value, _ = self._inference(state)
-        return np.array([value, -value])
-
-    def prior(self, state):
-        if state.is_chance_node():
-            return state.chance_outcomes()
-        _, policy = self._inference(state)
-        return [(action, policy[action]) for action in state.legal_actions()]
