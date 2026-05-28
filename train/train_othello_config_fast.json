@@ -14,7 +14,7 @@
   "policy_epsilon": 0.25,
   "policy_alpha": 1.0,
   "value_classes": 3,
-
+  
   "temperature": 0.2,
   "temperature_drop": 8,
 

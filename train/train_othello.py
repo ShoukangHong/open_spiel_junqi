@@ -41,6 +41,7 @@ import pyspiel
 from train.batch_mcts.config import MCTSConfig
 from train.batch_mcts.evaluator import PyTorchEvaluator
 from train.batch_mcts.mcts import BatchMCTS
+from train.batch_mcts.shared_evaluator import InferenceServer, SharedEvaluator
 from train.core.base_config import BaseTrainConfig
 from train.core.checkpoint import find_latest_checkpoint
 from train.core.game_logger import GameLogger
@@ -80,32 +81,21 @@ def _make_value(ret, value_classes):
 from train.core.model_builder import build_othello_model as build_model
 
 
-def actor_process(cfg_dict, result_queue, actor_id=0):
+def actor_process(cfg_dict, incoming_q, result_q, state_queue, actor_id=0):
     cfg = OthelloTrainConfig(**cfg_dict)
     game = pyspiel.load_game(cfg.game)
-    model = build_model(game, cfg)
+    evaluator = SharedEvaluator(game, incoming_q, result_q, actor_id)
     mcts_cfg = MCTSConfig(
         max_simulations=cfg.max_simulations, batch_size=cfg.mcts_batch_size,
         uct_c=cfg.uct_c, policy_epsilon=cfg.policy_epsilon,
         policy_alpha=cfg.policy_alpha,
         value_classes=cfg.value_classes, verbose=False)
-    evaluator = PyTorchEvaluator(game, model,
-                             value_classes=cfg.value_classes)
     mcts = BatchMCTS(game, mcts_cfg, evaluator,
                      random_state=np.random.RandomState())
     rng = np.random.RandomState()
     logger = GameLogger(cfg.path, actor_id)
-    loaded_step = 0
-    _LATEST = -999
     pending = []
     while True:
-        latest_path = os.path.join(cfg.path, f"checkpoint-{_LATEST}.pt")
-        if os.path.exists(latest_path):
-            mtime = os.path.getmtime(latest_path)
-            if mtime > loaded_step:
-                model.load_checkpoint(_LATEST)
-                evaluator.clear_cache()
-                loaded_step = mtime
         if pending:
             init_state, allow_weak, tag_override = pending.pop()
         else:
@@ -120,7 +110,7 @@ def actor_process(cfg_dict, result_queue, actor_id=0):
                 obs, mask, policy, cp, _tag = states_info[i]
                 states_info[i] = (obs, mask, policy, cp, tag_override)
         try:
-            result_queue.put((states_info, returns, wstats), timeout=1)
+            state_queue.put((states_info, returns, wstats), timeout=1)
         except queue.Full:
             print("[actor] WARNING: queue full, dropping game", flush=True)
 
@@ -146,19 +136,30 @@ def main():
 
     _LATEST = -999
 
-    # ── Spawn actors (if multi-process) ──────────────────────────────────
+    # ── Shared inference server (multi-actor GPU batching) ───────────────
+    inference_server = InferenceServer()
     actors = []
     if cfg.num_actors > 1:
-        # Save initial weights so actors can load them
         model.save_checkpoint(_LATEST)
         cfg_dict = asdict(cfg)
         cfg_dict["path"] = cfg.path
+        incoming_q = inference_server.incoming_queue
         for i in range(cfg.num_actors):
-            q = mp.Queue(maxsize=200)
+            inference_server.register_actor(i)
+        # Start server AFTER all actors are registered
+        inference_server.register_model(
+            "main", model._model.state_dict(),
+            cfg.nn_width, cfg.nn_depth, cfg.value_classes)
+        inference_server.start(cfg.game, cfg.inference_batch_size)
+        for i in range(cfg.num_actors):
+            result_q = inference_server.result_queue(i)
+            state_q = mp.Queue(maxsize=200)
             p = mp.Process(target=actor_process,
-                           args=(cfg_dict, q, i), name=f"actor-{i}")
+                           args=(cfg_dict, incoming_q, result_q,
+                                 state_q, i),
+                           name=f"actor-{i}")
             p.start()
-            actors.append((p, q))
+            actors.append((p, state_q))
         _log(f"[train] Spawned {cfg.num_actors} actor processes")
 
     # Training state
@@ -178,7 +179,7 @@ def main():
             if cfg.num_actors == 1:
                 # Single-process path
                 evaluator = PyTorchEvaluator(game, model,
-                             value_classes=cfg.value_classes)
+                                             value_classes=cfg.value_classes)
                 mcts = BatchMCTS(game, mcts_config, evaluator,
                                  random_state=np.random.RandomState(
                                      cfg.seed + step * 1000))
@@ -316,9 +317,12 @@ def main():
                     cfg.path, f"buffer-checkpoint-{step}.npz"))
                 _log(f"  [checkpoint] Saved {ckpt_path}")
 
-            # Broadcast latest weights to actors
+            # Broadcast latest weights to actors + server
             if cfg.num_actors > 1:
                 model.save_checkpoint(_LATEST)
+                inference_server.update_weights(
+                    "main", model._model.state_dict(),
+                    cfg.inference_batch_size)
 
             # ── Evaluation ─────────────────────────────────────────────
             _eval_thread, _last_eval_time = maybe_trigger_eval(
@@ -330,6 +334,7 @@ def main():
         _log(f"\n[train] Done. Final checkpoint: {cfg.max_steps}")
 
     finally:
+        inference_server.terminate()
         for p, q in actors:
             if p.is_alive():
                 p.terminate()

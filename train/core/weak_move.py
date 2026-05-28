@@ -17,7 +17,12 @@ def nn_raw_after_move(evaluator, state, action):
         return evaluator.scalar_value(s)
     # Fallback for duck-typed evaluators (tests)
     nn_val, _ = evaluator._inference(s)
-    return float(nn_val) if not hasattr(nn_val, '__len__') else float(nn_val[0])
+    if hasattr(nn_val, '__len__'):
+        q = float(nn_val[0] - nn_val[2])
+        if s.current_player() == 1:
+            q = -q
+        return q
+    return float(nn_val)
 
 
 def try_weak_move(mcts, state, root, config, weak_count, weak_max,

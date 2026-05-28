@@ -48,6 +48,7 @@ def setup_config_and_logging(config_path: str, config_class,
                  f"  value_classes={cfg.value_classes}")
     logging.info(f"[train] max_sim={cfg.max_simulations}"
                  f"  mcts_batch={cfg.mcts_batch_size}"
+                 f"  infer_batch={cfg.inference_batch_size}"
                  f"  buffer={cfg.replay_buffer_size}")
     logging.info(f"[train] max_steps={cfg.max_steps}"
                  f"  ckpt_freq={cfg.checkpoint_freq}")

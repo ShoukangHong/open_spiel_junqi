@@ -42,6 +42,7 @@ def _model_for(player_cfg):
         with open(config_path) as f:
             tc = json.load(f)
         from train.core.model_builder import build_othello_model
+        tc["path"] = player_cfg["checkpoint_dir"]  # override saved config
         m = build_othello_model(game, tc)
         step = player_cfg.get("checkpoint_step", 0)
         if step > 0:
@@ -184,6 +185,179 @@ def run_match(cfg0, cfg1, num_games=100, temperature=0.1, temp_drop=4,
     return score, sequences
 
 
+# ── Parallel version ─────────────────────────────────────────────────────────
+
+def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
+                       temp_drop=4, num_actors=4, quiet=True):
+    """Parallel eval using shared GPU inference server.
+
+    Spawns N game threads sharing one GPU process for batched inference.
+    """
+    from train.batch_mcts.shared_evaluator import (
+        InferenceServer, SharedEvaluator)
+    import json, os, threading
+
+    s0, s1 = cfg0["strategy"], cfg1["strategy"]
+    st0 = cfg0.get("checkpoint_step", 0)
+    st1 = cfg1.get("checkpoint_step", 0)
+    name0 = (f"{s0}" if s0 in ("random", "greedy")
+             else f"{s0}(step{st0},{cfg0.get('mcts_simulations', 0)}sim)")
+    name1 = (f"{s1}" if s1 in ("random", "greedy")
+             else f"{s1}(step{st1},{cfg1.get('mcts_simulations', 0)}sim)")
+
+    game = _game_obj()
+    server = InferenceServer()
+
+    # Register models that need NN
+    model_objs = {}
+    for mid, pcfg in [("m0", cfg0), ("m1", cfg1)]:
+        if pcfg["strategy"] not in ("mcts", "model"):
+            continue
+        config_path = os.path.join(pcfg["checkpoint_dir"],
+                                    "train_config.json")
+        with open(config_path) as f:
+            tc = json.load(f)
+        model_objs[mid] = _model_for(pcfg)
+        server.register_model(mid, model_objs[mid]._model.state_dict(),
+                              tc.get("nn_width", 32), tc.get("nn_depth", 6),
+                              tc.get("value_classes", 1))
+
+    server.start("othello", 128)
+    incoming_q = server.incoming_queue
+
+    score = {name0: 0, name1: 0, "draw": 0}
+    score_lock = threading.Lock()
+    sequences = []
+
+    def _worker(worker_id: int, g_start: int, g_end: int):
+        rq = server.register_actor(worker_id)
+        evals = {}
+        for mid, pcfg in [("m0", cfg0), ("m1", cfg1)]:
+            if pcfg["strategy"] in ("mcts", "model"):
+                evals[mid] = SharedEvaluator(
+                    game, incoming_q, rq, actor_id=worker_id, model_id=mid)
+            else:
+                evals[mid] = None  # random/greedy don't need evaluator
+
+        rng = np.random.RandomState(worker_id * 1000 + g_start)
+        local_score = {name0: 0, name1: 0, "draw": 0}
+        local_seqs = []
+
+        for i in range(g_start, g_end):
+            if i % 2 == 0:
+                cfg_b, cfg_w = cfg0, cfg1
+                label_b, label_w = name0, name1
+                ev_b, ev_w = evals["m0"], evals["m1"]
+            else:
+                cfg_b, cfg_w = cfg1, cfg0
+                label_b, label_w = name1, name0
+                ev_b, ev_w = evals["m1"], evals["m0"]
+
+            state = game.new_initial_state()
+            move_num = 0
+            moves = []
+            while not state.is_terminal():
+                cur = state.current_player()
+                cfg = cfg_b if cur == 0 else cfg_w
+                ev = ev_b if cur == 0 else ev_w
+                action = _act_parallel(cfg, state, move_num,
+                                        temperature, temp_drop, ev,
+                                        worker_id)
+                state.apply_action(action)
+                moves.append(action)
+                move_num += 1
+            local_seqs.append((label_b, tuple(moves)))
+            r = state.returns()[0]
+            if r > 0:
+                local_score[label_b] += 1
+            elif r < 0:
+                local_score[label_w] += 1
+            else:
+                local_score["draw"] += 1
+
+        with score_lock:
+            for k in score:
+                score[k] += local_score[k]
+            sequences.extend(local_seqs)
+
+    games_per = num_games // num_actors
+    threads = []
+    for w in range(num_actors):
+        gs = w * games_per
+        ge = num_games if w == num_actors - 1 else gs + games_per
+        t = threading.Thread(target=_worker, args=(w, gs, ge))
+        t.start()
+        threads.append(t)
+
+    if not quiet:
+        print(f"\nMatch: {name0} (black) vs {name1} (white), "
+              f"{num_games} games, {num_actors} actors\n")
+
+    for t in threads:
+        t.join()
+
+    server.stop()
+    return score, sequences
+
+
+def _act_parallel(player_cfg, state, move_num, temperature, temp_drop,
+                  shared_eval=None, worker_id=0):
+    strategy = player_cfg["strategy"]
+    legal = state.legal_actions()
+
+    if strategy == "random":
+        return np.random.choice(legal)
+
+    if strategy == "greedy":
+        cur = state.current_player()
+        token = "x" if cur == 0 else "o"
+        counts = [str(state.clone().apply_action(a)).count(token)
+                  for a in legal]
+        return legal[int(np.argmax(counts))]
+
+    if strategy == "model":
+        _, policy = shared_eval._inference(state)
+        probs = np.array([policy[a] for a in legal])
+        if temperature > 0:
+            probs = probs ** (1.0 / temperature)
+            probs /= probs.sum()
+            return np.random.choice(legal, p=probs)
+        return legal[int(np.argmax(probs))]
+
+    if strategy == "mcts":
+        if not hasattr(_act_parallel, '_mcts_cache'):
+            _act_parallel._mcts_cache = {}
+        key = (player_cfg["checkpoint_dir"],
+               player_cfg.get("checkpoint_step", 0),
+               worker_id)
+        if key not in _act_parallel._mcts_cache:
+            import json, os
+            config_path = os.path.join(player_cfg["checkpoint_dir"],
+                                       "train_config.json")
+            with open(config_path) as f:
+                tc = json.load(f)
+            cfg = MCTSConfig(
+                max_simulations=player_cfg.get("mcts_simulations", 128),
+                batch_size=player_cfg.get("mcts_batch_size", 4),
+                uct_c=player_cfg.get("mcts_uct_c", 1.41),
+                value_classes=tc.get("value_classes", 1),
+                policy_epsilon=0, verbose=False)
+            _act_parallel._mcts_cache[key] = BatchMCTS(
+                _game_obj(), cfg, shared_eval,
+                random_state=np.random.RandomState(worker_id * 1000))
+        mcts = _act_parallel._mcts_cache[key]
+        root = mcts.mcts_search(state)
+        visits = np.array([c.explore_count for c in root.children])
+        probs = visits / visits.sum()
+        tau = 1.0 if move_num < temp_drop else temperature
+        probs = probs ** (1.0 / max(tau, 0.01))
+        probs /= probs.sum()
+        actions = [c.action for c in root.children]
+        return np.random.choice(actions, p=probs)
+
+    raise ValueError(f"Unknown strategy: {strategy}")
+
+
 # ── Default config + main ────────────────────────────────────────────────────
 
 DEFAULT_NUM_GAMES = 100
@@ -221,18 +395,18 @@ def main():
 
 
 PLAYER = {
-    # 0: {"strategy": "mcts",
-    #     "checkpoint_dir": r"C:\Users\shouk\othello_train_v2",
-    #     "checkpoint_step": 130,
-    #     "mcts_simulations": 128, "mcts_batch_size": 6, "mcts_uct_c": 1.41},
-    0: {"strategy": "mcts",
-        "checkpoint_dir": r"C:\Users\shouk\othello_train_fast",
-        "checkpoint_step": -999,
-        "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
-    1: {"strategy": "random",
-        "checkpoint_dir": r"C:\Users\shouk\othello_train_cloud",
-        "checkpoint_step": 180,
-        "mcts_simulations": 512, "mcts_batch_size": 32, "mcts_uct_c": 1.41},
+    0: {"strategy": "random",
+        "checkpoint_dir": r"C:\Users\shouk\othello_train\fast",
+        "checkpoint_step": 25,
+        "mcts_simulations": 128, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
+    1: {"strategy": "mcts",
+        "checkpoint_dir": r"C:\Users\shouk\othello_train\fast",
+        "checkpoint_step": 100,
+        "mcts_simulations": 128, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
+    # 1: {"strategy": "mcts",
+    #     "checkpoint_dir": r"C:\Users\shouk\othello_train_cloud",
+    #     "checkpoint_step": 180,
+    #     "mcts_simulations": 256, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
 }
 
 if __name__ == "__main__":

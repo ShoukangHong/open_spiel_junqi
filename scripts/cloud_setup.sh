@@ -50,7 +50,7 @@ cd ..
 
 # ── 4. Python deps & pyspiel ─────────────────────────────────────────────────
 echo "=== [4/4] Python deps ==="
-pip install numpy attrs absl-py scipy ml-collections -q
+pip install numpy attrs absl-py scipy ml-collections nvidia-ml-py psutil -q
 
 # Copy pyspiel .so to site-packages (no rebuild)
 SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])")

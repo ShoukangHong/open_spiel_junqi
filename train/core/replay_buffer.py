@@ -84,8 +84,16 @@ class ReplayBuffer:
         self._obs = np.empty((self._max_size, *obs_shape), dtype=np.float32)
         self._masks = np.empty((self._max_size, *mask_shape), dtype=bool)
         self._policies = np.empty((self._max_size, *policy_shape), dtype=np.float32)
-        self._values = np.empty((self._max_size,), dtype=np.float32)
+
+        # Detect value shape from saved data (handles shape changes)
+        saved_values = data["values"]
+        if saved_values.ndim > 1:
+            self._value_dim = saved_values.shape[1]
+        v_shape = (self._max_size,) if saved_values.ndim == 1 else \
+                   (self._max_size, saved_values.shape[1])
+        self._values = np.empty(v_shape, dtype=np.float32)
         self._tags = np.empty((self._max_size,), dtype=object)
+
         self._obs[:self._size] = data["obs"]
         self._masks[:self._size] = data["masks"]
         self._policies[:self._size] = data["policies"]

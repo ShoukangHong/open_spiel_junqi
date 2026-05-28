@@ -21,9 +21,9 @@ from train.model.othello_resnet import Model, OthelloResNet
 # ── Config — paths only, model settings read from checkpoint dir ────────
 # CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_v2"
 # CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_cloud"
-CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_fast"
-CHECKPOINT_STEP = 10             # checkpoint step to load (must exist)
-MCTS_SIMULATIONS = 128          # MCTS search budget per move
+CHECKPOINT_DIR = r"C:\Users\shouk\othello_train\fast"
+CHECKPOINT_STEP = 70             # checkpoint step to load (must exist)
+MCTS_SIMULATIONS = 256          # MCTS search budget per move
 HINT_MAX_SIM = 12800
 MCTS_BATCH_SIZE = 8             # leaf evaluation batch size
 UCT_C = 1.41
@@ -35,6 +35,7 @@ def load_model(game):
     with open(config_path) as f:
         train_cfg = json.load(f)
     from train.core.model_builder import build_othello_model
+    train_cfg["path"] = CHECKPOINT_DIR  # override saved config
     model = build_othello_model(game, train_cfg)
     model.load_checkpoint(CHECKPOINT_STEP)
     print(f"Loaded checkpoint-{CHECKPOINT_STEP} from {CHECKPOINT_DIR}")

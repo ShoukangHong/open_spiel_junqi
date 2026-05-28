@@ -105,3 +105,20 @@ D4 变换是用 `np.rot90`（默认逆时针，CCW）做空间变换，action �
 ### 17. 模型构建统一入口
 
 所有需要加载 checkpoint 建模型的地方（训练、eval_match、游戏 UI）统一走 `train/core/model_builder.py` 的 `build_othello_model()`。避免各处手写 `OthelloResNet(...)` 导致参数遗漏（尤其是 `num_value_classes` 和 `value_classes`）。
+
+### 18. Shared evaluator 预编码：4.7× 吞吐
+
+多 actor + 共享 GPU server 架构下的两大瓶颈：
+
+1. **GPU forward**（主瓶颈）：avg_fwd=11.5ms，占总耗时 ~45%
+2. **Server 侧其他开销**：per-state 的 `observation_tensor()` / `legal_actions_mask()` C++ 调用、`hasattr` 类型检查、Python list 构造——每秒数千 states 时累积为主开销
+
+**方案**：actor 进程在提交队列前预编码 `obs`/`mask` 为 numpy 数组，server 端零 C++ 调用只做纯数组操作（`np.concatenate → forward → np.where(mask)` scatter）。
+
+| 指标 | 优化前 | 优化后 |
+|------|--------|--------|
+| avg_fwd | 11.5ms | 4.3ms（-63%） |
+| states/s | 3526 | 16375（4.7×） |
+| avg_batch | 82→137 | 超 `_MAX_BATCH` 饱负荷 |
+
+**教训**：GPU server 作为核心吞吐瓶颈，必须保持热路径上只有矩阵运算。所有博弈状态到数组的转换应下推到 actor 端完成。

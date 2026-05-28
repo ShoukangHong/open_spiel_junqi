@@ -134,11 +134,14 @@ class PyTorchEvaluator(BatchEvaluator):
         return value, policy
 
     def scalar_value(self, state) -> float:
-        """Override: use _inference with WDL conversion."""
+        """Override: always returns p0 (black) perspective."""
         value, _ = self._inference(state)
         if self._value_classes == 3:
             v = np.asarray(value, dtype=np.float32).ravel()
-            return float(v[0] - v[2])
+            q = float(v[0] - v[2])
+            if state.current_player() == 1:
+                q = -q
+            return q
         return float(value)
 
     def evaluate(self, state):

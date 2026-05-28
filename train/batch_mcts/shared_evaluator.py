@@ -1,173 +1,346 @@
 """Shared GPU evaluator for multi-actor training.
 
-Instead of N actors each doing their own tiny GPU calls (serialised by
-CUDA), all actors submit leaf states to a single inference thread that
-batches them together for one forward pass.  Designed to support
-multi-model mixing in the future via model_id.
+Supports multiple models via model_id routing — each actor can use a
+different checkpoint without spawning separate GPU processes.
 
-Usage:
-    server = InferenceServer()
-    server.register_model("main", model)
-    server.start()
-
-    eval = SharedEvaluator(game, server, "main")
-    # use eval in BatchMCTS like PyTorchEvaluator
+Architecture:
+  actor → incoming_q: (actor_id, model_id, obs_list, mask_list)
+  Server: groups by model_id, batched forward per group, scatters
+  actor ← result_qs[actor_id]: (actor_id, results)
 """
 
+import multiprocessing as mp
 import queue
-import threading
+import time
 
 import numpy as np
 
 
-class _Future:
-    """A one-shot future for inference results."""
-
-    __slots__ = ("_event", "_value", "_policy")
-
-    def __init__(self):
-        self._event = threading.Event()
-        self._value = None
-        self._policy = None
-
-    def set(self, value, policy):
-        self._value = value
-        self._policy = policy
-        self._event.set()
-
-    def get(self):
-        self._event.wait()
-        return self._value, self._policy
-
-
-class InferenceServer:
-    """Background thread that batches leaf-eval requests from all actors.
-
-    Actors submit (states, model_id, future) triples via submit().
-    The server thread coalesces submissions into batches grouped by
-    model_id, runs a single forward pass per group, and writes results
-    back through the futures.
-    """
-
-    def __init__(self, batch_timeout: float = 0.002):
-        self._batch_timeout = batch_timeout
-        self._lock = threading.Lock()
-        self._models = {}       # model_id → model (OthelloResNet)
-        self._pending = []      # [(states_list, model_id, future)]
-        self._thread = None
-        self._running = False
-
-    def register_model(self, model_id: str, model):
-        with self._lock:
-            self._models[model_id] = model
-
-    def submit(self, states, model_id: str, future: _Future):
-        with self._lock:
-            self._pending.append((states, model_id, future))
-
-    def start(self):
-        self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-
-    def stop(self):
-        self._running = False
-
-    def _run(self):
-        while self._running:
-            # Collect pending submissions
-            with self._lock:
-                if not self._pending:
-                    # Nothing pending — brief sleep then retry
-                    pass
-                batch = self._pending
-                self._pending = []
-
-            if not batch:
-                self._event.wait(self._batch_timeout)
-                continue
-
-            # Group by model_id
-            groups = {}
-            for states_list, mid, fut in batch:
-                groups.setdefault(mid, []).append((states_list, fut))
-
-            # One forward pass per model group
-            for mid, entries in groups.items():
-                model = self._models.get(mid)
-                if model is None:
-                    for _, fut in entries:
-                        fut.set(0.0, np.zeros(65, dtype=np.float32))
-                    continue
-
-                # Coalesce all states into one batch
-                all_states = []
-                state_counts = []
-                for states_list, _ in entries:
-                    all_states.extend(states_list)
-                    state_counts.append(len(states_list))
-
-                if not all_states:
-                    continue
-
-                obs_batch = np.stack(
-                    [np.asarray(s.observation_tensor(), dtype=np.float32)
-                     for s in all_states], axis=0)
-                mask_batch = np.stack(
-                    [np.asarray(s.legal_actions_mask(), dtype=bool)
-                     for s in all_states], axis=0)
-
-                values, policies = model.batch_inference(obs_batch, mask_batch)
-
-                # Scatter results back to individual futures
-                cursor = 0
-                for i, (states_list, fut) in enumerate(entries):
-                    n = state_counts[i]
-                    for j, state in enumerate(states_list):
-                        idx = cursor + j
-                        prior = [(a, float(policies[idx, a]))
-                                 for a in state.legal_actions()]
-                        fut.set(float(values[idx]), prior)
-                    cursor += n
-
-
 class SharedEvaluator:
-    """BatchMCTS-compatible evaluator backed by a shared InferenceServer.
+    """BatchMCTS-compatible evaluator backed by a shared GPU process."""
 
-    Implements the same interface as PyTorchEvaluator:
-      - _inference(state) → (value, policy_array)
-      - batch_inference_raw(states) → (values_array, prior_list)
-
-    The batch_inference_raw path is the one BatchMCTS actually calls;
-    it submits all leaf states together and blocks until the server
-    returns results.
-    """
-
-    def __init__(self, game, server: InferenceServer, model_id: str = "main"):
+    def __init__(self, game, incoming_q: mp.Queue, result_q: mp.Queue,
+                 actor_id: int = 0, model_id: str = "main"):
         self._game = game
-        self._server = server
+        self._incoming = incoming_q
+        self._result = result_q
+        self._actor_id = actor_id
         self._model_id = model_id
 
+    def scalar_value(self, state):
+        """Always returns p0 (black) perspective, matching PyTorchEvaluator."""
+        value, _ = self._inference(state)
+        if isinstance(value, (list, tuple, np.ndarray)) and len(value) == 3:
+            q = float(value[0] - value[2])
+            if state.current_player() == 1:
+                q = -q
+            return q
+        return float(value)
+
     def _inference(self, state):
-        """Single-state inference (used by _nn_raw_after_move etc.)."""
-        fut = _Future()
-        self._server.submit([state], self._model_id, fut)
-        value, prior = fut.get()
+        value, prior = self._infer_one(state)
         policy = np.zeros(self._game.num_distinct_actions(), dtype=np.float32)
         for a, p in prior:
             policy[a] = p
         return value, policy
 
-    def batch_inference_raw(self, states):
-        """Batch inference — the primary path used by BatchMCTS.
+    def _infer_one(self, state):
+        obs = np.asarray(state.observation_tensor(), dtype=np.float32)
+        mask = np.asarray(state.legal_actions_mask(), dtype=bool)
+        self._incoming.put((self._actor_id, self._model_id, [obs], [mask]))
+        while True:
+            aid, mid, results = self._result.get()
+            if aid == self._actor_id and mid == self._model_id:
+                if isinstance(results, Exception):
+                    raise results
+                return results[0]
 
-        Submits all leaf states in one go and blocks for results.
-        """
+    def batch_inference_raw(self, states):
         if not states:
             return np.array([]), []
 
-        fut = _Future()
-        self._server.submit(states, self._model_id, fut)
-        value, prior_list = fut.get()
+        obs_list = [np.asarray(s.observation_tensor(), dtype=np.float32)
+                    for s in states]
+        mask_list = [np.asarray(s.legal_actions_mask(), dtype=bool)
+                     for s in states]
 
-        return np.array([value], dtype=np.float32), prior_list
+        self._incoming.put((self._actor_id, self._model_id,
+                            obs_list, mask_list))
+        while True:
+            aid, mid, results = self._result.get()
+            if aid == self._actor_id and mid == self._model_id:
+                if isinstance(results, Exception):
+                    raise results
+                break
+
+        values = np.asarray([v for v, _ in results], dtype=np.float32)
+        prior_list = [p for _, p in results]
+        return values, prior_list
+
+
+# ── GPU Inference Server ────────────────────────────────────────────────────
+
+_MAX_WAIT = 0.010
+
+
+def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch):
+    """GPU inference process with multi-model support.
+
+    *model_specs*: dict model_id → {state_dict, nn_width, nn_depth, value_classes}
+    """
+    import os as _os
+
+    # ── Priority elevation ────────────────────────────────────────────────────
+    try:
+        if _os.name == "posix":
+            _os.nice(-10)
+        else:
+            import ctypes as _ctypes
+            _ctypes.windll.kernel32.SetPriorityClass(
+                _ctypes.windll.kernel32.GetCurrentProcess(), 0x00008000)
+    except Exception as _e:
+        print(f"[inference-server] priority elevation failed: {_e}", flush=True)
+
+    import pyspiel
+    from train.core.model_builder import build_othello_model
+
+    # ── Hardware monitoring (optional) ─────────────────────────────────────
+    try:
+        import pynvml as _nvml_lib
+        _nvml_lib.nvmlInit()
+        _nvml_handle = _nvml_lib.nvmlDeviceGetHandleByIndex(0)
+        _has_nvml = True
+    except Exception:
+        try:
+            import nvidia_ml_py as _nvml_lib
+            _nvml_lib.nvmlInit()
+            _nvml_handle = _nvml_lib.nvmlDeviceGetHandleByIndex(0)
+            _has_nvml = True
+        except Exception:
+            _has_nvml = False
+    try:
+        import psutil
+        _has_psutil = True
+    except ImportError:
+        _has_psutil = False
+
+    game = pyspiel.load_game(game_name)
+    models = {}
+    wdl_map = {}
+    for mid, spec in model_specs.items():
+        if spec.get("model") is not None:
+            # Pre-built mock model (testing)
+            models[mid] = spec["model"]
+        else:
+            m = build_othello_model(game, {
+                "nn_width": spec["nn_width"], "nn_depth": spec["nn_depth"],
+                "value_classes": spec["value_classes"],
+                "device": "cuda", "path": ".",
+            })
+            if spec.get("state_dict") is not None:
+                m._model.load_state_dict(spec["state_dict"])
+            m._model.to("cuda")
+            m.eval()
+            models[mid] = m
+        wdl_map[mid] = spec["value_classes"] == 3
+
+    _cfg = {"max_batch": max_batch}
+    int_batches = 0
+    int_states = 0
+    int_fwd_ms = 0.0
+    int_collect_ms = 0.0
+    int_scatter_ms = 0.0
+    last_report = time.time()
+    report_interval = 60.0  # seconds, doubles each report up to 32 min
+
+    # Per-model pending queues with arrival timestamps
+    from collections import defaultdict
+    pending = defaultdict(list)  # model_id → [(arrival_time, actor_id, obs_list, mask_list), ...]
+
+    while True:
+        # ── Collect all incoming messages ──────────────────────────────
+        while True:
+            try:
+                msg = incoming_q.get_nowait()
+            except queue.Empty:
+                break
+
+            if msg == "__STOP__":
+                return
+
+            if isinstance(msg, tuple) and len(msg) == 3 \
+                    and isinstance(msg[1], dict):
+                mid, sd, mb = msg
+                if mid in models and hasattr(models[mid], '_model'):
+                    models[mid]._model.load_state_dict(sd)
+                _cfg["max_batch"] = mb
+                continue
+
+            actor_id, model_id, obs_list, mask_list = msg
+            if model_id not in models:
+                if actor_id in result_qs:
+                    result_qs[actor_id].put(
+                        (actor_id, model_id,
+                         RuntimeError(f"unknown model_id: {model_id}")))
+                continue
+            pending[model_id].append(
+                (time.time(), actor_id, obs_list, mask_list))
+
+        # ── Pick model by score: wait_time * sqrt(fill_ratio) ─────────
+        if not any(pending.values()):
+            time.sleep(0.001)
+            continue
+
+        now = time.time()
+        best_score = -1.0
+        best_mid = None
+        for mid, reqs in pending.items():
+            if not reqs:
+                continue
+            wait_ms = (now - reqs[0][0]) * 1000
+            n_states = sum(len(r[2]) for r in reqs)
+            fill = min(n_states / _cfg["max_batch"], 1.0)
+            score = wait_ms * (fill ** 0.5)
+            if score > best_score:
+                best_score = score
+                best_mid = mid
+
+        # Collect up to max_batch states from the best model
+        group = []
+        total_states = 0
+        kept = []
+        for req in pending[best_mid]:
+            _, actor_id, obs_list, mask_list = req
+            if total_states + len(obs_list) <= _cfg["max_batch"]:
+                group.append((actor_id, obs_list, mask_list))
+                total_states += len(obs_list)
+            else:
+                kept.append(req)
+        pending[best_mid] = kept
+
+        if not group:
+            time.sleep(0.001)
+            continue
+
+        # ── Forward for this model ─────────────────────────────────────
+        model = models[best_mid]
+        wdl = wdl_map[best_mid]
+
+        concat_t0 = time.time()
+        all_obs = np.concatenate([np.stack(o, axis=0)
+                                   for _, o, _ in group], axis=0)
+        all_mask = np.concatenate([np.stack(m, axis=0)
+                                    for _, _, m in group], axis=0)
+        concat_ms = (time.time() - concat_t0) * 1000
+
+        fwd_t0 = time.time()
+        values, policies = model.batch_inference(all_obs, all_mask)
+        fwd_ms = (time.time() - fwd_t0) * 1000
+
+        scatter_t0 = time.time()
+        actor_results = {aid: [] for aid, _, _ in group}
+        cursor = 0
+        for actor_id, obs_list, _ in group:
+            for j in range(len(obs_list)):
+                idx = cursor + j
+                legal = all_mask[idx].nonzero()[0]
+                prior = [(int(a), float(policies[idx, a]))
+                         for a in legal]
+                actor_results[actor_id].append(
+                    (values[idx].tolist() if wdl else float(values[idx]),
+                     prior))
+            cursor += len(obs_list)
+        for actor_id, results in actor_results.items():
+            result_qs[actor_id].put((actor_id, best_mid, results))
+        scatter_ms = (time.time() - scatter_t0) * 1000
+
+        int_batches += 1
+        int_states += total_states
+        int_fwd_ms += fwd_ms
+        int_collect_ms += concat_ms
+        int_scatter_ms += scatter_ms
+
+        now = time.time()
+        if now - last_report >= report_interval:
+            elapsed = now - last_report
+            n = max(int_batches, 1)
+            hw = ""
+            if _has_nvml:
+                util = _nvml_lib.nvmlDeviceGetUtilizationRates(_nvml_handle)
+                import torch
+                vram = torch.cuda.memory_allocated() / (1024 ** 3)
+                hw += f"  gpu={util.gpu}% vram={vram:.1f}GB"
+            if _has_psutil:
+                cpu = psutil.cpu_percent()
+                mem = psutil.virtual_memory().percent
+                hw += f"  cpu={cpu}% mem={mem}%"
+            print(f"[inference-server] batches={int_batches}  "
+                  f"states={int_states}  "
+                  f"avg_batch={int_states/n:.1f}  "
+                  f"avg_fwd={int_fwd_ms/n:.1f}ms  "
+                  f"avg_ipc={int_collect_ms/n:.1f}ms  "
+                  f"avg_scatter={int_scatter_ms/n:.1f}ms  "
+                  f"states/s={int_states/max(elapsed,0.001):.0f}"
+                  f"{hw}",
+                  flush=True)
+            int_batches = 0
+            int_states = 0
+            int_fwd_ms = 0.0
+            int_collect_ms = 0.0
+            int_scatter_ms = 0.0
+            last_report = now
+            report_interval = min(report_interval * 2, 1920.0)
+
+
+# ── Lifecycle manager ───────────────────────────────────────────────────────
+
+class InferenceServer:
+
+    def __init__(self):
+        self._incoming = mp.Queue(maxsize=500)
+        self._result_qs = {}
+        self._model_specs = {}
+        self._proc = None
+
+    @property
+    def incoming_queue(self):
+        return self._incoming
+
+    def register_actor(self, actor_id: int):
+        q = mp.Queue(maxsize=100)
+        self._result_qs[actor_id] = q
+        return q
+
+    def result_queue(self, actor_id: int):
+        return self._result_qs[actor_id]
+
+    def register_model(self, model_id: str, state_dict, nn_width,
+                       nn_depth, value_classes):
+        self._model_specs[model_id] = {
+            "state_dict": state_dict,
+            "nn_width": nn_width, "nn_depth": nn_depth,
+            "value_classes": value_classes,
+        }
+
+    def start(self, game_name, max_batch):
+        if not self._model_specs:
+            raise RuntimeError("No models registered")
+        self._proc = mp.Process(
+            target=_run_server,
+            args=(self._incoming, self._result_qs, self._model_specs,
+                  game_name, max_batch),
+            daemon=True,
+        )
+        self._proc.start()
+
+    def update_weights(self, model_id: str, state_dict, max_batch):
+        self._incoming.put((model_id, state_dict, max_batch))
+
+    def stop(self):
+        """Graceful stop via sentinel (works for both threads and processes)."""
+        self._incoming.put("__STOP__")
+
+    def terminate(self):
+        if self._proc and self._proc.is_alive():
+            self._proc.terminate()
+            self._proc.join(timeout=5)

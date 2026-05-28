@@ -17,7 +17,7 @@ import pygame
 
 # ── Config ──────────────────────────────────────────────────────────────────────
 # BUFFER_FILE = r"C:\Users\shouk\othello_train_cloud\buffer-checkpoint-140.npz"
-BUFFER_FILE = r"C:\Users\shouk\othello_train_fast\buffer-checkpoint-10.npz"
+BUFFER_FILE = r"C:\Users\shouk\othello_train\fast\buffer-checkpoint-80.npz"
 # ── Constants ───────────────────────────────────────────────────────────────────
 ROWS = COLS = 8
 SQ_SIZE = 74
