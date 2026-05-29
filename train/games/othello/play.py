@@ -93,9 +93,7 @@ def play_game(game, mcts, config, rng, logger=None,
             sel_probs = policy
 
         if tag == "rare" or action != mcts_action:
-            pass
-        elif after_drop:
-            action = mcts_action
+            pass  # keep the weak/rare action
         else:
             action = rng.choice(len(sel_probs), p=sel_probs)
 

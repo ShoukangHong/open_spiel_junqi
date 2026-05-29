@@ -122,3 +122,43 @@ D4 变换是用 `np.rot90`（默认逆时针，CCW）做空间变换，action �
 | avg_batch | 82→137 | 超 `_MAX_BATCH` 饱负荷 |
 
 **教训**：GPU server 作为核心吞吐瓶颈，必须保持热路径上只有矩阵运算。所有博弈状态到数组的转换应下推到 actor 端完成。
+
+### 19. 温度采样被 argmax 覆盖（严重）
+
+`play_game` 中温度 drop 后的动作选择逻辑有 bug（`train/games/othello/play.py:97-98`）：
+
+```python
+# 第 90 行正确计算了温度 sharpen 后的分布
+sel_probs = policy ** (1.0 / tau) / sum(...)
+
+# 但第 97-98 行完全忽略了 sel_probs
+elif after_drop:
+    action = mcts_action   # ← 永远是 best_child（argmax）
+```
+
+温度只在 drop 前（`τ=1`）生效，drop 后（`τ=0.2`）永远是 argmax。导致 buffer 里存的 policy target 全是 one-hot，模型学不到搜索的不确定性，策略极度确定。eval 时走法完全缺乏多样性。
+
+**修复**：删除 `elif after_drop` 分支，drop 前后统一走 `rng.choice(len(sel_probs), p=sel_probs)`。
+
+**教训**：温度 drop 前后的采样路径必须一致——drop 只改变 tau 值，不改变选择逻辑。
+
+### 20. eval_match 并行模式受 GIL 限制
+
+`run_match_parallel` 原本用 `threading.Thread` 跑 MCTS 搜索，但 MCTS 树遍历全是纯 Python 操作，全程持有 GIL。10 个 actor 实际串行执行，server `avg_batch=8.4`（等于 MCTS batch_size），GPU 利用率 40%。
+
+**修复**：改为 `multiprocessing.Process`，每个 actor 独立进程绕过 GIL。
+
+### 21. eval_match `register_actor` 时序错误
+
+`run_match_parallel` 在 `server.start()` 之后才注册 actor queue。Windows `spawn` 模式下子进程复制了空的 `_result_qs`，后续注册的 actor queue 子进程不可见。
+
+**修复**：所有 actor 在 `server.start()` 前注册完毕。
+
+---
+
+## 测试运行
+
+```bash
+# 激活 venv 后
+python -m pytest tests/ -v
+```

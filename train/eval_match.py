@@ -91,8 +91,9 @@ def _act(player_cfg, state, move_num, temperature, temp_drop):
         mask = np.asarray(state.legal_actions_mask(), dtype=bool)
         _, policy = _model_for(player_cfg).inference(obs, mask)
         probs = np.array([policy[a] for a in legal])
-        if temperature > 0:
-            probs = probs ** (1.0 / temperature)
+        tau = 1.0 if move_num < temp_drop else temperature
+        if tau > 0:
+            probs = probs ** (1.0 / max(tau, 0.01))
             probs /= probs.sum()
             return np.random.choice(legal, p=probs)
         return legal[int(np.argmax(probs))]
@@ -191,11 +192,13 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
                        temp_drop=4, num_actors=4, quiet=True):
     """Parallel eval using shared GPU inference server.
 
-    Spawns N game threads sharing one GPU process for batched inference.
+    Spawns N game processes sharing one GPU process for batched inference.
+    Uses multiprocessing.Process to bypass GIL on MCTS search.
     """
+    import multiprocessing as mp
     from train.batch_mcts.shared_evaluator import (
         InferenceServer, SharedEvaluator)
-    import json, os, threading
+    import json, os
 
     s0, s1 = cfg0["strategy"], cfg1["strategy"]
     st0 = cfg0.get("checkpoint_step", 0)
@@ -205,7 +208,6 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
     name1 = (f"{s1}" if s1 in ("random", "greedy")
              else f"{s1}(step{st1},{cfg1.get('mcts_simulations', 0)}sim)")
 
-    game = _game_obj()
     server = InferenceServer()
 
     # Register models that need NN
@@ -222,82 +224,104 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
                               tc.get("nn_width", 32), tc.get("nn_depth", 6),
                               tc.get("value_classes", 1))
 
+    # Register all actor queues BEFORE start (fork/spawn copies _result_qs)
+    actor_rqs = [server.register_actor(i) for i in range(num_actors)]
+
     server.start("othello", 128)
-    incoming_q = server.incoming_queue
 
     score = {name0: 0, name1: 0, "draw": 0}
-    score_lock = threading.Lock()
     sequences = []
-
-    def _worker(worker_id: int, g_start: int, g_end: int):
-        rq = server.register_actor(worker_id)
-        evals = {}
-        for mid, pcfg in [("m0", cfg0), ("m1", cfg1)]:
-            if pcfg["strategy"] in ("mcts", "model"):
-                evals[mid] = SharedEvaluator(
-                    game, incoming_q, rq, actor_id=worker_id, model_id=mid)
-            else:
-                evals[mid] = None  # random/greedy don't need evaluator
-
-        rng = np.random.RandomState(worker_id * 1000 + g_start)
-        local_score = {name0: 0, name1: 0, "draw": 0}
-        local_seqs = []
-
-        for i in range(g_start, g_end):
-            if i % 2 == 0:
-                cfg_b, cfg_w = cfg0, cfg1
-                label_b, label_w = name0, name1
-                ev_b, ev_w = evals["m0"], evals["m1"]
-            else:
-                cfg_b, cfg_w = cfg1, cfg0
-                label_b, label_w = name1, name0
-                ev_b, ev_w = evals["m1"], evals["m0"]
-
-            state = game.new_initial_state()
-            move_num = 0
-            moves = []
-            while not state.is_terminal():
-                cur = state.current_player()
-                cfg = cfg_b if cur == 0 else cfg_w
-                ev = ev_b if cur == 0 else ev_w
-                action = _act_parallel(cfg, state, move_num,
-                                        temperature, temp_drop, ev,
-                                        worker_id)
-                state.apply_action(action)
-                moves.append(action)
-                move_num += 1
-            local_seqs.append((label_b, tuple(moves)))
-            r = state.returns()[0]
-            if r > 0:
-                local_score[label_b] += 1
-            elif r < 0:
-                local_score[label_w] += 1
-            else:
-                local_score["draw"] += 1
-
-        with score_lock:
-            for k in score:
-                score[k] += local_score[k]
-            sequences.extend(local_seqs)
-
-    games_per = num_games // num_actors
-    threads = []
-    for w in range(num_actors):
-        gs = w * games_per
-        ge = num_games if w == num_actors - 1 else gs + games_per
-        t = threading.Thread(target=_worker, args=(w, gs, ge))
-        t.start()
-        threads.append(t)
 
     if not quiet:
         print(f"\nMatch: {name0} (black) vs {name1} (white), "
               f"{num_games} games, {num_actors} actors\n")
 
-    for t in threads:
-        t.join()
+    # Spawn actor processes
+    stats_q = mp.Queue()
+    procs = []
+    games_per = num_games // num_actors
+    for w in range(num_actors):
+        gs = w * games_per
+        ge = num_games if w == num_actors - 1 else gs + games_per
+        p = mp.Process(target=_eval_actor_process, args=(
+            w, gs, ge, cfg0, cfg1, name0, name1, temperature, temp_drop,
+            server.incoming_queue, actor_rqs[w], stats_q))
+        p.start()
+        procs.append(p)
+
+    # Collect results
+    for _ in range(num_actors):
+        local_score, local_seqs = stats_q.get()
+        for k in score:
+            score[k] += local_score[k]
+        sequences.extend(local_seqs)
+
+    for p in procs:
+        p.join(timeout=5)
+
+    for p in procs:
+        if p.is_alive():
+            p.terminate()
 
     server.stop()
     return score, sequences
+
+
+def _eval_actor_process(worker_id, g_start, g_end, cfg0, cfg1,
+                        name0, name1, temperature, temp_drop,
+                        incoming_q, result_q, stats_out):
+    """Actor process body — runs at module level for Windows spawn compatibility."""
+    import numpy as np
+    import pyspiel
+    from train.batch_mcts.shared_evaluator import SharedEvaluator
+
+    game = pyspiel.load_game("othello")
+
+    evals = {}
+    for mid, pcfg in [("m0", cfg0), ("m1", cfg1)]:
+        if pcfg["strategy"] in ("mcts", "model"):
+            evals[mid] = SharedEvaluator(
+                game, incoming_q, result_q, actor_id=worker_id, model_id=mid)
+        else:
+            evals[mid] = None
+
+    rng = np.random.RandomState(worker_id * 1000 + g_start)
+    local_score = {name0: 0, name1: 0, "draw": 0}
+    local_seqs = []
+
+    for i in range(g_start, g_end):
+        if i % 2 == 0:
+            cfg_b, cfg_w = cfg0, cfg1
+            label_b, label_w = name0, name1
+            ev_b, ev_w = evals["m0"], evals["m1"]
+        else:
+            cfg_b, cfg_w = cfg1, cfg0
+            label_b, label_w = name1, name0
+            ev_b, ev_w = evals["m1"], evals["m0"]
+
+        state = game.new_initial_state()
+        move_num = 0
+        moves = []
+        while not state.is_terminal():
+            cur = state.current_player()
+            cfg = cfg_b if cur == 0 else cfg_w
+            ev = ev_b if cur == 0 else ev_w
+            action = _act_parallel(cfg, state, move_num,
+                                    temperature, temp_drop, ev,
+                                    worker_id)
+            state.apply_action(action)
+            moves.append(action)
+            move_num += 1
+        local_seqs.append((label_b, tuple(moves)))
+        r = state.returns()[0]
+        if r > 0:
+            local_score[label_b] += 1
+        elif r < 0:
+            local_score[label_w] += 1
+        else:
+            local_score["draw"] += 1
+
+    stats_out.put((local_score, local_seqs))
 
 
 def _act_parallel(player_cfg, state, move_num, temperature, temp_drop,
@@ -366,11 +390,12 @@ DEFAULT_TEMP_DROP = 7
 
 
 def main():
-    score, sequences = run_match(
+    score, sequences = run_match_parallel(
         PLAYER[0], PLAYER[1],
         num_games=DEFAULT_NUM_GAMES,
         temperature=DEFAULT_TEMPERATURE,
         temp_drop=DEFAULT_TEMP_DROP,
+        num_actors=10,
         quiet=False)
 
     n = DEFAULT_NUM_GAMES
@@ -395,18 +420,18 @@ def main():
 
 
 PLAYER = {
-    0: {"strategy": "random",
-        "checkpoint_dir": r"C:\Users\shouk\othello_train\fast",
-        "checkpoint_step": 25,
-        "mcts_simulations": 128, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
-    1: {"strategy": "mcts",
-        "checkpoint_dir": r"C:\Users\shouk\othello_train\fast",
-        "checkpoint_step": 100,
-        "mcts_simulations": 128, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
+    0: {"strategy": "mcts",
+        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl",
+        "checkpoint_step": 240,
+        "mcts_simulations": 160, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
     # 1: {"strategy": "mcts",
-    #     "checkpoint_dir": r"C:\Users\shouk\othello_train_cloud",
-    #     "checkpoint_step": 180,
-    #     "mcts_simulations": 256, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
+    #     "checkpoint_dir": r"C:\Users\shouk\othello_train\fast",
+    #     "checkpoint_step": 100,
+    #     "mcts_simulations": 128, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
+    1: {"strategy": "mcts",
+        "checkpoint_dir": r"C:\Users\shouk\othello_train_cloud",
+        "checkpoint_step": 180,
+        "mcts_simulations": 160, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
 }
 
 if __name__ == "__main__":

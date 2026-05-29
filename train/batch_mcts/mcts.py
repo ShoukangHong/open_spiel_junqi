@@ -23,7 +23,6 @@ Contains:
 import math
 import time
 
-from absl import logging
 import numpy as np
 
 import pyspiel
@@ -344,7 +343,7 @@ class MCTSBot(pyspiel.Bot):
       action: The action the bot takes.
     """
     if state.is_chance_node():
-      logging.info("Chance node, returning invalid action policy.")
+      print("Chance node, returning invalid action policy.")
       policy = [(pyspiel.INVALID_ACTION, 1.0)]
       return policy, pyspiel.INVALID_ACTION
 
