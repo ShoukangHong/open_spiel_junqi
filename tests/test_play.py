@@ -28,11 +28,12 @@ def _make_mock_root(state, visits_list):
 
 class _TestCfg:
     temperature = 0.5
-    temperature_drop = 0   # immediately after drop
+    temperature_drop = 0
     weak_max_per_game = 0
     weak_side_prob = 0
     max_moves = 200
     max_steps = 1000
+    prune_enabled = False
 
 
 def test_temperature_sampling_not_argmax():

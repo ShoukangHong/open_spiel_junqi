@@ -21,8 +21,8 @@ from train.model.othello_resnet import Model, OthelloResNet
 # ── Config — paths only, model settings read from checkpoint dir ────────
 # CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_v2"
 # CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_cloud"
-CHECKPOINT_DIR = r"C:\Users\shouk\othello_train\cloud_wdl"
-CHECKPOINT_STEP = 310             # checkpoint step to load (must exist)
+CHECKPOINT_DIR = r"C:\Users\shouk\othello_train\cloud_wdl_w"
+CHECKPOINT_STEP = 250             # checkpoint step to load (must exist)
 MCTS_SIMULATIONS = 256          # MCTS search budget per move
 HINT_MAX_SIM = 12800
 MCTS_BATCH_SIZE = 8             # leaf evaluation batch size
@@ -45,13 +45,11 @@ def load_model(game):
 
 def create_bot(game, model):
     """Create a BatchMCTS bot backed by the PyTorch model."""
-    vc = model._model.num_value_classes
-    evaluator = PyTorchEvaluator(game, model, value_classes=vc)
+    evaluator = PyTorchEvaluator(game, model)
     mcts_cfg = MCTSConfig(
         max_simulations=MCTS_SIMULATIONS,
         batch_size=MCTS_BATCH_SIZE,
         uct_c=UCT_C,
-        value_classes=vc,
         policy_epsilon=0,
         verbose=False,
     )
@@ -446,7 +444,7 @@ def main():
                     if hint_root is None or hint_state != str(state):
                         hint_cfg = MCTSConfig(
                             max_simulations=64, batch_size=MCTS_BATCH_SIZE,
-                            uct_c=UCT_C, value_classes=evaluator._value_classes,
+                            uct_c=UCT_C,
                             policy_epsilon=0, verbose=False)
                         hint_mcts = BatchMCTS(game, hint_cfg, evaluator,
                                               random_state=np.random.RandomState())

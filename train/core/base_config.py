@@ -3,6 +3,9 @@
 import os
 from dataclasses import dataclass
 
+# WDL value head: 3 output classes (win, draw, loss)
+VALUE_CLASSES = 3
+
 
 @dataclass
 class BaseTrainConfig:
@@ -20,7 +23,6 @@ class BaseTrainConfig:
     uct_c: float = 1.41
     policy_epsilon: float = 0.25
     policy_alpha: float = 1.0
-    value_classes: int = 1       # 1=scalar, 3=WDL softmax
     temperature: float = 0.01
     temperature_drop: int = 30
 

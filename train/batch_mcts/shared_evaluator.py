@@ -28,14 +28,12 @@ class SharedEvaluator:
         self._model_id = model_id
 
     def scalar_value(self, state):
-        """Always returns p0 (black) perspective, matching PyTorchEvaluator."""
+        """Return p0-perspective scalar Q from WDL output."""
         value, _ = self._inference(state)
-        if isinstance(value, (list, tuple, np.ndarray)) and len(value) == 3:
-            q = float(value[0] - value[2])
-            if state.current_player() == 1:
-                q = -q
-            return q
-        return float(value)
+        q = float(value[0] - value[2])         # w - l from current player view
+        if state.current_player() == 1:
+            q = -q                              # flip to p0 view
+        return q
 
     def _inference(self, state):
         value, prior = self._infer_one(state)
@@ -86,7 +84,7 @@ _MAX_WAIT = 0.010
 def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch):
     """GPU inference process with multi-model support.
 
-    *model_specs*: dict model_id → {state_dict, nn_width, nn_depth, value_classes}
+    *model_specs*: dict model_id → {state_dict, nn_width, nn_depth}
     """
     import os as _os
 
@@ -126,15 +124,12 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch):
 
     game = pyspiel.load_game(game_name)
     models = {}
-    wdl_map = {}
     for mid, spec in model_specs.items():
         if spec.get("model") is not None:
-            # Pre-built mock model (testing)
             models[mid] = spec["model"]
         else:
             m = build_othello_model(game, {
                 "nn_width": spec["nn_width"], "nn_depth": spec["nn_depth"],
-                "value_classes": spec["value_classes"],
                 "device": "cuda", "path": ".",
             })
             if spec.get("state_dict") is not None:
@@ -142,7 +137,6 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch):
             m._model.to("cuda")
             m.eval()
             models[mid] = m
-        wdl_map[mid] = spec["value_classes"] == 3
 
     _cfg = {"max_batch": max_batch}
     int_batches = 0
@@ -224,7 +218,6 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch):
 
         # ── Forward for this model ─────────────────────────────────────
         model = models[best_mid]
-        wdl = wdl_map[best_mid]
 
         concat_t0 = time.time()
         all_obs = np.concatenate([np.stack(o, axis=0)
@@ -247,8 +240,7 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch):
                 prior = [(int(a), float(policies[idx, a]))
                          for a in legal]
                 actor_results[actor_id].append(
-                    (values[idx].tolist() if wdl else float(values[idx]),
-                     prior))
+                    (values[idx].tolist(), prior))  # [w, d, l]
             cursor += len(obs_list)
         for actor_id, results in actor_results.items():
             result_qs[actor_id].put((actor_id, best_mid, results))
@@ -315,11 +307,10 @@ class InferenceServer:
         return self._result_qs[actor_id]
 
     def register_model(self, model_id: str, state_dict, nn_width,
-                       nn_depth, value_classes):
+                       nn_depth):
         self._model_specs[model_id] = {
             "state_dict": state_dict,
             "nn_width": nn_width, "nn_depth": nn_depth,
-            "value_classes": value_classes,
         }
 
     def start(self, game_name, max_batch):

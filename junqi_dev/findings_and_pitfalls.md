@@ -154,6 +154,19 @@ elif after_drop:
 
 **修复**：所有 actor 在 `server.start()` 前注册完毕。
 
+### 22. Rare fork 对局未跳过温度 drop（灾难性）
+
+Rare case 触发后会 fork 一个新对局从弱着状态出发，目的是评估该分支的后果。但 fork 对局的 `move_num` 从 0 开始计数，前 `temperature_drop` 步（如 8 步）使用 τ=1 随机走子，导致 fork 对局无法干净评估弱着后果——τ=1 的随机性完全淹没弱着的影响。
+
+另外，临时 drop 前加 Dirichlet 噪声也有问题。Othello 开局极其敏感，第 6 步的一步错棋就可能导致让角必输。temp drop 前加噪声会让 MCTS 无谓偏离最优走法。
+
+**修复**：
+- Fork 对局全程使用 post-drop τ（`config.temperature`），走法确定
+- 主对局 temp_drop 前 `mcts_search(add_noise=False)`，禁用 Dirichlet 噪声
+- Fork 对局噪声保留（影响不大）
+
+**教训**：温度系统和 fork 机制有隐含耦合。`move_num` 在 fork 对局中从 0 开始，但 fork 对局从残局出发不需要 warm-up 阶段的随机探索。
+
 ---
 
 ## 测试运行

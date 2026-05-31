@@ -17,7 +17,7 @@ import pygame
 
 # ── Config ──────────────────────────────────────────────────────────────────────
 # BUFFER_FILE = r"C:\Users\shouk\othello_train_cloud\buffer-checkpoint-140.npz"
-BUFFER_FILE = r"C:\Users\shouk\othello_train\cloud_wdl\buffer-checkpoint-20.npz"
+BUFFER_FILE = r"C:\Users\shouk\othello_train\fast\buffer-checkpoint-50.npz"
 # ── Constants ───────────────────────────────────────────────────────────────────
 ROWS = COLS = 8
 SQ_SIZE = 74
@@ -274,8 +274,8 @@ def draw_side_panel(screen, index, total, global_idx, tag_filter,
     _line(f"Turn: {pname}    B:{disp['black_c']}  W:{disp['white_c']}")
     if disp["wdl"] is not None:
         w, d, l = disp["wdl"]
-        _line(f"Value: {disp['value']:+.3f}  ({disp['win_pct']:.1f}%)"
-              f"  W/D/L: {w:.1%}/{d:.1%}/{l:.1%}")
+        _line(f"Value: {disp['value']:+.3f}  ({disp['win_pct']:.1f}%)")
+        _line(f"  W/D/L: {w:.1%}/{d:.1%}/{l:.1%}")
     else:
         _line(f"Value: {disp['value']:+.3f}  ({disp['win_pct']:.1f}%)")
 

@@ -10,20 +10,17 @@ import numpy as np
 def nn_raw_after_move(evaluator, state, action):
     """Apply *action* to a clone of *state*, then evaluate with NN.
 
-    Returns the NN value as a scalar (via evaluator.scalar_value).
+    Returns the NN value as a p0-perspective scalar.
     """
     s = state.clone()
     s.apply_action(action)
     if hasattr(evaluator, 'scalar_value'):
         return evaluator.scalar_value(s)
-    # Fallback for duck-typed evaluators (tests)
-    nn_val, _ = evaluator._inference(s)
-    if hasattr(nn_val, '__len__'):
-        q = float(nn_val[0] - nn_val[2])
-        if s.current_player() == 1:
-            q = -q
-        return q
-    return float(nn_val)
+    nn_val, _ = evaluator._inference(s)   # duck-typed fallback (tests)
+    q = float(nn_val[0] - nn_val[2])       # w - l from current player view
+    if s.current_player() == 1:
+        q = -q
+    return q
 
 
 def try_weak_move(mcts, state, root, config, weak_count, weak_max,
@@ -35,7 +32,7 @@ def try_weak_move(mcts, state, root, config, weak_count, weak_max,
     Returns (action, tag, weak_count, rare_state, weak_cat).
     """
     if rng is None:
-        rng = np.random
+        rng = np.random.RandomState()
     cur_player = state.current_player()
     mcts_action = root.best_child().action
     action = mcts_action
@@ -43,10 +40,39 @@ def try_weak_move(mcts, state, root, config, weak_count, weak_max,
     rare_state = None
     weak_cat = ""
 
-    _, nn_policy_arr = mcts.evaluator._inference(state)
-    legal = state.legal_actions()
-    others = [a for a in legal if a != mcts_action]
-    weak_a = rng.choice(others) if others else mcts_action
+    # ── Select weak action: Q-proximity softmax ──────────────────────
+    # Exclude best child & proven-loss; weight by normalized Q-distance.
+    children = root.children
+    if not children:
+        return mcts_action, "", weak_count, None, ""
+
+    q_vals = np.array([c.q_value for c in children], dtype=np.float64)
+    best_q = q_vals.max()
+    # Normalize to [0, 1]: scale up small Q spreads so proximity matters.
+    q_range = max(q_vals.max() - q_vals.min(), 0.01)
+    temp_q = max(q_range * 0.25, 0.01)  # 25% of spread, minimum 0.01
+    loss_actions = {c.action for c in children
+                    if c.outcome is not None
+                    and c.outcome[cur_player] < 0}
+
+    weights = []
+    candidates = []
+    for c in children:
+        if c.action == mcts_action:
+            continue
+        if c.action in loss_actions:
+            continue
+        w = np.exp(-abs(c.q_value - best_q) / temp_q)
+        candidates.append(c.action)
+        weights.append(w)
+
+    if not candidates:
+        others = [a for a in state.legal_actions() if a != mcts_action]
+        weak_a = int(rng.choice(others)) if others else mcts_action
+    else:
+        weights = np.array(weights, dtype=np.float64)
+        weights /= weights.sum()
+        weak_a = int(rng.choice(candidates, p=weights))
 
     if weak_a == mcts_action:
         return mcts_action, "", weak_count, None, ""
@@ -65,7 +91,6 @@ def try_weak_move(mcts, state, root, config, weak_count, weak_max,
         weak_cat = "rare"
         rare_state = state.clone()
         rare_state.apply_action(weak_a)
-        tag = "rare"
         weak_count = weak_max + 1
         if logger:
             logger.log_line(

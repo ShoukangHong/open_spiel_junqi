@@ -19,20 +19,28 @@ def _cfg(**kw):
         setattr(c, k, v)
     return c
 
+def _scalar_to_wdl(v):
+    """scalar in [-1,1] → WDL [w,d,l]."""
+    w = max(v, 0.0)
+    l = max(-v, 0.0)
+    d = 1.0 - abs(v)
+    return np.array([w, d, l], dtype=np.float32)
+
+
 class ZeroEvaluator:
     def batch_inference_raw(self, states):
         vals, prs = [], []
         for s in states:
-            vals.append(0.0)
+            vals.append([0.0, 1.0, 0.0])  # WDL neutral
             l = s.legal_actions()
             prs.append([(a, 1.0 / len(l)) for a in l])
-        return np.array(vals), prs
+        return np.array(vals, dtype=np.float32), prs
     def _inference(self, state):
         l = state.legal_actions()
         pol = np.zeros(65, dtype=np.float32)
         for a in l:
             pol[a] = 1.0 / len(l)
-        return 0.0, pol
+        return _scalar_to_wdl(0.0), pol
 
 class _ControlledEval:
     def __init__(self, nn_val=0.0, nn_argmax=None):
@@ -44,14 +52,14 @@ class _ControlledEval:
         for a in l: pol[a] = 0.5
         if self.nn_argmax is not None and self.nn_argmax in l:
             pol[self.nn_argmax] = 1.0
-        return self.nn_val, pol
+        return _scalar_to_wdl(self.nn_val), pol
     def batch_inference_raw(self, states):
         vals, prs = [], []
         for s in states:
-            vals.append(0.0)
+            vals.append([0.0, 1.0, 0.0])  # WDL neutral
             l = s.legal_actions()
             prs.append([(a, 1.0 / len(l)) for a in l])
-        return np.array(vals), prs
+        return np.array(vals, dtype=np.float32), prs
 
 
 # Test A
@@ -123,9 +131,9 @@ def test_weak_branches():
 
     # C1: nn_val=0.8 → prob=90%. mcts≈0 → prob=50%. rel_drop≈0.8 > 0.4 → rare
     a, tag, wc, rs, ra, wa, mv = _mk_weak_test("tic_tac_toe", 0.8, 0.4, 0.2)
-    assert tag == "rare"
+    assert tag == ""       # rare no longer stamps tag on main game
     assert rs is not None
-    assert a == ra
+    assert a == ra         # main game plays MCTS best action
     print("  C1 (rare): PASSED")
 
     # C2: nn_val=0 → prob=50% = mcts → rel_drop≈0 < 0.2 → weak accepted

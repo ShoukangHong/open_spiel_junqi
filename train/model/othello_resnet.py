@@ -86,15 +86,13 @@ class OthelloResNet(nn.Module):
     """
 
     def __init__(self, input_channels: int = 4, board_size: int = 8,
-                 output_size: int = 65, nn_width: int = 32, nn_depth: int = 5,
-                 num_value_classes: int = 1):
+                 output_size: int = 65, nn_width: int = 32, nn_depth: int = 5):
         super().__init__()
         self.input_channels = input_channels
         self.board_size = board_size
         self.output_size = output_size
         self.nn_width = nn_width
         self.nn_depth = nn_depth
-        self.num_value_classes = num_value_classes
 
         # Torso
         self.conv_in = ConvBlock(input_channels, nn_width, kernel_size=3)
@@ -107,12 +105,11 @@ class OthelloResNet(nn.Module):
         self.policy_bn = nn.BatchNorm2d(2)
         self.policy_fc = nn.Linear(2 * board_size * board_size, output_size)
 
-        # Value head — wider for WDL to avoid bottleneck
-        vch = 1 if num_value_classes == 1 else 4
-        self.value_conv = nn.Conv2d(nn_width, vch, 1, bias=False)
-        self.value_bn = nn.BatchNorm2d(vch)
-        self.value_fc1 = nn.Linear(vch * board_size * board_size, nn_width)
-        self.value_fc2 = nn.Linear(nn_width, num_value_classes)
+        # Value head — WDL: 3 output classes (win, draw, loss)
+        self.value_conv = nn.Conv2d(nn_width, 4, 1, bias=False)
+        self.value_bn = nn.BatchNorm2d(4)
+        self.value_fc1 = nn.Linear(4 * board_size * board_size, nn_width)
+        self.value_fc2 = nn.Linear(nn_width, 3)
 
         self._init_weights()
 
@@ -138,13 +135,9 @@ class OthelloResNet(nn.Module):
     def forward(self, x):
         """Forward pass.
 
-        Args:
-            x: (batch, input_channels, board_size, board_size) float tensor.
-
         Returns:
             policy_logits: (batch, output_size)
-            value: (batch,) scalar or (batch, num_value_classes)
-                   depending on num_value_classes.
+            value: (batch, 3) — WDL logits (no softmax).
         """
         batch = x.shape[0]
 
@@ -161,9 +154,7 @@ class OthelloResNet(nn.Module):
         v = F.relu(self.value_bn(self.value_conv(x)))
         v = v.reshape(batch, -1)
         v = F.relu(self.value_fc1(v))
-        value = self.value_fc2(v)
-        if self.num_value_classes == 1:
-            value = torch.tanh(value).squeeze(-1)
+        value = self.value_fc2(v)  # (batch, 3) logits
 
         return policy_logits, value
 
@@ -202,10 +193,7 @@ class OthelloResNet(nn.Module):
             policy = policy * mask_t
             policy = policy / policy.sum(dim=-1, keepdims=True).clamp(min=1e-9)
 
-            if self.num_value_classes > 1:
-                val = F.softmax(value, dim=-1)[0].cpu().numpy()
-            else:
-                val = value[0].item()
+            val = F.softmax(value, dim=-1)[0].cpu().numpy()
             return val, policy[0].cpu().numpy()
 
     def batch_inference(self, observations: np.ndarray,
@@ -252,8 +240,7 @@ class OthelloResNet(nn.Module):
             policies = policies * mask_t
             policies = policies / policies.sum(dim=-1, keepdims=True).clamp(min=1e-9)
 
-            if self.num_value_classes > 1:
-                value = F.softmax(value, dim=-1)
+            value = F.softmax(value, dim=-1)
             return value.cpu().numpy(), policies.cpu().numpy()
 
 
@@ -349,13 +336,10 @@ class Model:
         log_probs = F.log_softmax(policy_logits_masked, dim=-1)
         policy_loss = -(target_policy * log_probs).sum(dim=-1).mean()
 
-        # Value loss: MSE (scalar) or CrossEntropy (WDL)
-        if self._model.num_value_classes == 1:
-            value_loss = F.mse_loss(value_pred, target_value)
-        else:
-            value_loss = -(target_value *
-                           F.log_softmax(value_pred, dim=-1)
-                           ).sum(dim=-1).mean()
+        # Value loss: cross-entropy with soft WDL target
+        value_loss = -(target_value *
+                       F.log_softmax(value_pred, dim=-1)
+                       ).sum(dim=-1).mean()
 
         # Track L2 loss contribution (matching JAX formula)
         l2_reg = sum(

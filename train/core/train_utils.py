@@ -45,7 +45,7 @@ def setup_config_and_logging(config_path: str, config_class,
 
     logging.info(f"[train] game={cfg.game}  nn_width={cfg.nn_width}"
                  f"  nn_depth={cfg.nn_depth}"
-                 f"  value_classes={cfg.value_classes}")
+                 f"  value_head=WDL(3)")
     logging.info(f"[train] max_sim={cfg.max_simulations}"
                  f"  mcts_batch={cfg.mcts_batch_size}"
                  f"  infer_batch={cfg.inference_batch_size}"
@@ -77,8 +77,7 @@ def init_training(cfg, game_module, model_builder, ReplayBuffer_class,
     logging.info(f"[train] Model params: {model.num_trainable_variables}"
                  f"  lr={cfg.learning_rate:.0e}")
 
-    buffer = ReplayBuffer_class(max_size=cfg.replay_buffer_size,
-                                 value_dim=cfg.value_classes)
+    buffer = ReplayBuffer_class(max_size=cfg.replay_buffer_size)
     samples_per_step = max(
         int(cfg.replay_buffer_size * cfg.buffer_sampling_frac),
         cfg.train_batch_size)
@@ -93,7 +92,6 @@ def init_training(cfg, game_module, model_builder, ReplayBuffer_class,
         uct_c=cfg.uct_c,
         policy_epsilon=cfg.policy_epsilon,
         policy_alpha=cfg.policy_alpha,
-        value_classes=cfg.value_classes,
         verbose=False,
     )
 

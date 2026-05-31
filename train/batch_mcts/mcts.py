@@ -575,18 +575,23 @@ class BatchMCTS:
         self.evaluator = evaluator
         self.max_utility = game.max_utility()
         self._random_state = random_state or np.random.RandomState()
+        self._add_noise = True  # overridden per-search by mcts_search()
 
     # ── Public API ──────────────────────────────────────────────────────
 
-    def mcts_search(self, state, root=None):
+    def mcts_search(self, state, root=None, add_noise: bool = True):
         """Run batch MCTS from `state`, returning the root Node.
 
         If *root* is given, simulations are ADDED to the existing tree
         (persistent search).  Otherwise a fresh tree is created.
+
+        *add_noise* controls Dirichlet noise at the root (False = no noise).
         """
         if root is None:
             root = Node(None, state.current_player(), 1)
             root.state = state.clone()
+
+        self._add_noise = add_noise
 
         max_sim = self.config.max_simulations
         batch_size = self.config.batch_size
@@ -616,15 +621,11 @@ class BatchMCTS:
                 states_to_eval = [n.state for n in unique_nodes]
                 values_arr, priors_list = self.evaluator.batch_inference_raw(
                     states_to_eval)
-                wdl = (self.config.value_classes == 3)
                 for node, out, prior in zip(unique_nodes, values_arr,
                                             priors_list):
-                    if wdl:
-                        w, d, l = float(out[0]), float(out[1]), float(out[2])
-                        value = (w - l) * self.max_utility
-                        values_map[node] = (value, prior, d)
-                    else:
-                        values_map[node] = (float(out), prior, 0.0)
+                    w, d, l = float(out[0]), float(out[1]), float(out[2])
+                    value = (w - l) * self.max_utility
+                    values_map[node] = (value, prior, d)
 
             # ── Phase 3: Expand + Backprop ────────────────────────────
             expanded_this_batch = set()
@@ -639,13 +640,10 @@ class BatchMCTS:
                     if leaf_node not in expanded_this_batch:
                         self._expand(leaf_node, leaf_state, prior)
                         expanded_this_batch.add(leaf_node)
-                    if wdl:
-                        lp = leaf_state.current_player()
-                        returns = np.zeros(2)
-                        returns[lp] = value
-                        returns[1 - lp] = -value
-                    else:
-                        returns = np.array([value, -value])
+                    lp = leaf_state.current_player()
+                    returns = np.zeros(2)
+                    returns[lp] = value
+                    returns[1 - lp] = -value
 
                 self._backprop(path_nodes, returns, draw_prob)
 
@@ -665,7 +663,7 @@ class BatchMCTS:
         """Return the best action from the given state."""
         return self.step_with_policy(state)[1]
 
-    def step_with_policy(self, state):
+    def step_with_policy(self, state, add_noise: bool = True):
         """Return (policy, action) for the given state.
 
         Policy is visit-count proportional unless the solver has proven
@@ -675,14 +673,10 @@ class BatchMCTS:
             return [(pyspiel.INVALID_ACTION, 1.0)], pyspiel.INVALID_ACTION
 
         t1 = time.time()
-        root = self.mcts_search(state)
+        root = self.mcts_search(state, add_noise=add_noise)
         best = root.best_child()
 
         if self.config.verbose:
-            seconds = time.time() - t1
-            print("Finished {} sims in {:.3f} secs, {:.1f} sims/s".format(
-                root.explore_count, seconds,
-                root.explore_count / seconds))
             print("Root:")
             print(root.to_str(state))
             print("Children:")
@@ -728,8 +722,9 @@ class BatchMCTS:
             if not node.children:
                 break  # unexpanded leaf — stop here
 
-            # Dirichlet noise at root (AlphaZero) — apply ONCE
-            if node is root and not node.noise_applied and self.config.policy_epsilon:
+            # Dirichlet noise at root (AlphaZero) — apply ONCE, only when enabled
+            if (node is root and not node.noise_applied
+                    and self._add_noise and self.config.policy_epsilon):
                 epsilon = self.config.policy_epsilon
                 alpha = self.config.policy_alpha
                 noise = self._random_state.dirichlet(

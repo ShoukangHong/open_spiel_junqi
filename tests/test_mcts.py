@@ -33,10 +33,10 @@ class ZeroEvaluator:
     def batch_inference_raw(self, states):
         values, priors = [], []
         for s in states:
-            values.append(0.0)
+            values.append([0.0, 1.0, 0.0])  # WDL: neutral
             legal = s.legal_actions()
             priors.append([(a, 1.0 / len(legal)) for a in legal])
-        return np.array(values), priors
+        return np.array(values, dtype=np.float32), priors
 
 UCT_C = 2.0   # higher C emphasizes exploration — better for random-rollout tests
 

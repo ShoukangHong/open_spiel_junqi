@@ -403,7 +403,7 @@ def main():
         output_path = args.output or str(Path(log_path).with_suffix("")) + "_metrics.png"
         plot_metrics(records, smooth=args.smooth, output_path=output_path)
 
-DEFAULT_LOG = r"C:\Users\shouk\othello_train\cloud_wdl\train.log"
+DEFAULT_LOG = r"C:\Users\shouk\othello_train\cloud_wdl_w\train.log"
 DEFAULT_SMOOTH = 5
 DEFAULT_NO_PLOT = False
 

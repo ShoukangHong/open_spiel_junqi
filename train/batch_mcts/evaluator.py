@@ -88,11 +88,14 @@ class BatchRandomRolloutEvaluator(BatchEvaluator):
 
     def batch_inference_raw(self, states):
         full_returns = self.batch_evaluate(states)
-        scalar_values = np.array([
-            float(full_returns[i, state.current_player()])
-            for i, state in enumerate(states)
-        ])
-        return scalar_values, self.batch_prior(states)
+        wdl_values = []
+        for i, state in enumerate(states):
+            v = float(full_returns[i, state.current_player()])
+            w = max(v, 0.0)
+            l = max(-v, 0.0)
+            d = 1.0 - abs(v)
+            wdl_values.append([w, d, l])
+        return np.array(wdl_values, dtype=np.float32), self.batch_prior(states)
 
     def evaluate(self, state):
         return self._eval_one(state)
@@ -105,12 +108,11 @@ class BatchRandomRolloutEvaluator(BatchEvaluator):
 
 class PyTorchEvaluator(BatchEvaluator):
 
-    def __init__(self, game, model, cache_size=2**16, value_classes=1):
+    def __init__(self, game, model, cache_size=2**16):
         self._game = game
         self._model = model
         self._cache = lru_cache.LRUCache(cache_size)
         self._output_size = game.num_distinct_actions()
-        self._value_classes = value_classes
 
     def cache_info(self):
         return self._cache.info()
@@ -134,21 +136,17 @@ class PyTorchEvaluator(BatchEvaluator):
         return value, policy
 
     def scalar_value(self, state) -> float:
-        """Override: always returns p0 (black) perspective."""
+        """Return p0-perspective scalar Q from WDL output."""
         value, _ = self._inference(state)
-        if self._value_classes == 3:
-            v = np.asarray(value, dtype=np.float32).ravel()
-            q = float(v[0] - v[2])
-            if state.current_player() == 1:
-                q = -q
-            return q
-        return float(value)
+        v = np.asarray(value, dtype=np.float32).ravel()
+        q = float(v[0] - v[2])               # w - l from current player view
+        if state.current_player() == 1:
+            q = -q                           # flip to p0 view
+        return q
 
     def evaluate(self, state):
         value, _ = self._inference(state)
-        if self._value_classes == 3:
-            return np.array(value)
-        return np.array([value, -value])
+        return np.array(value)               # [w, d, l]
 
     def prior(self, state):
         if state.is_chance_node():

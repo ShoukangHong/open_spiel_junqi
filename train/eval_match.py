@@ -58,14 +58,12 @@ def _mcts_for(player_cfg):
     if key not in _mcts_bots:
         game = _game_obj()
         model = _model_for(player_cfg)
-        vc = model._model.num_value_classes
-        ev = PyTorchEvaluator(game, model, value_classes=vc)
+        ev = PyTorchEvaluator(game, model)
         _mcts_evaluators[key] = ev
         cfg = MCTSConfig(
             max_simulations=player_cfg.get("mcts_simulations", 128),
             batch_size=player_cfg.get("mcts_batch_size", 4),
             uct_c=player_cfg.get("mcts_uct_c", 1.41),
-            value_classes=vc,
             policy_epsilon=0, verbose=False)
         _mcts_bots[key] = BatchMCTS(
             game, cfg, ev, random_state=np.random.RandomState(42))
@@ -221,8 +219,7 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
             tc = json.load(f)
         model_objs[mid] = _model_for(pcfg)
         server.register_model(mid, model_objs[mid]._model.state_dict(),
-                              tc.get("nn_width", 32), tc.get("nn_depth", 6),
-                              tc.get("value_classes", 1))
+                              tc.get("nn_width", 32), tc.get("nn_depth", 6))
 
     # Register all actor queues BEFORE start (fork/spawn copies _result_qs)
     actor_rqs = [server.register_actor(i) for i in range(num_actors)]
@@ -364,7 +361,6 @@ def _act_parallel(player_cfg, state, move_num, temperature, temp_drop,
                 max_simulations=player_cfg.get("mcts_simulations", 128),
                 batch_size=player_cfg.get("mcts_batch_size", 4),
                 uct_c=player_cfg.get("mcts_uct_c", 1.41),
-                value_classes=tc.get("value_classes", 1),
                 policy_epsilon=0, verbose=False)
             _act_parallel._mcts_cache[key] = BatchMCTS(
                 _game_obj(), cfg, shared_eval,
@@ -413,22 +409,22 @@ def main():
               f"(top occurs {top_count}/{len(prefs)} = {pct:.0f}%)")
 
 DEFAULT_NUM_GAMES = 100
-DEFAULT_TEMPERATURE = 0.1
+DEFAULT_TEMPERATURE = 0.125
 DEFAULT_TEMP_DROP = 7
 
 PLAYER = {
     0: {"strategy": "mcts",
-        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl",
-        "checkpoint_step": 310,
-        "mcts_simulations": 320, "mcts_batch_size": 20, "mcts_uct_c": 1.41},
+        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_w",
+        "checkpoint_step": 250,
+        "mcts_simulations": 320, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
     1: {"strategy": "mcts",
-        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl",
-        "checkpoint_step": 270,
-        "mcts_simulations": 320, "mcts_batch_size": 20, "mcts_uct_c": 1.41},
-    # 1: {"strategy": "mcts",
+        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_argmax", # argmax 240 us benchmark
+        "checkpoint_step": 240,
+        "mcts_simulations": 320, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
+    # 1: {"strategy": "model",
     #     "checkpoint_dir": r"C:\Users\shouk\othello_train_cloud",
     #     "checkpoint_step": 180,
-    #     "mcts_simulations": 160, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+    #     "mcts_simulations": 320, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
 }
 
 if __name__ == "__main__":

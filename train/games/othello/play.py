@@ -48,7 +48,7 @@ def play_game(game, mcts, config, rng, logger=None,
             state.apply_action(action)
             continue
 
-        root = mcts.mcts_search(state)
+        root = mcts.mcts_search(state, add_noise=(move_num >= config.temperature_drop))
 
         # Early termination: if MCTS is ≥99% sure of a win, 90% chance to prune
         if (config.prune_enabled and not pruned["used"]
@@ -92,13 +92,16 @@ def play_game(game, mcts, config, rng, logger=None,
                 policy[a] = 1.0
             policy /= policy.sum()
 
-        # Store raw visit-proportional policy
+        # Store raw visit-proportional policy + MCTS Q + draw rate
         obs = np.asarray(state.observation_tensor(), dtype=np.float32)
         mask = np.asarray(state.legal_actions_mask(), dtype=bool)
-        states_info.append((obs, mask, policy, cur_player, tag))
+        states_info.append((obs, mask, policy, cur_player, tag,
+                            root.q_value, root.draw_rate))
 
         # Action selection with temperature
-        after_drop = move_num >= config.temperature_drop
+        # Forked (rare) games: always use post-drop τ for clean evaluation
+        after_drop = (init_state is not None
+                      or move_num >= config.temperature_drop)
         tau_sel = config.temperature if after_drop else 1.0
         if tau_sel > 0 and tau_sel != 1.0:
             sel_probs = policy.astype(np.float64) ** (1.0 / tau_sel)

@@ -53,8 +53,7 @@ class _WdlEvaluator:
 def test_wdl_mcts_returns_root():
     """Run a small search with WDL evaluator — just smoke test."""
     game = pyspiel.load_game("tic_tac_toe")
-    config = MCTSConfig(max_simulations=32, batch_size=4,
-                        value_classes=3)
+    config = MCTSConfig(max_simulations=32, batch_size=4)
     evaluator = _WdlEvaluator()
     mcts = BatchMCTS(game, config, evaluator,
                      random_state=np.random.RandomState(42))
@@ -67,7 +66,7 @@ def test_wdl_root_draw_rate():
     """Root draw_rate should reflect the evaluator's draw probability."""
     game = pyspiel.load_game("tic_tac_toe")
     config = MCTSConfig(max_simulations=64, batch_size=8,
-                        value_classes=3)
+                        )
     # Pure draw evaluator
     class PureDrawEval:
         def batch_inference_raw(self, states):
@@ -104,71 +103,6 @@ def _state_scalar(state):
     return float(rng.uniform(-0.9, 0.9))
 
 
-def test_wdl_vs_scalar_consistent():
-    """WDL mode with d=0 should match scalar mode behavior."""
-    game = pyspiel.load_game("tic_tac_toe")
-    state = game.new_initial_state()
-    val_rng = np.random.RandomState(42)
-
-    class WinLoseEval:
-        def batch_inference_raw(self, states):
-            values = np.array(
-                [_scalar_to_wdl(_state_scalar(s), s.current_player(),
-                                draw_rate=0.0)
-                 for s in states], dtype=np.float32)
-            priors = [[(a, 1.0 / len(s.legal_actions()))
-                       for a in s.legal_actions()] for s in states]
-            return values, priors
-
-    class ScalarEval:
-        def batch_inference_raw(self, states):
-            values = np.array([_state_scalar(s) for s in states],
-                              dtype=np.float32)
-            priors = [[(a, 1.0 / len(s.legal_actions()))
-                       for a in s.legal_actions()] for s in states]
-            for s in states:
-                legal = s.legal_actions()
-                priors.append([(a, 1.0 / len(legal)) for a in legal])
-            return values, priors
-
-    # Run both with same seed — WDL with perspective fix should match scalar
-    cfg_wdl = MCTSConfig(max_simulations=64, batch_size=8, value_classes=3)
-    cfg_scalar = MCTSConfig(max_simulations=64, batch_size=8, value_classes=1)
-
-    m1 = BatchMCTS(game, cfg_wdl, WinLoseEval(),
-                   random_state=np.random.RandomState(42))
-    m2 = BatchMCTS(game, cfg_scalar, ScalarEval(),
-                   random_state=np.random.RandomState(42))
-
-    r1 = m1.mcts_search(state.clone())
-    r2 = m2.mcts_search(state.clone())
-
-    assert r1.best_child().action == r2.best_child().action
-    assert abs(r1.q_value - r2.q_value) < 0.1
-    assert r1.draw_rate < 0.05
-
-
-def test_wdl_backward_compat():
-    """value_classes=1 (default) should produce draw_rate=0."""
-    game = pyspiel.load_game("tic_tac_toe")
-    config = MCTSConfig(max_simulations=16, batch_size=4,
-                        value_classes=1)
-
-    class ScalarEval:
-        def batch_inference_raw(self, states):
-            values = np.array([0.5] * len(states), dtype=np.float32)
-            priors = []
-            for s in states:
-                legal = s.legal_actions()
-                priors.append([(a, 1.0 / len(legal)) for a in legal])
-            return values, priors
-
-    mcts = BatchMCTS(game, config, ScalarEval(),
-                     random_state=np.random.RandomState(42))
-    root = mcts.mcts_search(game.new_initial_state())
-    assert root.draw_rate == 0.0
-
-
 # ── Terminal draw detection ─────────────────────────────────────────────────
 
 def test_terminal_draw_sets_draw_prob():
@@ -185,7 +119,7 @@ def test_terminal_draw_sets_draw_prob():
     if not state.is_terminal():
         # State is close to terminal
         config = MCTSConfig(max_simulations=32, batch_size=8,
-                            value_classes=3)
+                            )
         # Run one search — this will hit terminal draws
         pass  # can't guarantee terminal, skip assertion
     # If terminal, check
@@ -202,7 +136,6 @@ def main():
         test_node_draw_rate_default, test_node_draw_rate_accumulates,
         test_node_draw_does_not_affect_q,
         test_wdl_mcts_returns_root, test_wdl_root_draw_rate,
-        test_wdl_vs_scalar_consistent, test_wdl_backward_compat,
         test_draw_backprop_through_tree, test_draw_backprop_perspective,
         test_solved_draw_sets_draw_rate,
         test_wdl_mcts_q_from_wdl, test_wdl_mcts_q_perspective_consistent,
@@ -247,8 +180,7 @@ def test_draw_backprop_through_tree():
                 priors.append([(a, 1.0 / len(legal)) for a in legal])
             return values, priors
 
-    config = MCTSConfig(max_simulations=64, batch_size=8, value_classes=3,
-                        uct_c=1.41)
+    config = MCTSConfig(max_simulations=64, batch_size=8,                         uct_c=1.41)
     mcts = BatchMCTS(game, config, FixedWdlEval(),
                      random_state=np.random.RandomState(123))
     root = mcts.mcts_search(state.clone())
@@ -302,7 +234,7 @@ def test_draw_backprop_perspective():
                 priors.append([(a, 1.0 / len(legal)) for a in legal])
             return values, priors
 
-    config = MCTSConfig(max_simulations=32, batch_size=4, value_classes=3)
+    config = MCTSConfig(max_simulations=32, batch_size=4)
     mcts = BatchMCTS(game, config, PureDrawEval(),
                      random_state=np.random.RandomState(42))
     root = mcts.mcts_search(s)
@@ -339,7 +271,7 @@ def test_solved_draw_sets_draw_rate():
     # MCTS solver should prove this
 
     config = MCTSConfig(max_simulations=2000, batch_size=32,
-                        value_classes=3, uct_c=2.0,
+                        uct_c=2.0,
                         solve=True)
     mcts = BatchMCTS(game, config, _WdlEvaluator(),
                      random_state=np.random.RandomState(42))
@@ -372,7 +304,7 @@ def test_wdl_mcts_q_from_wdl():
                 priors.append([(a, 1.0 / len(legal)) for a in legal])
             return values, priors
 
-    config = MCTSConfig(max_simulations=64, batch_size=8, value_classes=3)
+    config = MCTSConfig(max_simulations=64, batch_size=8)
     mcts = BatchMCTS(game, config, FixedWdlEval(),
                      random_state=np.random.RandomState(42))
     root = mcts.mcts_search(state.clone())
@@ -406,7 +338,7 @@ def test_wdl_mcts_q_perspective_consistent():
     # Test at different sim counts — Q should converge
     for sims in [16, 64]:
         config = MCTSConfig(max_simulations=sims, batch_size=4,
-                            value_classes=3)
+                            )
         mcts = BatchMCTS(game, config, WinBiasEval(),
                          random_state=np.random.RandomState(42))
         root = mcts.mcts_search(state.clone())
@@ -431,8 +363,7 @@ def test_wdl_draw_rate_at_depth():
                 priors.append([(a, 1.0 / len(legal)) for a in legal])
             return values, priors
 
-    config = MCTSConfig(max_simulations=64, batch_size=8, value_classes=3,
-                        uct_c=1.41)
+    config = MCTSConfig(max_simulations=64, batch_size=8,                         uct_c=1.41)
     mcts = BatchMCTS(game, config, DrawEval(),
                      random_state=np.random.RandomState(123))
     root = mcts.mcts_search(state.clone())
@@ -469,7 +400,7 @@ def test_wdl_mcts_with_terminal_leaf():
             return values, priors
 
     config = MCTSConfig(max_simulations=128, batch_size=16,
-                        value_classes=3, uct_c=2.0)
+                        uct_c=2.0)
     mcts = BatchMCTS(game, config, NeutralEval(),
                      random_state=np.random.RandomState(42))
     root = mcts.mcts_search(state.clone())
@@ -515,7 +446,7 @@ def test_wdl_perspective_flip():
             return values, priors
 
     config = MCTSConfig(max_simulations=128, batch_size=16,
-                        value_classes=3, uct_c=2.0)
+                        uct_c=2.0)
     mcts = BatchMCTS(game, config, FixedWdlEval(),
                      random_state=np.random.RandomState(42))
     root = mcts.mcts_search(state.clone())
@@ -542,7 +473,7 @@ def test_wdl_perspective_draw_symmetric():
                 priors.append([(a, 1.0 / len(legal)) for a in legal])
             return values, priors
 
-    config = MCTSConfig(max_simulations=64, batch_size=8, value_classes=3)
+    config = MCTSConfig(max_simulations=64, batch_size=8)
     m0 = BatchMCTS(game, config, DrawEval(),
                    random_state=np.random.RandomState(42))
     m1 = BatchMCTS(game, config, DrawEval(),

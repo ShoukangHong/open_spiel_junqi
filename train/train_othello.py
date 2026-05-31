@@ -69,13 +69,30 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 
-def _make_value(ret, value_classes):
-    if value_classes == 1:
-        return float(ret)
-    r = float(ret)
-    if r > 0.1:      return np.array([1.0, 0.0, 0.0], dtype=np.float32)
-    elif r < -0.1:   return np.array([0.0, 0.0, 1.0], dtype=np.float32)
-    else:            return np.array([0.0, 1.0, 0.0], dtype=np.float32)
+def _mcts_wdl(q_value, draw_rate):
+    """Reconstruct WDL from MCTS Q and draw rate.  Returns [w, d, l]."""
+    w = max(( q_value + 1.0 - draw_rate) / 2.0, 0.0)
+    l = max((-q_value + 1.0 - draw_rate) / 2.0, 0.0)
+    s = w + draw_rate + l
+    if s > 0:
+        return np.array([w / s, draw_rate / s, l / s], dtype=np.float32)
+    return np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+
+def _outcome_wdl(ret_scalar):
+    """Game outcome scalar → one-hot WDL."""
+    if ret_scalar > 0.1:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    if ret_scalar < -0.1:
+        return np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    return np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
+
+def _mixed_target(game_ret, q_value, draw_rate, alpha):
+    """Mixed WDL: alpha * game_outcome + (1-alpha) * MCTS WDL."""
+    mcts = _mcts_wdl(q_value, draw_rate)
+    game = _outcome_wdl(game_ret)
+    return alpha * game + (1.0 - alpha) * mcts
 
 
 from train.core.model_builder import build_othello_model as build_model
@@ -88,8 +105,7 @@ def actor_process(cfg_dict, incoming_q, result_q, state_queue, actor_id=0):
     mcts_cfg = MCTSConfig(
         max_simulations=cfg.max_simulations, batch_size=cfg.mcts_batch_size,
         uct_c=cfg.uct_c, policy_epsilon=cfg.policy_epsilon,
-        policy_alpha=cfg.policy_alpha,
-        value_classes=cfg.value_classes, verbose=False)
+        policy_alpha=cfg.policy_alpha, verbose=False)
     mcts = BatchMCTS(game, mcts_cfg, evaluator,
                      random_state=np.random.RandomState())
     rng = np.random.RandomState()
@@ -107,8 +123,9 @@ def actor_process(cfg_dict, incoming_q, result_q, state_queue, actor_id=0):
             pending.append((rs, False, "rare"))
         if tag_override:
             for i in range(len(states_info)):
-                obs, mask, policy, cp, _tag = states_info[i]
-                states_info[i] = (obs, mask, policy, cp, tag_override)
+                item = states_info[i]
+                states_info[i] = (item[0], item[1], item[2], item[3],
+                                  tag_override, *item[5:])
         try:
             state_queue.put((states_info, returns, wstats), timeout=1)
         except queue.Full:
@@ -149,7 +166,7 @@ def main():
         # Start server AFTER all actors are registered
         inference_server.register_model(
             "main", model._model.state_dict(),
-            cfg.nn_width, cfg.nn_depth, cfg.value_classes)
+            cfg.nn_width, cfg.nn_depth)
         inference_server.start(cfg.game, cfg.inference_batch_size)
         for i in range(cfg.num_actors):
             result_q = inference_server.result_queue(i)
@@ -178,8 +195,7 @@ def main():
 
             if cfg.num_actors == 1:
                 # Single-process path
-                evaluator = PyTorchEvaluator(game, model,
-                                             value_classes=cfg.value_classes)
+                evaluator = PyTorchEvaluator(game, model)
                 mcts = BatchMCTS(game, mcts_config, evaluator,
                                  random_state=np.random.RandomState(
                                      cfg.seed + step * 1000))
@@ -203,12 +219,17 @@ def main():
                         pending.append((rs, False, "rare"))
 
                     game_outcome_p0 = returns[0]
-                    for item in states_info:
+                    game_length = len(states_info)
+                    for i, item in enumerate(states_info):
                         obs, mask, policy, cur_player = item[:4]
                         tag = item[4] if len(item) > 4 else ""
+                        q_value = item[5] if len(item) > 5 else 0.0
+                        draw_rate = item[6] if len(item) > 6 else 0.0
                         if tag_override:
                             tag = tag_override
-                        val = _make_value(returns[cur_player], cfg.value_classes)
+                        alpha = i / max(game_length - 1, 1)
+                        val = _mixed_target(returns[cur_player], q_value,
+                                            draw_rate, alpha)
                         buffer.append(obs, mask, policy, val, tag)
 
                     if game_outcome_p0 > 0:
@@ -233,10 +254,15 @@ def main():
                         accum_wstats(cfg, wstats)
                         game_outcome_p0 = returns[0]
 
-                        for item in states_info:
+                        game_length = len(states_info)
+                        for i, item in enumerate(states_info):
                             obs, mask, policy, cur_player = item[:4]
                             tag = item[4] if len(item) > 4 else ""
-                            val = _make_value(returns[cur_player], cfg.value_classes)
+                            q_value = item[5] if len(item) > 5 else 0.0
+                            draw_rate = item[6] if len(item) > 6 else 0.0
+                            alpha = i / max(game_length - 1, 1)
+                            val = _mixed_target(returns[cur_player], q_value,
+                                                draw_rate, alpha)
                             buffer.append(obs, mask, policy, val, tag)
 
                         if game_outcome_p0 > 0:
@@ -264,7 +290,7 @@ def main():
                 if sym is not None:
                     obs, mask, policy, value = sym.augment_batch(
                         batch.observation, batch.legals_mask, batch.policy,
-                        batch.value, cfg.value_classes)
+                        batch.value)
                     batch = TrainInput(observation=obs, legals_mask=mask,
                                        policy=policy, value=value)
                 loss = model.update(batch)
@@ -335,11 +361,20 @@ def main():
         _log(f"\n[train] Done. Final checkpoint: {cfg.max_steps}")
 
     finally:
-        inference_server.terminate()
+        _log("[train] Shutting down ...")
+        # 1. Kill actors first (before server, to avoid deadlock on GPU queue)
         for p, q in actors:
             if p.is_alive():
                 p.terminate()
-                p.join(timeout=5)
+        for p, q in actors:
+            p.join(timeout=5)
+        # 2. Kill server
+        inference_server.terminate()
+        # 3. Belt-and-suspenders: any leftover children
+        for child in mp.active_children():
+            child.terminate()
+            child.join(timeout=3)
+        _log("[train] Shutdown complete.")
 
 if __name__ == "__main__":
     main()

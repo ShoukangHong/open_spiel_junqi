@@ -37,20 +37,17 @@ class OthelloSymmetry:
 
     # ── Public API ──────────────────────────────────────────────────────────
 
-    def augment_batch(self, obs, mask, policy, value=None, value_classes=1):
+    def augment_batch(self, obs, mask, policy, value=None):
         """Apply random symmetries to a batch.
 
         Args:
             obs:    (B, 256) flat or (B, 4, 8, 8) float32
             mask:   (B, 65) bool
             policy: (B, 65) float32
-            value:  (B,) or (B, 3) float32, optional
-            value_classes: 1 for scalar, 3 for WDL
+            value:  (B, 3) float32 [w,d,l], optional
 
-        Returns (obs, mask, policy, value_or_none):
-            obs, mask, policy — same shapes as inputs.
-            value — augmented (negated for scalar when color flipped).
-            If value is None, returns None.
+        Returns (obs, mask, policy, value_or_none).
+        WDL is unchanged by color flip (turn indicator in obs compensates).
         """
         B = obs.shape[0]
         flat = obs.ndim == 2
@@ -77,12 +74,8 @@ class OthelloSymmetry:
             new_obs[i] = o.reshape(-1) if flat else o
 
             # --- mask & policy ---
-            inv = self._inv[k % 8]              # spatial map (color doesn't change)
+            inv = self._inv[k % 8]
             new_mask[i] = mask[i][inv]
             new_policy[i] = policy[i][inv]
-
-            # --- value ---
-            if value is not None and swapped and value_classes == 1:
-                new_value[i] *= -1.0
 
         return new_obs, new_mask, new_policy, new_value

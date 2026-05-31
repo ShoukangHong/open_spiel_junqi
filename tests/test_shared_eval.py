@@ -10,28 +10,19 @@ from train.batch_mcts.shared_evaluator import (
 
 
 class _MockModel:
-    """Mock model: output = f(model_id, step, state_hash).
+    """Mock model returning WDL values from deterministic hash."""
 
-    batch_inference returns values and policies matching the production
-    format (scalar or WDL depending on value_classes).
-    """
-
-    def __init__(self, model_id: str, value_classes: int = 1):
+    def __init__(self, model_id: str):
         self.mid = model_id
         self._step = 0
-        self._vc = value_classes
 
     def step_up(self):
         self._step += 1
 
     def batch_inference(self, obs, mask):
         n = obs.shape[0]
-        if self._vc == 1:
-            values = np.array([self._scalar(obs[i]) for i in range(n)],
-                              dtype=np.float32)
-        else:
-            values = np.array([self._wdl(obs[i]) for i in range(n)],
-                              dtype=np.float32)
+        values = np.array([self._wdl(obs[i]) for i in range(n)],
+                          dtype=np.float32)
         policies = np.zeros((n, 65), dtype=np.float32)
         for i in range(n):
             legals = np.where(mask[i])[0]
@@ -53,9 +44,14 @@ class _MockModel:
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
 
-def _expected_scalar(model_id, step, obs):
+def _expected_wdl(model_id, step, obs):
+    """Recompute the expected WDL for a given state."""
     h = abs(hash((model_id, step, obs.tobytes()))) % 1000
-    return float(h) / 1000.0
+    v = float(h) / 1000.0
+    q = (v - 0.5) * 2
+    d = 1.0 - abs(q)
+    w = np.array([max(q, 0), d, max(-q, 0)], dtype=np.float32)
+    return w / w.sum()
 
 
 def _make_state(moves=()):
@@ -66,15 +62,12 @@ def _make_state(moves=()):
     return s
 
 
-def _start_server(server, mock_models, value_classes=1):
+def _start_server(server, mock_models):
     """Start server with mock models using the real _run_server."""
     import threading
     specs = {}
     for mid, mm in mock_models.items():
-        specs[mid] = {
-            "model": mm,
-            "value_classes": value_classes,
-        }
+        specs[mid] = {"model": mm}
     server._thread = threading.Thread(
         target=_run_server,
         args=(server.incoming_queue, server._result_qs, specs,
@@ -109,7 +102,8 @@ def test_single_inference():
         v, _ = ev._inference(s)
 
         obs = np.asarray(s.observation_tensor(), dtype=np.float32)
-        assert abs(float(v) - _expected_scalar("main", 0, obs)) < 0.01
+        exp = _expected_wdl("main", 0, obs)
+        assert np.allclose(np.asarray(v), exp, atol=0.01)
     finally:
         _stop_server(server)
 
@@ -130,7 +124,8 @@ def test_batch_order():
         assert len(values) == 3
         for i, s in enumerate(states):
             obs = np.asarray(s.observation_tensor(), dtype=np.float32)
-            assert abs(float(values[i]) - _expected_scalar("main", 0, obs)) < 0.01
+            exp = _expected_wdl("main", 0, obs)
+            assert np.allclose(values[i], exp, atol=0.01)
     finally:
         _stop_server(server)
 
@@ -153,9 +148,9 @@ def test_multi_model_routing():
         v0, _ = ev0._inference(s)
         v1, _ = ev1._inference(s)
 
-        assert abs(float(v0) - _expected_scalar("m0", 0, obs)) < 0.01
-        assert abs(float(v1) - _expected_scalar("m1", 0, obs)) < 0.01
-        assert abs(float(v0) - float(v1)) > 0.01
+        assert np.allclose(np.asarray(v0), _expected_wdl("m0", 0, obs), atol=0.01)
+        assert np.allclose(np.asarray(v1), _expected_wdl("m1", 0, obs), atol=0.01)
+        assert not np.allclose(np.asarray(v0), np.asarray(v1), atol=0.01)
     finally:
         _stop_server(server)
 
@@ -174,25 +169,25 @@ def test_weight_update_changes_output():
         obs = np.asarray(s.observation_tensor(), dtype=np.float32)
 
         v0, _ = ev._inference(s)
-        assert abs(float(v0) - _expected_scalar("main", 0, obs)) < 0.01
+        assert np.allclose(np.asarray(v0), _expected_wdl("main", 0, obs), atol=0.01)
 
         mm.step_up()
         server._incoming.put(("main", {}, 128))
         time.sleep(0.1)
 
         v1, _ = ev._inference(s)
-        assert abs(float(v1) - _expected_scalar("main", 1, obs)) < 0.01
+        assert np.allclose(np.asarray(v1), _expected_wdl("main", 1, obs), atol=0.01)
     finally:
         _stop_server(server)
 
 
 def test_wdl_mode():
     game = pyspiel.load_game("tic_tac_toe")
-    mm = _MockModel("main_wdl", value_classes=3)
+    mm = _MockModel("main_wdl", )
     server = InferenceServer()
     try:
         rq = server.register_actor(0)
-        _start_server(server, {"main_wdl": mm}, value_classes=3)
+        _start_server(server, {"main_wdl": mm}, )
 
         ev = SharedEvaluator(game, server.incoming_queue, rq, actor_id=0,
                              model_id="main_wdl")
@@ -220,7 +215,7 @@ def test_wdl_scalar_value_perspective():
     server = InferenceServer()
     try:
         rq = server.register_actor(0)
-        specs = {"wdl": {"model": _FixedWDLModel(), "value_classes": 3}}
+        specs = {"wdl": {"model": _FixedWDLModel()}}
         server._thread = threading.Thread(
             target=_run_server,
             args=(server.incoming_queue, server._result_qs, specs,
@@ -272,10 +267,10 @@ def test_same_actor_different_models():
 
         for _ in range(3):
             v0, _ = ev0._inference(s)
-            assert abs(float(v0) - _expected_scalar("m0", 0, obs)) < 0.01
+            assert np.allclose(np.asarray(v0), _expected_wdl("m0", 0, obs), atol=0.01)
             v1, _ = ev1._inference(s)
-            assert abs(float(v1) - _expected_scalar("m1", 0, obs)) < 0.01
-            assert abs(float(v0) - float(v1)) > 0.01
+            assert np.allclose(np.asarray(v1), _expected_wdl("m1", 0, obs), atol=0.01)
+            assert not np.allclose(np.asarray(v0), np.asarray(v1), atol=0.01)
     finally:
         _stop_server(server)
 
@@ -306,25 +301,17 @@ def test_multi_actor_multi_model():
         v10, _ = ev1_m0._inference(s)
         v11, _ = ev1_m1._inference(s)
 
-        assert abs(float(v00) - _expected_scalar("m0", 0, obs)) < 0.01
-        assert abs(float(v10) - _expected_scalar("m0", 0, obs)) < 0.01
-        assert abs(float(v01) - _expected_scalar("m1", 0, obs)) < 0.01
-        assert abs(float(v11) - _expected_scalar("m1", 0, obs)) < 0.01
-        assert abs(float(v00) - float(v01)) > 0.01
+        assert np.allclose(np.asarray(v00), _expected_wdl("m0", 0, obs), atol=0.01)
+        assert np.allclose(np.asarray(v10), _expected_wdl("m0", 0, obs), atol=0.01)
+        assert np.allclose(np.asarray(v01), _expected_wdl("m1", 0, obs), atol=0.01)
+        assert np.allclose(np.asarray(v11), _expected_wdl("m1", 0, obs), atol=0.01)
+        assert not np.allclose(np.asarray(v00), np.asarray(v01), atol=0.01)
     finally:
         _stop_server(server)
 
 
-def _expected_wdl(model_id, step, obs):
-    v = _expected_scalar(model_id, step, obs)
-    q = (v - 0.5) * 2
-    d = 1.0 - abs(q)
-    w = np.array([max(q, 0), d, max(-q, 0)], dtype=np.float32)
-    return w / w.sum()
-
-
 def _stress_worker(actor_id, ev0, ev1, game, states, errors, lock,
-                   mid0="m0", mid1="m1", wdl=False):
+                   mid0="m0", mid1="m1"):
     rng = np.random.RandomState(actor_id * 1000)
     for _ in range(30):
         mid = rng.randint(0, 2)
@@ -335,26 +322,19 @@ def _stress_worker(actor_id, ev0, ev1, game, states, errors, lock,
 
         value, policy = ev._inference(s)
 
-        if wdl:
-            if len(value) != 3:
-                with lock:
-                    errors.append(f"[a{actor_id} m{mid}] WDL len={len(value)}")
-                continue
-            if abs(sum(value) - 1.0) >= 0.01:
-                with lock:
-                    errors.append(f"[a{actor_id} m{mid}] WDL sum={sum(value):.3f}")
-                continue
-            expected_val = _expected_wdl(model_id, 0, obs)
-            if not np.allclose(value, expected_val, atol=0.05):
-                with lock:
-                    errors.append(f"[a{actor_id} m{mid}] WDL: "
-                                  f"{list(value)} != {list(expected_val)}")
-        else:
-            expected_val = _expected_scalar(model_id, 0, obs)
-            if abs(float(value) - expected_val) >= 0.01:
-                with lock:
-                    errors.append(f"[a{actor_id} m{mid}] value: "
-                                  f"{float(value):.3f} != {expected_val:.3f}")
+        if len(value) != 3:
+            with lock:
+                errors.append(f"[a{actor_id} m{mid}] WDL len={len(value)}")
+            continue
+        if abs(sum(value) - 1.0) >= 0.01:
+            with lock:
+                errors.append(f"[a{actor_id} m{mid}] WDL sum={sum(value):.3f}")
+            continue
+        expected_val = _expected_wdl(model_id, 0, obs)
+        if not np.allclose(value, expected_val, atol=0.05):
+            with lock:
+                errors.append(f"[a{actor_id} m{mid}] WDL: "
+                              f"{list(value)} != {list(expected_val)}")
 
         legals = s.legal_actions()
         mask = np.zeros(game.num_distinct_actions(), dtype=bool)
@@ -416,13 +396,13 @@ def test_stress_concurrent_wdl():
     """Concurrent stress: 4 actors × 2 models, WDL mode."""
     import threading
     game = pyspiel.load_game("tic_tac_toe")
-    m0 = _MockModel("m0_wdl", value_classes=3)
-    m1 = _MockModel("m1_wdl", value_classes=3)
+    m0 = _MockModel("m0_wdl", )
+    m1 = _MockModel("m1_wdl", )
     server = InferenceServer()
     try:
         num_actors = 4
         rqs = [server.register_actor(i) for i in range(num_actors)]
-        _start_server(server, {"m0_wdl": m0, "m1_wdl": m1}, value_classes=3)
+        _start_server(server, {"m0_wdl": m0, "m1_wdl": m1}, )
 
         states = [_make_state([]), _make_state([0]), _make_state([0, 4]),
                   _make_state([0, 4, 1]), _make_state([0, 4, 1, 3])]
@@ -435,7 +415,7 @@ def test_stress_concurrent_wdl():
             ev1 = SharedEvaluator(game, server.incoming_queue, rqs[actor_id],
                                   actor_id=actor_id, model_id="m1_wdl")
             _stress_worker(actor_id, ev0, ev1, game, states, errors, lock,
-                           mid0="m0_wdl", mid1="m1_wdl", wdl=True)
+                           mid0="m0_wdl", mid1="m1_wdl")
 
         threads = [threading.Thread(target=worker, args=(i,))
                    for i in range(num_actors)]

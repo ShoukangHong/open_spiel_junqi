@@ -334,41 +334,7 @@ def test_color_flip_channels():
     assert np.allclose(o0[0], o8[0]), "empty channel should be unchanged"
 
 
-# ── Test L: scalar value negated on color flip (deterministic) ──────────────
-
-def test_color_flip_scalar_value():
-    """scalar value: color_flipped(k>=8) → negated, spatial-only(k<8) → unchanged."""
-    obs = np.zeros((1, 4, 8, 8), dtype=np.float32)
-    mask = np.ones((1, 65), dtype=bool)
-    policy = np.ones((1, 65), dtype=np.float32) / 65
-    val = np.array([0.7], dtype=np.float32)
-
-    # Patch random to cycle through all 16 transforms
-    real_randint = np.random.randint
-    _k = [0]
-
-    def _fixed_randint(low, high, size):
-        if low == 0 and high == 16:
-            n = size if isinstance(size, int) else size[0]
-            k = _k[0]; _k[0] += 1
-            return np.full(n, k, dtype=int)
-        return real_randint(low, high, size)
-
-    np.random.randint = _fixed_randint
-    try:
-        for k in range(16):
-            ao, am, ap, av = sym.augment_batch(obs, mask, policy, val, value_classes=1)
-            if k >= 8:
-                assert np.isclose(av[0], -0.7, atol=1e-6), \
-                    f"k={k}: scalar value should be negated, got {av[0]}"
-            else:
-                assert np.isclose(av[0], 0.7, atol=1e-6), \
-                    f"k={k}: scalar value should be unchanged, got {av[0]}"
-    finally:
-        np.random.randint = real_randint
-
-
-# ── Test M: WDL value unchanged on color flip (deterministic) ───────────────
+# ── Test L: WDL value unchanged on color flip ──────────────────────────────
 
 def test_color_flip_wdl_value():
     """WDL value: unchanged regardless of color flip."""
@@ -387,7 +353,7 @@ def test_color_flip_wdl_value():
     np.random.randint = _fixed_randint
     try:
         for k in range(16):
-            ao, am, ap, av = sym.augment_batch(obs, mask, policy, val, value_classes=3)
+            ao, am, ap, av = sym.augment_batch(obs, mask, policy, val)
             assert av is not None
             assert np.allclose(av[0], [0.8, 0.1, 0.1], atol=1e-6), \
                 f"k={k}: WDL value should be unchanged, got {av[0]}"
@@ -413,7 +379,6 @@ def test_print_all_transforms():
     # Policy where value = action_index / 100, so we can see the mapping
     policy = np.arange(65, dtype=np.float32) / 100.0
     policy[64] = 0.0  # pass action is 0
-    val_scalar = np.float32(0.7)
     val_wdl = np.array([0.8, 0.1, 0.1], dtype=np.float32)
 
     TRANSFORM_NAMES = [
@@ -428,7 +393,6 @@ def test_print_all_transforms():
         name = f"{TRANSFORM_NAMES[spatial]}{swapped}"
         o = _apply(k, obs)
         turn = "B" if o[3, 0, 0] > 0.5 else "W"
-        val = -val_scalar if (k >= 8) else val_scalar
         wdl = val_wdl
 
         pol = policy[sym._inv[k % 8]]
@@ -437,7 +401,7 @@ def test_print_all_transforms():
         top5 = ", ".join(f"{cols[t%8]}{t//8+1}({pol[t]:.2f})"
                          for t in top5_idx if pol[t] > 0.01)
 
-        print(f"\nk={k:2d}  {name:<22s}  turn={turn}  val_scalar={val:+.1f}  val_wdl={list(wdl)}")
+        print(f"\nk={k:2d}  {name:<22s}  turn={turn}  val_wdl={list(wdl)}")
         print(f"  policy top5: [{top5}]")
         print("    a b c d e f g h")
         for r in range(8):
@@ -461,7 +425,7 @@ def main():
         test_augment_batch_shapes, test_policy_map,
         test_transforms_distinct, test_inverse_roundtrip,
         test_mask_preserves_legal_count, test_augment_batch_deterministic,
-        test_color_flip_channels, test_color_flip_scalar_value,
+        test_color_flip_channels,
         test_color_flip_wdl_value, test_color_flip_inv_consistent,
         test_print_all_transforms,
     ]
