@@ -262,10 +262,11 @@ def main():
             for _ in range(n_updates):
                 batch = buffer.sample(cfg.train_batch_size)
                 if sym is not None:
-                    obs, mask, policy = sym.augment_batch(
-                        batch.observation, batch.legals_mask, batch.policy)
+                    obs, mask, policy, value = sym.augment_batch(
+                        batch.observation, batch.legals_mask, batch.policy,
+                        batch.value, cfg.value_classes)
                     batch = TrainInput(observation=obs, legals_mask=mask,
-                                       policy=policy, value=batch.value)
+                                       policy=policy, value=value)
                 loss = model.update(batch)
                 losses_list.append(loss)
                 # Policy entropy (nats) — per-sample, then averaged

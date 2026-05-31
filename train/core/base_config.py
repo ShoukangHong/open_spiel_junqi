@@ -39,6 +39,11 @@ class BaseTrainConfig:
     eval_reference_count: int = 3
     eval_min_interval: int = 1800
 
+    # Early termination (pruning)
+    prune_enabled: bool = True
+    prune_threshold: float = 0.99    # MCTS Q exceeding this triggers prune
+    prune_prob: float = 0.9          # probability of actually pruning
+
     # Misc
     path: str = "train_output"
     seed: int = 42

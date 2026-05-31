@@ -28,9 +28,9 @@
 
   "weak_side_prob": 0.333,
   "weak_move_prob": 0.333,
-  "rare_case_threshold": 0.4,
+  "rare_case_threshold": 0.2,
   "weak_move_threshold": 0.2,
-  "weak_max_per_game": 3,
+  "weak_max_per_game": 1,
   "weak_move_max_step": 64,
 
   "evaluation_window": 25,

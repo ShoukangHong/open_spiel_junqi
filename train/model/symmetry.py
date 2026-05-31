@@ -8,14 +8,17 @@ import numpy as np
 
 
 class OthelloSymmetry:
-    """D4 group: 4 rotations × mirror = 8 transforms for the 8×8 board."""
+    """D4 group × color swap = 16 transforms for the 8×8 board.
 
-    num_transforms = 8
+    8 spatial transforms (4 rotations × mirror), each with optional
+    color flip (swap black/white pieces + invert player-to-move).
+    """
+
+    num_transforms = 16
 
     def __init__(self):
-        # (8, 65): action_map[k, a] = new action after transform k
-        # (8, 65): inv[k, new_a] = original action
-        self._inv = np.zeros((8, 65), dtype=int)
+        # (16, 65): inv[k, new_a] = original action
+        self._inv = np.zeros((16, 65), dtype=int)
         self._inv[:, 64] = 64  # pass stays pass
 
         for k in range(8):
@@ -29,18 +32,25 @@ class OthelloSymmetry:
                     r, c = 7 - c, r      # 90° CCW (matches np.rot90 default)
                 self._inv[k, r * 8 + c] = a
 
+        # Color-flip transforms (k=8..15): same spatial mapping, same _inv
+        self._inv[8:16] = self._inv[0:8]
+
     # ── Public API ──────────────────────────────────────────────────────────
 
-    def augment_batch(self, obs, mask, policy):
+    def augment_batch(self, obs, mask, policy, value=None, value_classes=1):
         """Apply random symmetries to a batch.
 
         Args:
             obs:    (B, 256) flat or (B, 4, 8, 8) float32
             mask:   (B, 65) bool
             policy: (B, 65) float32
+            value:  (B,) or (B, 3) float32, optional
+            value_classes: 1 for scalar, 3 for WDL
 
-        Returns (obs, mask, policy) — same shapes as inputs.
-        Value is invariant (caller handles it).
+        Returns (obs, mask, policy, value_or_none):
+            obs, mask, policy — same shapes as inputs.
+            value — augmented (negated for scalar when color flipped).
+            If value is None, returns None.
         """
         B = obs.shape[0]
         flat = obs.ndim == 2
@@ -49,21 +59,30 @@ class OthelloSymmetry:
         new_obs = np.empty_like(obs)
         new_mask = np.empty_like(mask)
         new_policy = np.empty_like(policy)
+        new_value = None if value is None else value.copy()
 
         for i, k in enumerate(choices):
             rot, flip = k % 4, k // 4
+            swapped = k >= 8
 
-            # --- observation (→ 4,8,8 → transform → back) ---
+            # --- observation ---
             o = obs[i].reshape(4, 8, 8)
             if flip:
                 o = o[:, :, ::-1]
             if rot:
                 o = np.rot90(o, rot, axes=(1, 2))
+            if swapped:
+                o[[1, 2]] = o[[2, 1]]          # swap black ↔ white
+                o[3] = 1.0 - o[3]              # invert turn indicator
             new_obs[i] = o.reshape(-1) if flat else o
 
-            # --- mask & policy (65,) ---
-            inv = self._inv[k]
+            # --- mask & policy ---
+            inv = self._inv[k % 8]              # spatial map (color doesn't change)
             new_mask[i] = mask[i][inv]
             new_policy[i] = policy[i][inv]
 
-        return new_obs, new_mask, new_policy
+            # --- value ---
+            if value is not None and swapped and value_classes == 1:
+                new_value[i] *= -1.0
+
+        return new_obs, new_mask, new_policy, new_value

@@ -4,6 +4,7 @@ Reusable for any pyspiel game.  The caller (play_game) handles
 game-specific setup like choosing the weak side and pre-rolling
 move steps.
 """
+import numpy as np
 
 
 def nn_raw_after_move(evaluator, state, action):
@@ -26,13 +27,15 @@ def nn_raw_after_move(evaluator, state, action):
 
 
 def try_weak_move(mcts, state, root, config, weak_count, weak_max,
-                  logger=None):
+                  logger=None, rng=None):
     """Attempt a weak move on *state*.
 
     Caller guarantees: weak_count < weak_max and this is the weak side.
 
     Returns (action, tag, weak_count, rare_state, weak_cat).
     """
+    if rng is None:
+        rng = np.random
     cur_player = state.current_player()
     mcts_action = root.best_child().action
     action = mcts_action
@@ -42,7 +45,8 @@ def try_weak_move(mcts, state, root, config, weak_count, weak_max,
 
     _, nn_policy_arr = mcts.evaluator._inference(state)
     legal = state.legal_actions()
-    weak_a = max(legal, key=lambda a: nn_policy_arr[a])
+    others = [a for a in legal if a != mcts_action]
+    weak_a = rng.choice(others) if others else mcts_action
 
     if weak_a == mcts_action:
         return mcts_action, "", weak_count, None, ""

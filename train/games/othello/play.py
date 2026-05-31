@@ -37,6 +37,8 @@ def play_game(game, mcts, config, rng, logger=None,
         if weak_steps:
             logger.log_line(f"[weak steps = {sorted(weak_steps)}]")
 
+    pruned = {"used": False, "cur_player": None}
+
     while not state.is_terminal():
         cur_player = state.current_player()
         if state.is_chance_node():
@@ -48,16 +50,28 @@ def play_game(game, mcts, config, rng, logger=None,
 
         root = mcts.mcts_search(state)
 
+        # Early termination: if MCTS is ≥99% sure of a win, 90% chance to prune
+        if (config.prune_enabled and not pruned["used"]
+                and root.q_value >= config.prune_threshold * game.max_utility()
+                and rng.random() < config.prune_prob):
+            pruned = {"used": True, "cur_player": cur_player}
+            if logger is not None:
+                logger.log_line(
+                    f"[prune] step {move_num} p{cur_player} "
+                    f"Q={root.q_value:+.3f} — early win\n{state}")
+            break
+
         # Weak-move
         if ((move_num in weak_steps or (move_num + 1) in weak_steps)
                 and weak_side is not None
                 and cur_player == weak_side
                 and weak_count < weak_max):
             action, tag, weak_count, rare_state, weak_cat = try_weak_move(
-                mcts, state, root, config, weak_count, weak_max, logger)
+                mcts, state, root, config, weak_count, weak_max, logger, rng)
         else:
             action, tag, weak_cat = root.best_child().action, "", ""
             rare_state = None
+
         if weak_cat in wstats:
             wstats[weak_cat] += 1
         if rare_state is not None:
@@ -112,7 +126,13 @@ def play_game(game, mcts, config, rng, logger=None,
         state.apply_action(action)
         move_num += 1
 
-    returns = state.returns()
+    if pruned["used"]:
+        max_u = game.max_utility()
+        p = pruned["cur_player"]
+        returns = np.array([max_u if i == p else -max_u for i in range(2)],
+                           dtype=np.float64)
+    else:
+        returns = state.returns()
     if logger is not None:
         logger.log_game_end(returns, move_num, len(rare_games))
     return states_info, returns, rare_games, wstats

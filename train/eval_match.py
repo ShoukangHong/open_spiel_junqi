@@ -382,12 +382,6 @@ def _act_parallel(player_cfg, state, move_num, temperature, temp_drop,
     raise ValueError(f"Unknown strategy: {strategy}")
 
 
-# ── Default config + main ────────────────────────────────────────────────────
-
-DEFAULT_NUM_GAMES = 100
-DEFAULT_TEMPERATURE = 0.1
-DEFAULT_TEMP_DROP = 7
-
 
 def main():
     score, sequences = run_match_parallel(
@@ -418,20 +412,23 @@ def main():
         print(f"  first {L:>2d} moves:  {len(unique)} unique  "
               f"(top occurs {top_count}/{len(prefs)} = {pct:.0f}%)")
 
+DEFAULT_NUM_GAMES = 100
+DEFAULT_TEMPERATURE = 0.1
+DEFAULT_TEMP_DROP = 7
 
 PLAYER = {
     0: {"strategy": "mcts",
         "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl",
-        "checkpoint_step": 240,
-        "mcts_simulations": 160, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
-    # 1: {"strategy": "mcts",
-    #     "checkpoint_dir": r"C:\Users\shouk\othello_train\fast",
-    #     "checkpoint_step": 100,
-    #     "mcts_simulations": 128, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
+        "checkpoint_step": 310,
+        "mcts_simulations": 320, "mcts_batch_size": 20, "mcts_uct_c": 1.41},
     1: {"strategy": "mcts",
-        "checkpoint_dir": r"C:\Users\shouk\othello_train_cloud",
-        "checkpoint_step": 180,
-        "mcts_simulations": 160, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl",
+        "checkpoint_step": 270,
+        "mcts_simulations": 320, "mcts_batch_size": 20, "mcts_uct_c": 1.41},
+    # 1: {"strategy": "mcts",
+    #     "checkpoint_dir": r"C:\Users\shouk\othello_train_cloud",
+    #     "checkpoint_step": 180,
+    #     "mcts_simulations": 160, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
 }
 
 if __name__ == "__main__":

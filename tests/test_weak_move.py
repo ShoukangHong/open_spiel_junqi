@@ -132,14 +132,14 @@ def test_weak_branches():
     a, tag, wc, rs, ra, wa, mv = _mk_weak_test("tic_tac_toe", 0.0, 0.4, 0.2)
     assert tag == ""
     assert rs is None
-    assert a == wa
+    assert a != ra  # weak_a picked, not MCTS action
     print("  C2 (accept): PASSED")
 
     # C3: nn_val=0.3 → prob=65%. mcts≈0 → prob=50%. rel_drop≈0.3 → weak_final
     a, tag, wc, rs, ra, wa, mv = _mk_weak_test("tic_tac_toe", 0.3, 0.4, 0.2)
     assert tag == ""
     assert rs is None
-    assert a == wa
+    assert a != ra  # weak_a picked, not MCTS action
     assert wc > 1
     print("  C3 (final): PASSED")
 
