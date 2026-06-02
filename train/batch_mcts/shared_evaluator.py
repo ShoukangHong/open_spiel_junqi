@@ -88,7 +88,7 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch):
     """
     import os as _os
 
-    # ── Priority elevation ────────────────────────────────────────────────────
+    # ── Priority / CPU affinity ───────────────────────────────────────────────
     try:
         if _os.name == "posix":
             _os.nice(-10)
@@ -96,8 +96,18 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch):
             import ctypes as _ctypes
             _ctypes.windll.kernel32.SetPriorityClass(
                 _ctypes.windll.kernel32.GetCurrentProcess(), 0x00008000)
+    except Exception:
+        pass  # non-root — try CPU affinity fallback
+
+    try:
+        allowed = sorted(_os.sched_getaffinity(0))  # respects cgroup cpuset
+        if len(allowed) >= 4:
+            reserved = {allowed[-1]}  # pin to 1 dedicated core
+            _os.sched_setaffinity(0, reserved)
+            print(f"[inference-server] CPU affinity: core {allowed[-1]} "
+                  f"(of {len(allowed)} available)", flush=True)
     except Exception as _e:
-        print(f"[inference-server] priority elevation failed: {_e}", flush=True)
+        print(f"[inference-server] CPU affinity failed: {_e}", flush=True)
 
     import pyspiel
     from train.core.model_builder import build_othello_model

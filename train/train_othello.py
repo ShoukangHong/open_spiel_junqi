@@ -99,6 +99,14 @@ from train.core.model_builder import build_othello_model as build_model
 
 
 def actor_process(cfg_dict, incoming_q, result_q, state_queue, actor_id=0):
+    # Leave last core for inference server
+    try:
+        import os as _os
+        allowed = sorted(_os.sched_getaffinity(0))
+        if len(allowed) >= 4:
+            _os.sched_setaffinity(0, set(allowed[:-1]))
+    except Exception as _e:
+        print(f"[actor-{actor_id}] CPU affinity failed: {_e}", flush=True)
     cfg = OthelloTrainConfig(**cfg_dict)
     game = pyspiel.load_game(cfg.game)
     evaluator = SharedEvaluator(game, incoming_q, result_q, actor_id)
@@ -121,13 +129,19 @@ def actor_process(cfg_dict, incoming_q, result_q, state_queue, actor_id=0):
             init_state=init_state, allow_weak=allow_weak)
         for rs in rare_games:
             pending.append((rs, False, "rare"))
+        if tag_override == "rare" and init_state is not None:
+            weak_player = 1 - init_state.current_player()
+            if returns[weak_player] > 0:
+                tag_override = "rare_flip"
+                wstats["rare_flip"] = wstats.get("rare_flip", 0) + 1
         if tag_override:
             for i in range(len(states_info)):
                 item = states_info[i]
                 states_info[i] = (item[0], item[1], item[2], item[3],
                                   tag_override, *item[5:])
+        rare_at = len(init_state.history()) if init_state is not None else 0
         try:
-            state_queue.put((states_info, returns, wstats), timeout=1)
+            state_queue.put((states_info, returns, wstats, rare_at), timeout=1)
         except queue.Full:
             print("[actor] WARNING: queue full, dropping game", flush=True)
 
@@ -212,14 +226,25 @@ def main():
                     states_info, returns, rare_games, wstats = play_game(
                         game, mcts, cfg, global_rng, logger=game_logger,
                         init_state=init_state, allow_weak=allow_weak)
-                    accum_wstats(cfg, wstats)
 
                     # Enqueue rare states for future games
                     for rs in rare_games:
                         pending.append((rs, False, "rare"))
 
+                    # Detect rare-flip: weak-move player won the fork game
+                    if (tag_override == "rare" and init_state is not None
+                            and returns[1 - init_state.current_player()] > 0):
+                        tag_override = "rare_flip"
+                        wstats["rare_flip"] = wstats.get("rare_flip", 0) + 1
+                    accum_wstats(cfg, wstats)
+
                     game_outcome_p0 = returns[0]
                     game_length = len(states_info)
+                    rare_at = 0
+                    if init_state is not None:
+                        rare_at = len(init_state.history())
+                    offset = rare_at
+                    denom = max(offset + game_length - 1, 1)
                     for i, item in enumerate(states_info):
                         obs, mask, policy, cur_player = item[:4]
                         tag = item[4] if len(item) > 4 else ""
@@ -227,7 +252,7 @@ def main():
                         draw_rate = item[6] if len(item) > 6 else 0.0
                         if tag_override:
                             tag = tag_override
-                        alpha = i / max(game_length - 1, 1)
+                        alpha = (offset + i) / denom
                         val = _mixed_target(returns[cur_player], q_value,
                                             draw_rate, alpha)
                         buffer.append(obs, mask, policy, val, tag)
@@ -248,19 +273,21 @@ def main():
                 while total_states < samples_per_step:
                     for _, q in actors:
                         try:
-                            states_info, returns, wstats = q.get_nowait()
+                            states_info, returns, wstats, rare_at = q.get_nowait()
                         except queue.Empty:
                             continue
                         accum_wstats(cfg, wstats)
                         game_outcome_p0 = returns[0]
 
                         game_length = len(states_info)
+                        offset = rare_at
+                        denom = max(offset + game_length - 1, 1)
                         for i, item in enumerate(states_info):
                             obs, mask, policy, cur_player = item[:4]
                             tag = item[4] if len(item) > 4 else ""
                             q_value = item[5] if len(item) > 5 else 0.0
                             draw_rate = item[6] if len(item) > 6 else 0.0
-                            alpha = i / max(game_length - 1, 1)
+                            alpha = (offset + i) / denom
                             val = _mixed_target(returns[cur_player], q_value,
                                                 draw_rate, alpha)
                             buffer.append(obs, mask, policy, val, tag)
@@ -302,10 +329,14 @@ def main():
                 entropies.append(float(np.mean(sample_ent)))
 
             if losses_list:
+                n = len(losses_list)
                 avg_loss = Losses(
-                    policy=sum(l.policy for l in losses_list) / len(losses_list),
-                    value=sum(l.value for l in losses_list) / len(losses_list),
-                    l2=sum(l.l2 for l in losses_list) / len(losses_list),
+                    policy=sum(l.policy for l in losses_list) / n,
+                    value=sum(l.value for l in losses_list) / n,
+                    l2=sum(l.l2 for l in losses_list) / n,
+                    v_kl=sum(l.v_kl for l in losses_list) / n,
+                    top1=sum(l.top1 for l in losses_list) / n,
+                    p_kl=sum(l.p_kl for l in losses_list) / n,
                 )
                 avg_entropy = sum(entropies) / len(entropies)
             else:

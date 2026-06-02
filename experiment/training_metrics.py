@@ -42,9 +42,11 @@ class StepRecord:
     tags_normal: int = 0
     tags_rare: int = 0
     rare_count: int = 0
+    rf_count: int = 0
     wf_count: int = 0
     weak_count: int = 0
     rare_per_game: float = 0.0
+    rf_per_game: float = 0.0
     wf_per_game: float = 0.0
     weak_per_game: float = 0.0
     states_per_s: float = 0.0
@@ -54,6 +56,9 @@ class StepRecord:
     loss_policy: float = 0.0
     loss_value: float = 0.0
     loss_l2: float = 0.0
+    v_kl: float = 0.0
+    top1: float = 0.0
+    p_kl: float = 0.0
     entropy: float = 0.0
     p0_pct: float = 0.0
     p1_pct: float = 0.0
@@ -72,9 +77,11 @@ _LINE1_RE = re.compile(
     r"buffer=\s*(?P<buf_cur>\d+)/\s*(?P<buf_total>\d+)\s+"
     r"unique=\s*(?P<unique>\d+)\s+"
     r"tags=\{(?P<tags>[^}]*)\}\s+"
-    r"weak=rare=(?P<rare>\d+)\s+wf=(?P<wf>\d+)\s+weak=(?P<weak>\d+)\s+"
+    r"weak=rare=(?P<rare>\d+)\s+(rf=(?P<rf>\d+)\s+)?"
+    r"wf=(?P<wf>\d+)\s+weak=(?P<weak>\d+)\s+"
     r"\(\d+d games\)\s+\|\s+"
-    r"rare/g=(?P<rare_g>[\d.]+)\s+wf/g=(?P<wf_g>[\d.]+)\s+weak/g=(?P<weak_g>[\d.]+)\s+"
+    r"rare/g=(?P<rare_g>[\d.]+)\s+(rf/g=(?P<rf_g>[\d.]+)\s+)?"
+    r"wf/g=(?P<wf_g>[\d.]+)\s+weak/g=(?P<weak_g>[\d.]+)\s+"
     r"states/s=(?P<sps>[\d.]+)\s+"
     r"selfplay=(?P<selfplay>[\d.]+)s\s+"
     r"train=(?P<train>[\d.]+)s"
@@ -85,7 +92,11 @@ _LINE2_RE = re.compile(
     r"loss=Losses\(total:\s*(?P<loss_total>[\d.]+),\s*"
     r"policy:\s*(?P<loss_policy>[\d.]+),\s*"
     r"value:\s*(?P<loss_value>[\d.]+),\s*"
-    r"l2:\s*(?P<loss_l2>[\d.]+)\)\s+"
+    r"l2:\s*(?P<loss_l2>[\d.]+)"
+    r"(?:,\s*V-KL:\s*(?P<vkl>[\d.]+))?"
+    r"(?:,\s*Top1:\s*(?P<top1>[\d.]+)%)?"
+    r"(?:,\s*P-KL:\s*(?P<pkl>[\d.]+))?"
+    r"\)\s+"
     r"entropy=(?P<entropy>[\d.]+)\s+\|\s+"
     r"p0=(?P<p0>[\d.]+)%\s+"
     r"p1=(?P<p1>[\d.]+)%\s+"
@@ -134,9 +145,11 @@ def parse_training_log(log_path: str) -> List[StepRecord]:
                     "tags_normal": tags_normal,
                     "tags_rare": tags_rare,
                     "rare_count": int(d["rare"]),
+                    "rf_count": int(d.get("rf") or 0),
                     "wf_count": int(d["wf"]),
                     "weak_count": int(d["weak"]),
                     "rare_per_game": float(d["rare_g"]),
+                    "rf_per_game": float(d.get("rf_g") or 0),
                     "wf_per_game": float(d["wf_g"]),
                     "weak_per_game": float(d["weak_g"]),
                     "states_per_s": float(d["sps"]),
@@ -154,6 +167,9 @@ def parse_training_log(log_path: str) -> List[StepRecord]:
                     loss_policy=float(d2["loss_policy"]),
                     loss_value=float(d2["loss_value"]),
                     loss_l2=float(d2["loss_l2"]),
+                    v_kl=float(d2.get("vkl") or 0),
+                    top1=float(d2.get("top1") or 0) / 100,
+                    p_kl=float(d2.get("pkl") or 0),
                     entropy=float(d2["entropy"]),
                     p0_pct=float(d2["p0"]),
                     p1_pct=float(d2["p1"]),
@@ -186,24 +202,23 @@ def moving_average(values: np.ndarray, window: int) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def plot_metrics(records: List[StepRecord], smooth: int = 1,
-                 output_path: Optional[str] = None):
-    """Produce a multi-panel dashboard of training metrics."""
+                 output_path: Optional[str] = None,
+                 elo_pairs: Optional[list] = None):
+    """Produce a 3x3 multi-panel dashboard of training metrics."""
     steps = np.array([r.step for r in records])
     if len(steps) < 2:
         print("[metrics] Not enough data to plot.")
         return
 
-    # Extract arrays
     def arr(name: str):
         return np.array([getattr(r, name) for r in records])
 
-    # Checkpoint markers
-    ckpt_mask = np.array([r.step % 5 == 0 for r in records])  # approximate
+    ckpt_mask = np.array([r.step % 5 == 0 for r in records])
 
-    fig, axes = plt.subplots(3, 2, figsize=(14, 12))
-    fig.suptitle("Training Metrics Dashboard", fontsize=13, fontweight="bold")
+    fig, axes = plt.subplots(3, 3, figsize=(12, 9))
+    fig.suptitle("Training Metrics Dashboard", fontsize=14, fontweight="bold")
 
-    # --- Panel 1: Loss curves ---
+    # ── (0,0) Loss curves ──────────────────────────────────────────────
     ax = axes[0, 0]
     for key, label, color in [
         ("loss_total", "total", "#333333"),
@@ -214,39 +229,32 @@ def plot_metrics(records: List[StepRecord], smooth: int = 1,
         if smooth > 1:
             v = moving_average(v, smooth)
         ax.plot(steps, v, label=label, color=color, linewidth=1.2, alpha=0.85)
-    ax.set_ylabel("Loss")
     ax.set_title("Loss")
-    ax.legend(fontsize=8, ncol=3)
+    ax.legend(fontsize=7, ncol=3)
     ax.grid(True, alpha=0.25)
-    ax.vlines(steps[ckpt_mask], *ax.get_ylim(), colors="gray",
-              linestyles=":", alpha=0.2, linewidth=0.5)
 
-    # --- Panel 2: Entropy ---
+    # ── (0,1) Entropy ──────────────────────────────────────────────────
     ax = axes[0, 1]
     ent = arr("entropy")
     if smooth > 1:
         ent = moving_average(ent, smooth)
     ax.plot(steps, ent, color="#4CAF50", linewidth=1.2)
-    ax.set_ylabel("Policy entropy (nats)")
     ax.set_title("Policy Entropy")
+    ax.set_ylim(0.8, 1.8)
     ax.grid(True, alpha=0.25)
-    ax.set_ylim([0.5, 2])
-    ax.axhline(y=np.log(65), color="gray", linestyle="--", alpha=0.4, linewidth=0.8,
-               label=f"max (ln 65 = {np.log(65):.1f})")
-    ax.legend(fontsize=8)
+    ax.axhline(y=np.log(65), color="gray", linestyle="--", alpha=0.4, linewidth=0.8)
 
-    # --- Panel 3: Throughput ---
-    ax = axes[1, 0]
+    # ── (0,2) Throughput ───────────────────────────────────────────────
+    ax = axes[0, 2]
     sps = arr("states_per_s")
     if smooth > 1:
         sps = moving_average(sps, smooth)
     ax.plot(steps, sps, color="#9C27B0", linewidth=1.2)
-    ax.set_ylabel("states / s")
-    ax.set_title("Self-play Throughput")
+    ax.set_title("Throughput (states/s)")
     ax.grid(True, alpha=0.25)
 
-    # --- Panel 4: Game outcomes ---
-    ax = axes[1, 1]
+    # ── (1,0) Game outcomes ────────────────────────────────────────────
+    ax = axes[1, 0]
     p0 = arr("p0_pct")
     p1 = arr("p1_pct")
     draw = arr("draw_pct")
@@ -254,19 +262,40 @@ def plot_metrics(records: List[StepRecord], smooth: int = 1,
         p0 = moving_average(p0, smooth)
         p1 = moving_average(p1, smooth)
         draw = moving_average(draw, smooth)
-    ax.fill_between(steps, 0, p0, alpha=0.4, color="#2196F3", label="p0 (black)")
-    ax.fill_between(steps, p0, p0 + p1, alpha=0.4, color="#FF5722", label="p1 (white)")
-    ax.fill_between(steps, p0 + p1, p0 + p1 + draw, alpha=0.4, color="#9E9E9E", label="draw")
-    ax.set_ylabel("Outcome %")
-    ax.set_title("Self-play Game Outcomes")
+    ax.fill_between(steps, 0, p0, alpha=0.4, color="#2196F3", label="p0")
+    ax.fill_between(steps, p0, p0 + p1, alpha=0.4, color="#FF5722", label="p1")
+    ax.fill_between(steps, p0 + p1, 100, alpha=0.4, color="#9E9E9E", label="draw")
+    ax.set_title("Game Outcomes")
     ax.set_ylim(0, 100)
-    ax.legend(fontsize=8, ncol=3, loc="upper right")
+    ax.legend(fontsize=7, ncol=3)
     ax.grid(True, alpha=0.25)
 
-    # --- Panel 5: Weak-move stats ---
-    ax = axes[2, 0]
+    # ── (1,1) Policy quality ───────────────────────────────────────────
+    ax = axes[1, 1]
+    t1 = arr("top1")
+    pk = arr("p_kl")
+    if smooth > 1:
+        t1 = moving_average(t1, smooth)
+        pk = moving_average(pk, smooth)
+    ax.plot(steps, t1 * 100, color="#2196F3", linewidth=1.2, label="Top1%")
+    ax.set_ylabel("Top1 %", color="#2196F3")
+    ax.tick_params(axis="y", colors="#2196F3")
+    ax2 = ax.twinx()
+    ax2.plot(steps, pk, color="#FF5722", linewidth=1.0, alpha=0.7,
+             label="P-KL")
+    ax2.set_ylabel("P-KL", color="#FF5722")
+    ax2.tick_params(axis="y", colors="#FF5722")
+    ax.set_title("Policy Quality")
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper left")
+    ax.grid(True, alpha=0.25)
+
+    # ── (1,2) Weak-move + rare_flip stats ──────────────────────────────
+    ax = axes[1, 2]
     for key, label, color in [
         ("rare_per_game", "rare/g", "#E91E63"),
+        ("rf_per_game", "rare_flip/g", "#795548"),
         ("wf_per_game", "weak_final/g", "#FF9800"),
         ("weak_per_game", "weak/g", "#00BCD4"),
     ]:
@@ -274,30 +303,59 @@ def plot_metrics(records: List[StepRecord], smooth: int = 1,
         if smooth > 1:
             v = moving_average(v, smooth)
         ax.plot(steps, v, label=label, color=color, linewidth=1.0, alpha=0.85)
-    ax.set_ylabel("per game")
-    ax.set_title("Weak-move Exploration")
-    ax.legend(fontsize=8, ncol=3)
+    ax.set_title("Weak-move + Rare-flip")
+    ax.legend(fontsize=7, ncol=2)
     ax.grid(True, alpha=0.25)
 
-    # --- Panel 6: Buffer + unique states ---
-    ax = axes[2, 1]
+    # ── (2,0) Buffer health ────────────────────────────────────────────
+    ax = axes[2, 0]
     buf_cur = arr("buffer_current")
     buf_max = np.max(buf_cur)
     unique = arr("unique_states")
     unique_ratio = unique / np.maximum(buf_cur, 1) * 100
-    ax.plot(steps, buf_cur, color="#607D8B", linewidth=1.2, label=f"buffer (max={buf_max})")
+    ax.plot(steps, buf_cur, color="#607D8B", linewidth=1.2, label="buffer")
     ax2 = ax.twinx()
-    ax2.plot(steps, unique_ratio, color="#FF9800", linewidth=1.0, alpha=0.7,
-             label="unique %")
+    ax2.plot(steps, unique_ratio, color="#FF9800", linewidth=1.0, alpha=0.7)
     ax2.set_ylabel("Unique %", color="#FF9800")
     ax2.tick_params(axis="y", colors="#FF9800")
     ax2.set_ylim(0, 105)
-    ax.set_ylabel("States")
-    ax.set_title("Replay Buffer Health")
+    ax.set_title("Buffer Health")
+    ax.legend(fontsize=7, loc="upper left")
+    ax.grid(True, alpha=0.25)
+
+    # ── (2,1) Value quality ────────────────────────────────────────────
+    ax = axes[2, 1]
+    vl = arr("loss_value")
+    vk = arr("v_kl")
+    if smooth > 1:
+        vl = moving_average(vl, smooth)
+        vk = moving_average(vk, smooth)
+    ax.plot(steps, vl, color="#FF5722", linewidth=1.2, label="CE loss")
+    ax.set_ylabel("Value CE", color="#FF5722")
+    ax.tick_params(axis="y", colors="#FF5722")
+    ax2 = ax.twinx()
+    ax2.plot(steps, vk, color="#9C27B0", linewidth=1.0, alpha=0.7,
+             label="V-KL")
+    ax2.set_ylabel("V-KL", color="#9C27B0")
+    ax2.tick_params(axis="y", colors="#9C27B0")
+    ax.set_title("Value Quality")
     lines1, labels1 = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper left")
+    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper left")
     ax.grid(True, alpha=0.25)
+
+    # ── (2,2) Elo vs step ──────────────────────────────────────────────
+    ax = axes[2, 2]
+    if elo_pairs:
+        elo_steps, elo_vals = zip(*elo_pairs)
+        ax.plot(elo_steps, elo_vals, "o-", color="#2196F3", markersize=5,
+                linewidth=1.2)
+        ax.axhline(y=1000, color="gray", linestyle="--", alpha=0.4, linewidth=0.8)
+        ax.set_title("Elo Rating")
+    else:
+        ax.text(0.5, 0.5, "no eval data", ha="center", va="center",
+                transform=ax.transAxes, color="gray")
+        ax.set_title("Elo Rating")
 
     for ax_row in axes.flat:
         ax_row.set_xlabel("step")
@@ -330,6 +388,9 @@ def print_summary(records: List[StepRecord]):
         ("loss_total", "Total loss", "{:.3f} → {:.3f}"),
         ("loss_policy", "Policy loss", "{:.3f} → {:.3f}"),
         ("loss_value", "Value loss", "{:.3f} → {:.3f}"),
+        ("v_kl", "V-KL", "{:.4f} → {:.4f}"),
+        ("p_kl", "P-KL", "{:.4f} → {:.4f}"),
+        ("top1", "Top1 acc", "{:.1%} → {:.1%}"),
         ("entropy", "Entropy", "{:.3f} → {:.3f}"),
         ("states_per_s", "States/s", "{:.0f} → {:.0f}"),
         ("p0_pct", "p0 win%", "{:.1f} → {:.1f}"),
@@ -354,12 +415,13 @@ def print_summary(records: List[StepRecord]):
 
     # Weak-move totals
     total_rare = sum(r.rare_count for r in records)
+    total_rf = sum(r.rf_count for r in records)
     total_wf = sum(r.wf_count for r in records)
     total_weak = sum(r.weak_count for r in records)
     total_tags_rare = sum(r.tags_rare for r in records)
     total_tags_normal = sum(r.tags_normal for r in records)
-    print(f"\n  Weak-move totals: rare={total_rare}  weak_final={total_wf}  "
-          f"weak={total_weak}")
+    print(f"\n  Weak-move totals: rare={total_rare}  rare_flip={total_rf}  "
+          f"weak_final={total_wf}  weak={total_weak}")
     print(f"  Buffer tags: normal={total_tags_normal}  rare_tagged={total_tags_rare}  "
           f"rare_pct={total_tags_rare/max(1,total_tags_normal+total_tags_rare)*100:.1f}%")
 
@@ -400,8 +462,32 @@ def main():
     print_summary(records)
 
     if not args.no_plot:
+        # Compute Elo from eval lines in the same log
+        elo_pairs = None
+        try:
+            from experiment.elo_analysis import (
+                parse_eval_log, build_matchup_dict, simulate_elo)
+            eval_records = parse_eval_log(log_path)
+            if eval_records:
+                matchups = build_matchup_dict(eval_records)
+                if matchups:
+                    traj = simulate_elo(matchups, n_rounds=5000,
+                                        K=16, games_per_pair=100, seed=42)
+                    elo_pairs = []
+                    for m in sorted(traj.keys(),
+                                    key=lambda x: (0 if x == "random"
+                                                   else int(x[4:]))):
+                        if m == "random":
+                            continue
+                        step = int(m[4:])
+                        elo_pairs.append((step, traj[m][-1]))
+                    print(f"[metrics] Elo: {len(elo_pairs)} models")
+        except Exception as e:
+            print(f"[metrics] Elo computation skipped: {e}")
+
         output_path = args.output or str(Path(log_path).with_suffix("")) + "_metrics.png"
-        plot_metrics(records, smooth=args.smooth, output_path=output_path)
+        plot_metrics(records, smooth=args.smooth, output_path=output_path,
+                     elo_pairs=elo_pairs)
 
 DEFAULT_LOG = r"C:\Users\shouk\othello_train\cloud_wdl_w\train.log"
 DEFAULT_SMOOTH = 5

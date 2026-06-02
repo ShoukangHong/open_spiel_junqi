@@ -17,7 +17,7 @@ import pygame
 
 # ── Config ──────────────────────────────────────────────────────────────────────
 # BUFFER_FILE = r"C:\Users\shouk\othello_train_cloud\buffer-checkpoint-140.npz"
-BUFFER_FILE = r"C:\Users\shouk\othello_train\fast\buffer-checkpoint-50.npz"
+BUFFER_FILE = r"C:\Users\shouk\othello_train\cloud_wdl_w\buffer-checkpoint-50.npz"
 # ── Constants ───────────────────────────────────────────────────────────────────
 ROWS = COLS = 8
 SQ_SIZE = 74
@@ -44,9 +44,10 @@ BG = (240, 240, 240)
 
 TAG_COLORS = {
     "": BLACK, "normal": BLACK,
-    "rare": RED, "weak": ORANGE, "weak_final": (200, 100, 0),
+    "rare": RED, "rare_flip": (128, 0, 128),  # purple
+    "weak": ORANGE, "weak_final": (200, 100, 0),
 }
-TAG_FILTERS = ["all", "normal", "rare", "weak"]
+TAG_FILTERS = ["all", "normal", "rare", "rare_flip", "weak"]
 
 # ── Cached fonts (created once) ─────────────────────────────────────────────────
 _FONT_LABEL = None       # 18
@@ -340,7 +341,7 @@ def draw_side_panel(screen, index, total, global_idx, tag_filter,
         "← → : ±1     ↑↓ : ±10",
         "PgUp/Dn: ±100   Home/End",
         "H: heatmap   T: cycle filter",
-        "R: rare only   A: show all",
+        "R: rare  F: rare_flip  A: all",
         "Q/Esc: quit",
     ]:
         screen.blit(sf.render(line, True, GRAY), (x0, y))
@@ -464,6 +465,9 @@ def main():
                     _s["heatmap"] = not _s["heatmap"]
                 elif key == pygame.K_r:
                     _do_filter("rare")
+                    need_refresh = True
+                elif key == pygame.K_f:
+                    _do_filter("rare_flip")
                     need_refresh = True
                 elif key == pygame.K_t:
                     idx = (TAG_FILTERS.index(_s["filter"]) + 1) % len(TAG_FILTERS)

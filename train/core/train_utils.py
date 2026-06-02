@@ -142,8 +142,9 @@ def maybe_trigger_eval(step, cfg, _eval_thread, _last_eval_time,
             pass
     ckpts.sort(reverse=True)
     refs = ckpts[:cfg.eval_reference_count]
-    if not refs:
-        refs = [-1]
+    # Pad with at most one random when fewer checkpoints exist
+    if len(refs) < cfg.eval_reference_count and -1 not in refs:
+        refs.append(-1)
 
     _eval_thread = threading.Thread(
         target=eval_func,

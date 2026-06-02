@@ -101,10 +101,12 @@ def try_weak_move(mcts, state, root, config, weak_count, weak_max,
     elif rel_drop < config.weak_move_threshold:
         weak_cat = "weak"
         action = weak_a
+        tag = "weak"
         weak_count += 1
     else:
         weak_cat = "weak_final"
         action = weak_a
+        tag = "weak_final"
         weak_count = weak_max + 1
 
     return action, tag, weak_count, rare_state, weak_cat
@@ -114,7 +116,8 @@ def try_weak_move(mcts, state, root, config, weak_count, weak_max,
 
 def accum_wstats(cfg, per_game):
     if not hasattr(cfg, "_wstats_total"):
-        cfg._wstats_total = {"rare": 0, "weak": 0, "weak_final": 0}
+        cfg._wstats_total = {"rare": 0, "weak": 0, "weak_final": 0,
+                             "rare_flip": 0}
         cfg._wstats_games = 0
     for k in cfg._wstats_total:
         cfg._wstats_total[k] += per_game.get(k, 0)
@@ -126,9 +129,12 @@ def wstats_summary(cfg):
         return "weak=(none)"
     total = cfg._wstats_total
     games = cfg._wstats_games
-    return (f"rare={total['rare']:d} wf={total['weak_final']:d}"
+    flip = total.get("rare_flip", 0)
+    return (f"rare={total['rare']:d} rf={flip:d}"
+            f" wf={total['weak_final']:d}"
             f" weak={total['weak']:d}  ({games}d games)"
             f"  |  rare/g={total['rare']/games:.1f}"
+            f" rf/g={flip/games:.1f}"
             f" wf/g={total['weak_final']/games:.1f}"
             f" weak/g={total['weak']/games:.1f}")
 

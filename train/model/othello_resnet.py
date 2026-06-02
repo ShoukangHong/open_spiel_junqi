@@ -30,6 +30,9 @@ class Losses:
     policy: float
     value: float
     l2: float
+    v_kl: float = 0.0
+    top1: float = 0.0
+    p_kl: float = 0.0
 
     @property
     def total(self) -> float:
@@ -37,7 +40,9 @@ class Losses:
 
     def __str__(self) -> str:
         return (f"Losses(total: {self.total:.3f}, policy: {self.policy:.3f}, "
-                f"value: {self.value:.3f}, l2: {self.l2:.3f})")
+                f"value: {self.value:.3f}, l2: {self.l2:.3f}, "
+                f"V-KL: {self.v_kl:.4f}, Top1: {self.top1:.1%}, "
+                f"P-KL: {self.p_kl:.4f})")
 
 
 # ── Building blocks ─────────────────────────────────────────────────────────
@@ -336,10 +341,27 @@ class Model:
         log_probs = F.log_softmax(policy_logits_masked, dim=-1)
         policy_loss = -(target_policy * log_probs).sum(dim=-1).mean()
 
+        # Policy metrics (interpretable)
+        with torch.no_grad():
+            policy_pred = F.softmax(policy_logits_masked, dim=-1)
+            top1 = (policy_pred.argmax(-1) == target_policy.argmax(-1)
+                    ).float().mean().item()
+            eps = 1e-12
+            p_kl = (target_policy * (torch.log(target_policy + eps)
+                                     - torch.log(policy_pred + eps))
+                    ).sum(dim=-1).mean().item()
+
         # Value loss: cross-entropy with soft WDL target
         value_loss = -(target_value *
                        F.log_softmax(value_pred, dim=-1)
                        ).sum(dim=-1).mean()
+
+        # WDL KL divergence
+        with torch.no_grad():
+            wdl_pred = F.softmax(value_pred, dim=-1)
+            v_kl = (target_value * (torch.log(target_value + eps)
+                                    - torch.log(wdl_pred + eps))
+                    ).sum(dim=-1).mean().item()
 
         # Track L2 loss contribution (matching JAX formula)
         l2_reg = sum(
@@ -356,7 +378,7 @@ class Model:
         self._optimizer.step()
 
         return Losses(policy=policy_loss.item(), value=value_loss.item(),
-                      l2=l2_reg)
+                      l2=l2_reg, v_kl=v_kl, top1=top1, p_kl=p_kl)
 
     def save_checkpoint(self, step: int) -> str:
         if not self._checkpoint_path:

@@ -89,7 +89,7 @@ def _act(player_cfg, state, move_num, temperature, temp_drop):
         mask = np.asarray(state.legal_actions_mask(), dtype=bool)
         _, policy = _model_for(player_cfg).inference(obs, mask)
         probs = np.array([policy[a] for a in legal])
-        tau = 1.0 if move_num < temp_drop else temperature
+        tau = 0.5 if move_num < temp_drop else temperature
         if tau > 0:
             probs = probs ** (1.0 / max(tau, 0.01))
             probs /= probs.sum()
@@ -369,7 +369,7 @@ def _act_parallel(player_cfg, state, move_num, temperature, temp_drop,
         root = mcts.mcts_search(state)
         visits = np.array([c.explore_count for c in root.children])
         probs = visits / visits.sum()
-        tau = 1.0 if move_num < temp_drop else temperature
+        tau = 0.5 if move_num < temp_drop else temperature
         probs = probs ** (1.0 / max(tau, 0.01))
         probs /= probs.sum()
         actions = [c.action for c in root.children]
@@ -415,16 +415,16 @@ DEFAULT_TEMP_DROP = 7
 PLAYER = {
     0: {"strategy": "mcts",
         "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_w",
-        "checkpoint_step": 250,
+        "checkpoint_step": 590,
         "mcts_simulations": 320, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
+    # 1: {"strategy": "mcts",
+    #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_argmax", # argmax 240 us benchmark
+    #     "checkpoint_step": 240,
+    #     "mcts_simulations": 320, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
     1: {"strategy": "mcts",
-        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_argmax", # argmax 240 us benchmark
-        "checkpoint_step": 240,
+        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_w",
+        "checkpoint_step": 400,
         "mcts_simulations": 320, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
-    # 1: {"strategy": "model",
-    #     "checkpoint_dir": r"C:\Users\shouk\othello_train_cloud",
-    #     "checkpoint_step": 180,
-    #     "mcts_simulations": 320, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
 }
 
 if __name__ == "__main__":

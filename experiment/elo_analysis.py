@@ -87,8 +87,8 @@ def expected_score(elo_a: float, elo_b: float) -> float:
     return 1.0 / (1.0 + 10.0 ** ((elo_b - elo_a) / 400.0))
 
 
-def simulate_elo(matchups: dict, n_rounds: int = 500, K: float = 32.0,
-                 games_per_pair: int = 200, seed: int = 42) -> dict:
+def simulate_elo(matchups: dict, n_rounds: int = 5000, K: float = 16.0,
+                 games_per_pair: int = 100, seed: int = 42) -> dict:
     """Bootstrap Elo ratings by repeatedly simulating tournaments.
 
     Each round simulates a full round-robin: every pair plays *games_per_pair*

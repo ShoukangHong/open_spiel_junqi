@@ -11,7 +11,7 @@ def play_game(game, mcts, config, rng, logger=None,
     """Play one self-play game using BatchMCTS."""
     states_info = []
     rare_games = []
-    wstats = {"rare": 0, "weak": 0, "weak_final": 0}
+    wstats = {"rare": 0, "weak": 0, "weak_final": 0, "rare_flip": 0}
     state = game.new_initial_state() if init_state is None else init_state.clone()
     move_num = 0
     weak_enabled = allow_weak and init_state is None
@@ -27,8 +27,8 @@ def play_game(game, mcts, config, rng, logger=None,
         n_weak = 1
         while n_weak < weak_max and rng.random() < config.weak_move_prob:
             n_weak += 1
-        max_step = max(config.temperature_drop + 1, config.weak_move_max_step)
-        cand = list(range(config.temperature_drop, max_step))
+        max_step = max(config.weak_move_max_step, 30)
+        cand = list(range(2, max_step))
         if len(cand) >= n_weak:
             weak_steps = set(rng.choice(cand, size=n_weak, replace=False))
 
@@ -48,7 +48,7 @@ def play_game(game, mcts, config, rng, logger=None,
             state.apply_action(action)
             continue
 
-        root = mcts.mcts_search(state, add_noise=(move_num >= config.temperature_drop))
+        root = mcts.mcts_search(state)
 
         # Early termination: if MCTS is ≥99% sure of a win, 90% chance to prune
         if (config.prune_enabled and not pruned["used"]
@@ -102,7 +102,7 @@ def play_game(game, mcts, config, rng, logger=None,
         # Forked (rare) games: always use post-drop τ for clean evaluation
         after_drop = (init_state is not None
                       or move_num >= config.temperature_drop)
-        tau_sel = config.temperature if after_drop else 1.0
+        tau_sel = config.temperature if after_drop else 0.5
         if tau_sel > 0 and tau_sel != 1.0:
             sel_probs = policy.astype(np.float64) ** (1.0 / tau_sel)
             sel_probs /= sel_probs.sum()
