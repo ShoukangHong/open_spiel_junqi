@@ -339,29 +339,38 @@ class Model:
             mask, policy_logits,
             torch.full_like(policy_logits, -1e9))
         log_probs = F.log_softmax(policy_logits_masked, dim=-1)
-        policy_loss = -(target_policy * log_probs).sum(dim=-1).mean()
+
+        # Down-weight policy loss for proven states:
+        #   proven-win  (w > 0.99999) → weight 0.2
+        #   proven-loss (l > 0.99999) → weight 0.0
+        with torch.no_grad():
+            p_weights = torch.ones(target_value.shape[0], device=dev)
+            p_weights[target_value[:, 0] > 0.99999] = 0.2
+            p_weights[target_value[:, 2] > 0.99999] = 0.0
+        per_sample = -(target_policy * log_probs).sum(dim=-1)
+        policy_loss = (p_weights * per_sample).sum() / p_weights.sum().clamp(min=1)
 
         # Policy metrics (interpretable)
+        eps = 1e-12
         with torch.no_grad():
             policy_pred = F.softmax(policy_logits_masked, dim=-1)
             top1 = (policy_pred.argmax(-1) == target_policy.argmax(-1)
                     ).float().mean().item()
-            eps = 1e-12
-            p_kl = (target_policy * (torch.log(target_policy + eps)
-                                     - torch.log(policy_pred + eps))
-                    ).sum(dim=-1).mean().item()
+            # KL = CE - H(target), per-sample then average
+            p_ce = -(target_policy * log_probs).sum(dim=-1)
+            p_ent = -(target_policy * torch.log(target_policy + eps)).sum(dim=-1)
+            p_kl = ((p_weights * (p_ce - p_ent)).sum()
+                    / p_weights.sum().clamp(min=1)).item()
 
         # Value loss: cross-entropy with soft WDL target
-        value_loss = -(target_value *
-                       F.log_softmax(value_pred, dim=-1)
-                       ).sum(dim=-1).mean()
+        log_val = F.log_softmax(value_pred, dim=-1)
+        value_loss = -(target_value * log_val).sum(dim=-1).mean()
 
-        # WDL KL divergence
+        # WDL KL = CE - H(target)
         with torch.no_grad():
-            wdl_pred = F.softmax(value_pred, dim=-1)
-            v_kl = (target_value * (torch.log(target_value + eps)
-                                    - torch.log(wdl_pred + eps))
-                    ).sum(dim=-1).mean().item()
+            v_ce = -(target_value * log_val).sum(dim=-1)
+            v_ent = -(target_value * torch.log(target_value + eps)).sum(dim=-1)
+            v_kl = (v_ce - v_ent).mean().item()
 
         # Track L2 loss contribution (matching JAX formula)
         l2_reg = sum(

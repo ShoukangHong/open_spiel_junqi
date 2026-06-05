@@ -431,6 +431,71 @@ def test_stress_concurrent_wdl():
 
 # ── run ─────────────────────────────────────────────────────────────────────
 
+# ── Best model support ──────────────────────────────────────────────────────
+
+def test_best_model_routing():
+    """Server routes "main" vs "best" to different mock models."""
+    game = pyspiel.load_game("tic_tac_toe")
+    m_main = _MockModel("main")
+    m_best = _MockModel("best")
+    server = InferenceServer()
+    try:
+        rq = server.register_actor(0)
+        _start_server(server, {"main": m_main, "best": m_best})
+        ev_main = SharedEvaluator(game, server.incoming_queue, rq,
+                                  actor_id=0, model_id="main")
+        ev_best = SharedEvaluator(game, server.incoming_queue, rq,
+                                  actor_id=0, model_id="best")
+        s = _make_state([0, 4])
+        obs = np.asarray(s.observation_tensor(), dtype=np.float32)
+        v_main, _ = ev_main._inference(s)
+        v_best, _ = ev_best._inference(s)
+        assert np.allclose(np.asarray(v_main), _expected_wdl("main", 0, obs), atol=0.01)
+        assert np.allclose(np.asarray(v_best), _expected_wdl("best", 0, obs), atol=0.01)
+        assert not np.allclose(np.asarray(v_main), np.asarray(v_best), atol=0.01)
+        print("  best_model_routing: PASSED")
+    finally:
+        _stop_server(server)
+
+
+def test_best_model_weight_update():
+    """update_weights for "best" changes its output."""
+    game = pyspiel.load_game("tic_tac_toe")
+    m_best = _MockModel("best")
+    server = InferenceServer()
+    try:
+        rq = server.register_actor(0)
+        _start_server(server, {"best": m_best})
+        ev = SharedEvaluator(game, server.incoming_queue, rq,
+                             actor_id=0, model_id="best")
+        s = _make_state([0])
+        obs = np.asarray(s.observation_tensor(), dtype=np.float32)
+        v0, _ = ev._inference(s)
+        assert np.allclose(np.asarray(v0), _expected_wdl("best", 0, obs), atol=0.01)
+        m_best.step_up()
+        server._incoming.put(("best", {}, 128))
+        time.sleep(0.1)
+        v1, _ = ev._inference(s)
+        assert np.allclose(np.asarray(v1), _expected_wdl("best", 1, obs), atol=0.01)
+        assert not np.allclose(np.asarray(v0), np.asarray(v1), atol=0.01)
+        print("  best_model_weight_update: PASSED")
+    finally:
+        _stop_server(server)
+
+
+def test_best_model_prob_selection():
+    """best_model_prob controls how often best model is picked."""
+    rng = np.random.RandomState(42)
+    n = 500
+    for prob in [0.0, 0.3, 1.0]:
+        cnt = sum(1 for _ in range(n) if prob > 0 and rng.random() < prob)
+        exp = int(n * prob)
+        tol = max(30, exp * 0.25)
+        assert abs(cnt - exp) <= tol, \
+            f"prob={prob}: expected ≈{exp}, got {cnt} (tol={tol:.0f})"
+    print("  best_model_prob_selection: PASSED")
+
+
 def main():
     tests = [
         test_single_inference,
@@ -443,6 +508,9 @@ def main():
         test_multi_actor_multi_model,
         test_stress_concurrent,
         test_stress_concurrent_wdl,
+        test_best_model_routing,
+        test_best_model_weight_update,
+        test_best_model_prob_selection,
     ]
     failed = 0
     for fn in tests:

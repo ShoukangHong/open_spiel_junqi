@@ -21,12 +21,12 @@ from train.model.othello_resnet import Model, OthelloResNet
 # ── Config — paths only, model settings read from checkpoint dir ────────
 # CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_v2"
 # CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_cloud"
-CHECKPOINT_DIR = r"C:\Users\shouk\othello_train\cloud_wdl_w"
-CHECKPOINT_STEP = 630             # checkpoint step to load (must exist)
-MCTS_SIMULATIONS = 256          # MCTS search budget per move
+CHECKPOINT_DIR = r"C:\Users\shouk\othello_train\cloud_wdl_128"
+CHECKPOINT_STEP = 1500             # checkpoint step to load (must exist)
+MCTS_SIMULATIONS = 1024          # MCTS search budget per move
 HINT_MAX_SIM = 12800
-MCTS_BATCH_SIZE = 8             # leaf evaluation batch size
-UCT_C = 1.41
+MCTS_BATCH_SIZE = 16             # leaf evaluation batch size
+UCT_C = 2
 
 
 def load_model(game):

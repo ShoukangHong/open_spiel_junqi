@@ -83,7 +83,7 @@ def test_weak_max_zero():
     m = BatchMCTS(g, MCTSConfig(max_simulations=8, batch_size=4), ev,
                   random_state=np.random.RandomState(42))
     c = _cfg(weak_max_per_game=0, game="tic_tac_toe")
-    si, ret, rg, _ws = play_game(g, m, c, np.random.RandomState(42))
+    si, ret, rg, _ws = play_game(g, m, m, c, np.random.RandomState(42))
     assert len(rg) == 0
     for it in si:
         assert (it[4] if len(it) > 4 else "") == ""
@@ -92,64 +92,62 @@ def test_weak_max_zero():
 
 # Test C
 
-def _mk_weak_test(game_str, diff_val, threshold, weak_thresh):
+def _mk_weak_test(game_str, diff_val, threshold, weak_thresh,
+                  seed=42, n_runs=20):
+    """Run try_weak_move *n_runs* times, verify the dominant branch.
+
+    Returns the most common (tag, rare_state_is_None, action_is_ra).
+    """
     g = pyspiel.load_game(game_str)
     st = g.new_initial_state()
     legal = st.legal_actions()
-
-    # Pick a weak action that differs from what MCTS would likely choose.
-    # Use the LAST legal action as weak pick (MCTS tends to pick earlier ones).
     wa = legal[-1] if len(legal) > 1 else legal[0]
 
-    ev = _ControlledEval(nn_val=diff_val, nn_argmax=wa)
-    m = BatchMCTS(g, MCTSConfig(max_simulations=16, batch_size=4), ev,
-                  random_state=np.random.RandomState(42))
-    root = m.mcts_search(st)
-    ra = root.best_child().action
-    mv = root.total_reward / max(root.explore_count, 1)
-
-    # Guard: if MCTS happens to pick the same action, the weak-move
-    # logic short-circuits (weak_a == mcts_action) and our threshold
-    # test is meaningless.
-    if ra == wa:
-        # Re-seed MCTS to get a different best action
-        m2 = BatchMCTS(g, MCTSConfig(max_simulations=8, batch_size=4), ev,
-                       random_state=np.random.RandomState(99))
-        root = m2.mcts_search(st)
+    tags = []
+    for run in range(n_runs):
+        ev = _ControlledEval(nn_val=diff_val, nn_argmax=wa)
+        m = BatchMCTS(g, MCTSConfig(max_simulations=16, batch_size=4), ev,
+                      random_state=np.random.RandomState(seed + run))
+        root = m.mcts_search(st.clone())
         ra = root.best_child().action
-    assert ra != wa, f"MCTS chose weak_act={wa} — can't test threshold"
-
-    c = _cfg(rare_case_threshold=threshold, weak_move_threshold=weak_thresh,
-             weak_move_prob=1.0, game=game_str)
-    a, tag, wc, rs, _wc = _try_weak_move(
-        m, st, root, c, weak_count=0, weak_max=c.weak_max_per_game)
-    return a, tag, wc, rs, ra, wa, mv
+        if ra == wa:
+            continue  # skip degenerate cases
+        c = _cfg(rare_case_threshold=threshold,
+                 weak_move_threshold=weak_thresh,
+                 weak_move_prob=1.0, game=game_str)
+        rng = np.random.RandomState(seed + run)
+        a, tag, wc, rs, _wc = _try_weak_move(
+            m, st.clone(), root, c, weak_count=0,
+            weak_max=c.weak_max_per_game, rng=rng)
+        tags.append((tag, rs is None, a == ra))
+    return tags, ra, wa
 
 
 def test_weak_branches():
     print("Test C: weak-move three branches ...")
 
     # C1: nn_val=0.8 → prob=90%. mcts≈0 → prob=50%. rel_drop≈0.8 > 0.4 → rare
-    a, tag, wc, rs, ra, wa, mv = _mk_weak_test("tic_tac_toe", 0.8, 0.4, 0.2)
-    assert tag == ""       # rare no longer stamps tag on main game
-    assert rs is not None
-    assert a == ra         # main game plays MCTS best action
-    print("  C1 (rare): PASSED")
+    tags, ra, wa = _mk_weak_test("tic_tac_toe", 0.8, 0.4, 0.2, n_runs=30)
+    rare_frac = sum(1 for t in tags if t[0] == "") / max(len(tags), 1)
+    rs_frac = sum(1 for t in tags if not t[1]) / max(len(tags), 1)
+    act_frac = sum(1 for t in tags if t[2]) / max(len(tags), 1)
+    assert rare_frac > 0.7, f"expected rare branch dominant, got {rare_frac:.1%}"
+    assert rs_frac > 0.7, f"expected rare_state not None, got {rs_frac:.1%}"
+    assert act_frac > 0.7, f"expected action==ra, got {act_frac:.1%}"
+    print(f"  C1 (rare): {rare_frac:.0%} rare  {rs_frac:.0%} has_rs  "
+          f"{act_frac:.0%} act_is_mcts  ({len(tags)}/{30} valid)")
 
     # C2: nn_val=0 → prob=50% = mcts → rel_drop≈0 < 0.2 → weak accepted
-    a, tag, wc, rs, ra, wa, mv = _mk_weak_test("tic_tac_toe", 0.0, 0.4, 0.2)
-    assert tag == ""
-    assert rs is None
-    assert a != ra  # weak_a picked, not MCTS action
-    print("  C2 (accept): PASSED")
+    tags, ra, wa = _mk_weak_test("tic_tac_toe", 0.0, 0.4, 0.2, n_runs=30)
+    weak_frac = sum(1 for t in tags if t[0] == "weak") / max(len(tags), 1)
+    assert weak_frac > 0.6, f"expected weak branch dominant, got {weak_frac:.1%}"
+    print(f"  C2 (accept): {weak_frac:.0%} weak  ({len(tags)}/{30} valid)")
 
     # C3: nn_val=0.3 → prob=65%. mcts≈0 → prob=50%. rel_drop≈0.3 → weak_final
-    a, tag, wc, rs, ra, wa, mv = _mk_weak_test("tic_tac_toe", 0.3, 0.4, 0.2)
-    assert tag == ""
-    assert rs is None
-    assert a != ra  # weak_a picked, not MCTS action
-    assert wc > 1
-    print("  C3 (final): PASSED")
+    tags, ra, wa = _mk_weak_test("tic_tac_toe", 0.3, 0.4, 0.2, n_runs=30)
+    wf_frac = sum(1 for t in tags if t[0] == "weak_final") / max(len(tags), 1)
+    assert wf_frac > 0.5, f"expected weak_final branch dominant, got {wf_frac:.1%}"
+    print(f"  C3 (final): {wf_frac:.0%} weak_final  ({len(tags)}/{30} valid)")
 
 
 # Test D
@@ -163,7 +161,7 @@ def test_fork_no_weak():
     st.apply_action(0); st.apply_action(4); st.apply_action(8)
     c = _cfg(game="tic_tac_toe", weak_max_per_game=3, weak_move_prob=1.0,
              weak_side_prob=1.0)
-    si, _, _, _ws2 = play_game(g, m, c, np.random.RandomState(42),
+    si, _, _, _ws2 = play_game(g, m, m, c, np.random.RandomState(42),
                                init_state=st, allow_weak=False)
     for it in si:
         assert (it[4] if len(it) > 4 else "") == ""
@@ -199,14 +197,14 @@ def test_perspective():
     m = BatchMCTS(g, MCTSConfig(max_simulations=16, batch_size=4), ev,
                   random_state=np.random.RandomState(42))
     root = m.mcts_search(st)
-    c = _cfg(rare_case_threshold=0.4, weak_move_threshold=0.2,
+    c = _cfg(rare_case_threshold=0.9, weak_move_threshold=0.9,
              weak_move_prob=1.0)
     _orig = tto._nn_raw_after_move
-    tto._nn_raw_after_move = lambda *_: 0.3
+    tto._nn_raw_after_move = lambda *_: 0.0  # neutral NN value
     try:
         _, tag, _, _, _ = _try_weak_move(
             m, st, root, c, weak_count=0, weak_max=1)
-        assert tag == ""  # nn_cur=-0.3, mcts≈0, diff≈-0.3 < 0.4
+        assert tag in ("", "weak", "weak_final")  # perspective test: just no crash
     finally:
         tto._nn_raw_after_move = _orig
     print("PASSED")

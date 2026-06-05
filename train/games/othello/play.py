@@ -6,9 +6,13 @@ from train.batch_mcts.mcts import compute_solved_policy
 from train.core.weak_move import try_weak_move
 
 
-def play_game(game, mcts, config, rng, logger=None,
+def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
               init_state=None, allow_weak=True):
-    """Play one self-play game using BatchMCTS."""
+    """Play one self-play game using BatchMCTS.
+
+    mcts_black / mcts_white may be the same object (standard self-play)
+    or different (cross-play vs historical best).
+    """
     states_info = []
     rare_games = []
     wstats = {"rare": 0, "weak": 0, "weak_final": 0, "rare_flip": 0}
@@ -48,6 +52,7 @@ def play_game(game, mcts, config, rng, logger=None,
             state.apply_action(action)
             continue
 
+        mcts = mcts_black if cur_player == 0 else mcts_white
         root = mcts.mcts_search(state)
 
         # Early termination: if MCTS is ≥99% sure of a win, 90% chance to prune
@@ -93,10 +98,16 @@ def play_game(game, mcts, config, rng, logger=None,
             policy /= policy.sum()
 
         # Store raw visit-proportional policy + MCTS Q + draw rate
+        # If root is proven, use the exact outcome instead of Q estimate.
         obs = np.asarray(state.observation_tensor(), dtype=np.float32)
         mask = np.asarray(state.legal_actions_mask(), dtype=bool)
-        states_info.append((obs, mask, policy, cur_player, tag,
-                            root.q_value, root.draw_rate))
+        if root.outcome is not None:
+            q = root.outcome[cur_player]
+            dr = 1.0 if q == 0 else 0.0
+        else:
+            q = root.q_value
+            dr = root.draw_rate
+        states_info.append((obs, mask, policy, cur_player, tag, q, dr))
 
         # Action selection with temperature
         # Forked (rare) games: always use post-drop τ for clean evaluation

@@ -109,26 +109,38 @@ def actor_process(cfg_dict, incoming_q, result_q, state_queue, actor_id=0):
         print(f"[actor-{actor_id}] CPU affinity failed: {_e}", flush=True)
     cfg = OthelloTrainConfig(**cfg_dict)
     game = pyspiel.load_game(cfg.game)
-    evaluator = SharedEvaluator(game, incoming_q, result_q, actor_id)
+    ev_main = SharedEvaluator(game, incoming_q, result_q, actor_id,
+                              model_id="main")
+    ev_best = SharedEvaluator(game, incoming_q, result_q, actor_id,
+                              model_id="best")
     mcts_cfg = MCTSConfig(
         max_simulations=cfg.max_simulations, batch_size=cfg.mcts_batch_size,
         uct_c=cfg.uct_c, policy_epsilon=cfg.policy_epsilon,
         policy_alpha=cfg.policy_alpha, verbose=False)
-    mcts = BatchMCTS(game, mcts_cfg, evaluator,
-                     random_state=np.random.RandomState())
+    mcts_main = BatchMCTS(game, mcts_cfg, ev_main,
+                          random_state=np.random.RandomState())
+    mcts_best = BatchMCTS(game, mcts_cfg, ev_best,
+                          random_state=np.random.RandomState())
     rng = np.random.RandomState()
     logger = GameLogger(cfg.path, actor_id)
     pending = []
     while True:
         if pending:
-            init_state, allow_weak, tag_override = pending.pop()
+            init_state, allow_weak, tag_override, use_best = pending.pop()
         else:
-            init_state, allow_weak, tag_override = None, True, ""
+            init_state, allow_weak, tag_override, use_best = None, True, "", False
+            # Randomly pick opponent model for this game
+            if cfg.best_model_prob > 0:
+                use_best = rng.random() < cfg.best_model_prob
+        mcts_p0 = mcts_main
+        mcts_p1 = (mcts_best if use_best else mcts_main)
+        if use_best and rng.random() < 0.5:
+            mcts_p0, mcts_p1 = mcts_p1, mcts_p0  # alternate colors
         states_info, returns, rare_games, wstats = play_game(
-            game, mcts, cfg, rng, logger=logger,
+            game, mcts_p0, mcts_p1, cfg, rng, logger=logger,
             init_state=init_state, allow_weak=allow_weak)
         for rs in rare_games:
-            pending.append((rs, False, "rare"))
+            pending.append((rs, False, "rare", use_best))
         if tag_override == "rare" and init_state is not None:
             weak_player = 1 - init_state.current_player()
             if returns[weak_player] > 0:
@@ -181,6 +193,23 @@ def main():
         inference_server.register_model(
             "main", model._model.state_dict(),
             cfg.nn_width, cfg.nn_depth)
+        # Load best model if recorded, else copy main as initial best
+        best_sd = model._model.state_dict()
+        best_file = os.path.join(cfg.path, "best_step.txt")
+        if os.path.exists(best_file):
+            try:
+                with open(best_file) as f:
+                    best_step = int(f.read().strip())
+                ckpt = os.path.join(cfg.path, f"checkpoint-{best_step}.pt")
+                if os.path.exists(ckpt):
+                    best_sd = torch.load(
+                        ckpt, map_location="cpu",
+                        weights_only=False)["model_state_dict"]
+                    _log(f"[train] Best model: step {best_step}")
+            except Exception:
+                pass
+        inference_server.register_model(
+            "best", best_sd, cfg.nn_width, cfg.nn_depth)
         inference_server.start(cfg.game, cfg.inference_batch_size)
         for i in range(cfg.num_actors):
             result_q = inference_server.result_queue(i)
@@ -209,27 +238,53 @@ def main():
 
             if cfg.num_actors == 1:
                 # Single-process path
-                evaluator = PyTorchEvaluator(game, model)
-                mcts = BatchMCTS(game, mcts_config, evaluator,
-                                 random_state=np.random.RandomState(
-                                     cfg.seed + step * 1000))
+                ev_main = PyTorchEvaluator(game, model)
+                mcts_main = BatchMCTS(game, mcts_config, ev_main,
+                                      random_state=np.random.RandomState(
+                                          cfg.seed + step * 1000))
+                # Load best model if available
+                mcts_best = mcts_main  # fallback: same as main
+                best_file = os.path.join(cfg.path, "best_step.txt")
+                if os.path.exists(best_file):
+                    try:
+                        with open(best_file) as f:
+                            bs = int(f.read().strip())
+                        ckpt = os.path.join(cfg.path, f"checkpoint-{bs}.pt")
+                        if os.path.exists(ckpt):
+                            best_model = build_othello_model(game, cfg)
+                            best_model.load_checkpoint(bs)
+                            ev_best = PyTorchEvaluator(game, best_model)
+                            mcts_best = BatchMCTS(
+                                game, mcts_config, ev_best,
+                                random_state=np.random.RandomState(
+                                    cfg.seed + step * 1000 + 1))
+                    except Exception:
+                        pass
                 game_logger = GameLogger(cfg.path, 0)
                 pending = []  # (init_state, allow_weak, tag_override)
 
                 while total_states < samples_per_step:
                     # ── Decide what game to play next ──────────────────
                     if pending:
-                        init_state, allow_weak, tag_override = pending.pop()
+                        (init_state, allow_weak,
+                         tag_override, use_best) = pending.pop()
                     else:
                         init_state, allow_weak, tag_override = None, True, ""
+                        use_best = (cfg.best_model_prob > 0
+                                    and global_rng.random()
+                                    < cfg.best_model_prob)
 
+                    mb = mcts_main
+                    mw = mcts_best if use_best else mcts_main
+                    if use_best and global_rng.random() < 0.5:
+                        mb, mw = mw, mb  # alternate colors
                     states_info, returns, rare_games, wstats = play_game(
-                        game, mcts, cfg, global_rng, logger=game_logger,
+                        game, mb, mw, cfg, global_rng, logger=game_logger,
                         init_state=init_state, allow_weak=allow_weak)
 
                     # Enqueue rare states for future games
                     for rs in rare_games:
-                        pending.append((rs, False, "rare"))
+                        pending.append((rs, False, "rare", use_best))
 
                     # Detect rare-flip: weak-move player won the fork game
                     if (tag_override == "rare" and init_state is not None
@@ -381,6 +436,26 @@ def main():
                 inference_server.update_weights(
                     "main", model._model.state_dict(),
                     cfg.inference_batch_size)
+                # Refresh best model if best_step.txt changed
+                _last_best = getattr(main, "_last_best_step", 0)
+                best_file = os.path.join(cfg.path, "best_step.txt")
+                if os.path.exists(best_file):
+                    try:
+                        with open(best_file) as f:
+                            cur_best = int(f.read().strip())
+                        if cur_best != _last_best:
+                            ckpt = os.path.join(
+                                cfg.path, f"checkpoint-{cur_best}.pt")
+                            if os.path.exists(ckpt):
+                                best_sd = torch.load(
+                                    ckpt, map_location="cpu",
+                                    weights_only=False)["model_state_dict"]
+                                inference_server.update_weights(
+                                    "best", best_sd, cfg.inference_batch_size)
+                                _log(f"  [best] updated → step {cur_best}")
+                            main._last_best_step = cur_best
+                    except Exception:
+                        pass
 
             # ── Evaluation ─────────────────────────────────────────────
             _eval_thread, _last_eval_time = maybe_trigger_eval(

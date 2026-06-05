@@ -112,7 +112,7 @@ def parse_training_log(log_path: str) -> List[StepRecord]:
     records: List[StepRecord] = []
     pending: Optional[dict] = None  # step line waiting for its loss line
 
-    with open(log_path, encoding="utf-8") as f:
+    with open(log_path, encoding="utf-8", errors="replace") as f:
         for line in f:
             m1 = _LINE1_RE.search(line)
             if m1:
@@ -489,7 +489,7 @@ def main():
         plot_metrics(records, smooth=args.smooth, output_path=output_path,
                      elo_pairs=elo_pairs)
 
-DEFAULT_LOG = r"C:\Users\shouk\othello_train\cloud_wdl_w\train.log"
+DEFAULT_LOG = r"C:\Users\shouk\othello_train\cloud_wdl_128\train.log"
 DEFAULT_SMOOTH = 5
 DEFAULT_NO_PLOT = False
 

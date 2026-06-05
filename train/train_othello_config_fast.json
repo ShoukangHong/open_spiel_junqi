@@ -32,9 +32,15 @@
   "weak_max_per_game": 3,
   "weak_move_max_step": 64,
 
+  "prune_enabled": true,
+  "prune_threshold": 0.99,
+  "prune_prob": 0.9,
+
   "evaluation_window": 25,
-  "eval_reference_count": 3,
+  "eval_reference_count": 5,
+
   "eval_min_interval": 60,
+  "best_model_prob": 0.25,
 
   "path": "C:\\Users\\shouk\\othello_train\\fast",
   "seed": 42,

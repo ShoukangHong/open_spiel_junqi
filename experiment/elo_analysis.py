@@ -32,7 +32,7 @@ def parse_eval_log(log_path: str) -> dict:
     """Parse train.log, return {model_name: {opponent_name: (W, D, L)}}."""
     records = defaultdict(lambda: defaultdict(lambda: (0, 0, 0)))
 
-    with open(log_path, encoding="utf-8") as f:
+    with open(log_path, encoding="utf-8", errors="replace") as f:
         for line in f:
             m = _EVAL_RE.search(line)
             if not m:
@@ -309,7 +309,7 @@ def main():
     plot_elo(trajectories, args.rounds, output_path)
 
 
-DEFAULT_LOG = r"C:\Users\shouk\othello_train\cloud_wdl_w\train.log"
+DEFAULT_LOG = r"C:\Users\shouk\othello_train\cloud_wdl_128\train.log"
 DEFAULT_ROUNDS = 5000
 DEFAULT_GAMES_PER_PAIR = 100
 DEFAULT_K = 16

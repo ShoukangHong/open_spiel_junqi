@@ -38,7 +38,8 @@ class BaseTrainConfig:
 
     # Evaluation
     evaluation_window: int = 50
-    eval_reference_count: int = 3
+    eval_reference_count: int = 5
+    best_model_prob: float = 0.3       # probability of self-play vs best model
     eval_min_interval: int = 1800
 
     # Early termination (pruning)

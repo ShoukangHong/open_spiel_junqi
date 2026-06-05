@@ -54,7 +54,7 @@ def test_temperature_sampling_not_argmax():
     first_actions = []
     for _ in range(200):
         states_info, _, _, _ = play_game(
-            game, mcts, _TestCfg(), np.random.RandomState(), allow_weak=False)
+            game, mcts, mcts, _TestCfg(), np.random.RandomState(), allow_weak=False)
         obs1 = states_info[1][0]  # observation before second move
         # Tic-tac-toe CHW: ch0=empty, ch1=p1(O), ch2=p0(X)
         obs1 = obs1.reshape(3, 3, 3)
