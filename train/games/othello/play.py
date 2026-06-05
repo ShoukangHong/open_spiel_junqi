@@ -55,16 +55,22 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
         mcts = mcts_black if cur_player == 0 else mcts_white
         root = mcts.mcts_search(state)
 
-        # Early termination: if MCTS is ≥99% sure of a win, 90% chance to prune
+        # Early termination: MCTS solver proves a win, or Q ≥ threshold
         if (config.prune_enabled and not pruned["used"]
-                and root.q_value >= config.prune_threshold * game.max_utility()
                 and rng.random() < config.prune_prob):
-            pruned = {"used": True, "cur_player": cur_player}
-            if logger is not None:
-                logger.log_line(
-                    f"[prune] step {move_num} p{cur_player} "
-                    f"Q={root.q_value:+.3f} — early win\n{state}")
-            break
+            proven_win = (root.outcome is not None
+                          and root.outcome[cur_player] > 0)
+            high_q = (root.q_value
+                      >= config.prune_threshold * game.max_utility())
+            if not (proven_win or high_q):
+                pass  # don't prune
+            else:
+                pruned = {"used": True, "cur_player": cur_player}
+                if logger is not None:
+                    logger.log_line(
+                        f"[prune] step {move_num} p{cur_player} "
+                        f"Q={root.q_value:+.3f} — early win\n{state}")
+                break
 
         # Weak-move
         if ((move_num in weak_steps or (move_num + 1) in weak_steps)

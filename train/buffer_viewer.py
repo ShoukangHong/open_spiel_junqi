@@ -17,7 +17,7 @@ import pygame
 
 # ── Config ──────────────────────────────────────────────────────────────────────
 # BUFFER_FILE = r"C:\Users\shouk\othello_train_cloud\buffer-checkpoint-140.npz"
-BUFFER_FILE = r"C:\Users\shouk\othello_train\fast\buffer.db"
+BUFFER_FILE = r"C:\Users\shouk\othello_train\cloud_wdl_db\buffer.db"
 # ── Constants ───────────────────────────────────────────────────────────────────
 ROWS = COLS = 8
 SQ_SIZE = 74
@@ -104,7 +104,12 @@ def load_buffer(path):
 
 
 def _load_from_db(db_path):
-    import sqlite3
+    import sqlite3, zlib
+    def _unpack(raw, dtype):
+        try:
+            return np.frombuffer(zlib.decompress(raw), dtype=dtype)
+        except zlib.error:
+            return np.frombuffer(raw, dtype=dtype)
     conn = sqlite3.connect(db_path)
     cur = conn.execute(
         "SELECT obs, mask, policy, value, tag FROM states ORDER BY id")
@@ -113,19 +118,19 @@ def _load_from_db(db_path):
     if n == 0:
         conn.close()
         return None, None, None, None, None
-    first_obs = np.frombuffer(rows[0][0], dtype=np.float32)
-    first_mask = np.frombuffer(rows[0][1], dtype=bool)
-    first_pol = np.frombuffer(rows[0][2], dtype=np.float32)
+    first_obs = _unpack(rows[0][0], np.float32)
+    first_mask = _unpack(rows[0][1], bool)
+    first_pol = _unpack(rows[0][2], np.float32)
     obs_arr = np.empty((n, *first_obs.shape), dtype=np.float32)
     mask_arr = np.empty((n, *first_mask.shape), dtype=bool)
     pol_arr = np.empty((n, *first_pol.shape), dtype=np.float32)
     val_arr = np.empty((n, 3), dtype=np.float32)
     tag_arr = np.empty((n,), dtype=object)
     for i, (obs_b, mask_b, pol_b, val_b, tag) in enumerate(rows):
-        obs_arr[i] = np.frombuffer(obs_b, dtype=np.float32)
-        mask_arr[i] = np.frombuffer(mask_b, dtype=bool)
-        pol_arr[i] = np.frombuffer(pol_b, dtype=np.float32)
-        val_arr[i] = np.frombuffer(val_b, dtype=np.float32)
+        obs_arr[i] = _unpack(obs_b, np.float32)
+        mask_arr[i] = _unpack(mask_b, bool)
+        pol_arr[i] = _unpack(pol_b, np.float32)
+        val_arr[i] = _unpack(val_b, np.float32)
         tag_arr[i] = tag
     conn.close()
     return obs_arr, mask_arr, pol_arr, val_arr, tag_arr

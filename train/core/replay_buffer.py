@@ -8,6 +8,7 @@ for fast GPU sampling.
 
 import os
 import sqlite3
+import zlib
 
 import numpy as np
 
@@ -17,11 +18,18 @@ _WAL_PRAGMAS = ("PRAGMA journal_mode=WAL;", "PRAGMA synchronous=NORMAL;")
 
 
 def _pack(arr):
-    return np.asarray(arr, dtype=np.float32).tobytes()
+    return zlib.compress(np.asarray(arr, dtype=np.float32).tobytes())
 
 
 def _pack_bool(arr):
-    return np.asarray(arr, dtype=bool).tobytes()
+    return zlib.compress(np.asarray(arr, dtype=bool).tobytes())
+
+
+def _unpack(raw, dtype):
+    try:
+        return np.frombuffer(zlib.decompress(raw), dtype=dtype)
+    except zlib.error:
+        return np.frombuffer(raw, dtype=dtype)  # old uncompressed format
 
 
 class ReplayBuffer:
@@ -162,11 +170,10 @@ class ReplayBuffer:
 
         n = len(rows)
         # Reconstruct shapes from the first row (all rows share the same layout)
-        first_obs = np.frombuffer(rows[0][0], dtype=np.float32)
-        first_mask = np.frombuffer(rows[0][1], dtype=bool)
-        first_pol = np.frombuffer(rows[0][2], dtype=np.float32)
+        first_obs = _unpack(rows[0][0], np.float32)
+        first_mask = _unpack(rows[0][1], bool)
+        first_pol = _unpack(rows[0][2], np.float32)
 
-        # Always re-allocate on reload (handles shape changes)
         self._obs = np.empty((self._max_size, *first_obs.shape),
                              dtype=np.float32)
         self._masks = np.empty((self._max_size, *first_mask.shape),
@@ -177,10 +184,10 @@ class ReplayBuffer:
         self._tags = np.empty((self._max_size,), dtype=object)
 
         for i, (obs_b, mask_b, pol_b, val_b, tag) in enumerate(rows):
-            self._obs[i] = np.frombuffer(obs_b, dtype=np.float32)
-            self._masks[i] = np.frombuffer(mask_b, dtype=bool)
-            self._policies[i] = np.frombuffer(pol_b, dtype=np.float32)
-            self._values[i] = np.frombuffer(val_b, dtype=np.float32)
+            self._obs[i] = _unpack(obs_b, np.float32)
+            self._masks[i] = _unpack(mask_b, bool)
+            self._policies[i] = _unpack(pol_b, np.float32)
+            self._values[i] = _unpack(val_b, np.float32)
             self._tags[i] = tag
 
         self._size = n
@@ -241,9 +248,45 @@ def _convert_buffer(src_path: str, dst_path: str = None):
     print(f"[convert] {vals.shape[0]} states: scalar → WDL → {out}")
 
 
+def _compress_db(db_path: str):
+    """In-place convert uncompressed DB rows to zlib-compressed format."""
+    print(f"[compress] Opening {db_path} ...")
+    conn = sqlite3.connect(db_path)
+    for p in _WAL_PRAGMAS:
+        conn.execute(p)
+    cur = conn.execute("SELECT COUNT(*) FROM states")
+    total = cur.fetchone()[0]
+    print(f"[compress] {total} rows — scanning for uncompressed ...")
+
+    # Test first row to check if already compressed
+    test = conn.execute("SELECT obs FROM states LIMIT 1").fetchone()
+    try:
+        zlib.decompress(test[0])
+        print("[compress] Already compressed — nothing to do.")
+        conn.close()
+        return
+    except zlib.error:
+        pass
+
+    updated = 0
+    for row in conn.execute("SELECT id, obs, mask, policy, value FROM states"):
+        rid, obs_b, mask_b, pol_b, val_b = row
+        new_obs = sqlite3.Binary(zlib.compress(obs_b))
+        new_mask = sqlite3.Binary(zlib.compress(mask_b))
+        new_pol = sqlite3.Binary(zlib.compress(pol_b))
+        new_val = sqlite3.Binary(zlib.compress(val_b))
+        conn.execute(
+            "UPDATE states SET obs=?, mask=?, policy=?, value=? WHERE id=?",
+            (new_obs, new_mask, new_pol, new_val, rid))
+        updated += 1
+        if updated % 10000 == 0:
+            conn.commit()
+            print(f"[compress] {updated}/{total} ...")
+    conn.commit()
+    conn.execute("VACUUM")
+    conn.close()
+    print(f"[compress] Done — {updated} rows compressed + VACUUM.")
+
+
 if __name__ == "__main__":
-    import glob
-    target = r"C:\Users\shouk\othello_train\cloud_wdl_w\buffer-checkpoint-240.npz"
-    paths = sorted(glob.glob(f"{target}/buffer-checkpoint-*.npz")) if os.path.isdir(target) else [target]
-    for p in paths:
-        _convert_buffer(p)
+    _compress_db(r"C:\Users\shouk\othello_train\cloud_wdl_db\buffer.db")

@@ -147,12 +147,57 @@ def test_sqlite_step_tagging():
         except: pass
 
 
+def test_compress_roundtrip():
+    """Compressed DB must preserve exact data after reload."""
+    import sqlite3, os, zlib
+    from train.core.replay_buffer import _compress_db
+    db = _tempfile.mktemp(suffix=".db")
+    try:
+        # Build uncompressed DB directly
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE states (id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            " step INTEGER, obs BLOB, mask BLOB, policy BLOB,"
+            " value BLOB, tag TEXT DEFAULT '')")
+        obs0 = np.arange(8, dtype=np.float32)     # flat, like training obs
+        mask0 = np.array([True, False, True], dtype=bool)
+        pol0 = np.array([0.7, 0.2, 0.1], dtype=np.float32)
+        val0 = np.array([0.8, 0.1, 0.1], dtype=np.float32)
+        for i in range(50):
+            conn.execute(
+                "INSERT INTO states (step,obs,mask,policy,value,tag)"
+                " VALUES (?,?,?,?,?,?)",
+                (i, obs0.tobytes(), mask0.tobytes(), pol0.tobytes(),
+                 val0.tobytes(), "test"))
+        conn.commit()
+        conn.close()
+
+        # Compress
+        _compress_db(db)
+
+        # Reload and verify
+        buf = ReplayBuffer(100, db_path=db)
+        assert len(buf) == 50
+        for i in range(10):
+            batch = buf.sample(1)
+            np.testing.assert_array_equal(batch.observation[0], obs0)
+            np.testing.assert_array_equal(batch.legals_mask[0], mask0)
+            np.testing.assert_allclose(batch.policy[0], pol0, atol=1e-6)
+            np.testing.assert_allclose(batch.value[0], val0, atol=1e-6)
+        buf.close()
+    finally:
+        for ext in ("", "-shm", "-wal"):
+            try: _os.unlink(db + ext)
+            except: pass
+
+
 def main():
     tests = [
         test_sqlite_basic_append_sample, test_sqlite_resume_full,
         test_sqlite_resume_partial, test_sqlite_rollback,
         test_sqlite_expand_buffer, test_sqlite_empty_start,
         test_sqlite_in_memory_mode, test_sqlite_step_tagging,
+        test_compress_roundtrip,
     ]
     failed = 0
     for fn in tests:

@@ -91,7 +91,7 @@ def try_weak_move(mcts, state, root, config, weak_count, weak_max,
         weak_cat = "rare"
         rare_state = state.clone()
         rare_state.apply_action(weak_a)
-        weak_count = weak_max + 1
+        weak_count += 1
         if logger:
             logger.log_line(
                 f"\n── Rare Case ──\n{state}\n"
