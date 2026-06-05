@@ -489,7 +489,7 @@ def main():
         plot_metrics(records, smooth=args.smooth, output_path=output_path,
                      elo_pairs=elo_pairs)
 
-DEFAULT_LOG = r"C:\Users\shouk\othello_train\cloud_wdl_128\train.log"
+DEFAULT_LOG = r"C:\Users\shouk\othello_train\fast\train.log"
 DEFAULT_SMOOTH = 5
 DEFAULT_NO_PLOT = False
 

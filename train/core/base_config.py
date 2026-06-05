@@ -15,6 +15,7 @@ class BaseTrainConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
     train_batch_size: int = 128
+    entropy_weight: float = 0.01  # policy entropy bonus (0=off)
 
     # MCTS
     max_simulations: int = 64

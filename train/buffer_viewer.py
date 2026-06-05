@@ -17,7 +17,7 @@ import pygame
 
 # ── Config ──────────────────────────────────────────────────────────────────────
 # BUFFER_FILE = r"C:\Users\shouk\othello_train_cloud\buffer-checkpoint-140.npz"
-BUFFER_FILE = r"C:\Users\shouk\othello_train\cloud_wdl_128\buffer-checkpoint-840.npz"
+BUFFER_FILE = r"C:\Users\shouk\othello_train\fast\buffer.db"
 # ── Constants ───────────────────────────────────────────────────────────────────
 ROWS = COLS = 8
 SQ_SIZE = 74
@@ -94,11 +94,41 @@ def _action_label(a):
 
 
 def load_buffer(path):
+    if path.endswith(".db"):
+        return _load_from_db(path)
     data = np.load(path, allow_pickle=True)
     tags = None
     if "tags" in data:
         tags = np.asarray(data["tags"], dtype=str)
     return data["obs"], data["masks"], data["policies"], data["values"], tags
+
+
+def _load_from_db(db_path):
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    cur = conn.execute(
+        "SELECT obs, mask, policy, value, tag FROM states ORDER BY id")
+    rows = cur.fetchall()
+    n = len(rows)
+    if n == 0:
+        conn.close()
+        return None, None, None, None, None
+    first_obs = np.frombuffer(rows[0][0], dtype=np.float32)
+    first_mask = np.frombuffer(rows[0][1], dtype=bool)
+    first_pol = np.frombuffer(rows[0][2], dtype=np.float32)
+    obs_arr = np.empty((n, *first_obs.shape), dtype=np.float32)
+    mask_arr = np.empty((n, *first_mask.shape), dtype=bool)
+    pol_arr = np.empty((n, *first_pol.shape), dtype=np.float32)
+    val_arr = np.empty((n, 3), dtype=np.float32)
+    tag_arr = np.empty((n,), dtype=object)
+    for i, (obs_b, mask_b, pol_b, val_b, tag) in enumerate(rows):
+        obs_arr[i] = np.frombuffer(obs_b, dtype=np.float32)
+        mask_arr[i] = np.frombuffer(mask_b, dtype=bool)
+        pol_arr[i] = np.frombuffer(pol_b, dtype=np.float32)
+        val_arr[i] = np.frombuffer(val_b, dtype=np.float32)
+        tag_arr[i] = tag
+    conn.close()
+    return obs_arr, mask_arr, pol_arr, val_arr, tag_arr
 
 
 def build_filtered_indices(tags, total, tag_filter):

@@ -77,7 +77,8 @@ def init_training(cfg, game_module, model_builder, ReplayBuffer_class,
     logging.info(f"[train] Model params: {model.num_trainable_variables}"
                  f"  lr={cfg.learning_rate:.0e}")
 
-    buffer = ReplayBuffer_class(max_size=cfg.replay_buffer_size)
+    buffer = ReplayBuffer_class(max_size=cfg.replay_buffer_size,
+                                 db_path=os.path.join(cfg.path, "buffer.db"))
     samples_per_step = max(
         int(cfg.replay_buffer_size * cfg.buffer_sampling_frac),
         cfg.train_batch_size)
@@ -99,15 +100,9 @@ def init_training(cfg, game_module, model_builder, ReplayBuffer_class,
     start_step = find_latest_checkpoint(cfg.path)
     if start_step > 0:
         model.load_checkpoint(start_step)
-        buf_path = os.path.join(cfg.path,
-                                f"buffer-checkpoint-{start_step}.npz")
-        if os.path.exists(buf_path):
-            buffer.load(buf_path)
-            logging.info(f"[train] Resumed from checkpoint-{start_step}"
-                         f" (buffer: {len(buffer)} states)")
-        else:
-            logging.info(f"[train] Resumed from checkpoint-{start_step}"
-                         f" (buffer file not found, starting empty)")
+        buffer.rollback(start_step)  # discard states past this checkpoint
+        logging.info(f"[train] Resumed from checkpoint-{start_step}"
+                     f" (buffer: {len(buffer)} states)")
     else:
         logging.info("[train] No checkpoint found, starting fresh")
 

@@ -1,24 +1,77 @@
-"""FIFO ring buffer for AlphaZero (obs, mask, policy, value, tag) samples."""
+"""SQLite-backed FIFO ring buffer for AlphaZero samples.
+
+Each state is persisted immediately to SQLite with its training step,
+solving crash-resilience and checkpoint-alignment in one shot.
+An in-memory ring buffer mirrors the most recent *max_size* states
+for fast GPU sampling.
+"""
+
+import os
+import sqlite3
 
 import numpy as np
+
 from train.model.othello_resnet import TrainInput
+
+_WAL_PRAGMAS = ("PRAGMA journal_mode=WAL;", "PRAGMA synchronous=NORMAL;")
+
+
+def _pack(arr):
+    return np.asarray(arr, dtype=np.float32).tobytes()
+
+
+def _pack_bool(arr):
+    return np.asarray(arr, dtype=bool).tobytes()
 
 
 class ReplayBuffer:
-    """Fixed-size FIFO ring buffer for training tuples."""
+    """SQLite-persisted FIFO ring buffer.
 
-    def __init__(self, max_size: int):
+    Args:
+        max_size: in-memory ring capacity (also limits how many recent
+                  states are loaded from DB on resume).
+        db_path: path to SQLite file.  If None, operates in-memory only
+                 (backward compat for tests).
+    """
+
+    def __init__(self, max_size: int, db_path: str = None):
         self._max_size = max_size
+        self._db_path = db_path
         self._obs = None
         self._masks = None
         self._policies = None
         self._values = None
-        self._tags = None
-        self._index = 0
-        self._size = 0
+        self._tags = None           # ring-buffer tags
+        self._index = 0             # total states ever appended
+        self._size = 0              # ring occupancy
+        self._pending = 0           # unflushed DB inserts
+
+        if db_path:
+            self._conn = sqlite3.connect(db_path, timeout=30)
+            for p in _WAL_PRAGMAS:
+                self._conn.execute(p)
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS states ("
+                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "  step INTEGER NOT NULL,"
+                "  obs BLOB NOT NULL,"
+                "  mask BLOB NOT NULL,"
+                "  policy BLOB NOT NULL,"
+                "  value BLOB NOT NULL,"
+                "  tag TEXT NOT NULL DEFAULT ''"
+                ")"
+            )
+            self._conn.execute("CREATE INDEX IF NOT EXISTS idx_step ON states(step)")
+            self._conn.commit()
+            self._load_ring_from_db()
+        else:
+            self._conn = None
+
+    # ── Public API ──────────────────────────────────────────────────────────
 
     def append(self, obs: np.ndarray, mask: np.ndarray,
-               policy: np.ndarray, value, tag: str = ""):
+               policy: np.ndarray, value, tag: str = "", step: int = 0):
+        """Insert one state.  *step* is the training step that produced it."""
         if self._obs is None:
             self._obs = np.empty((self._max_size, *obs.shape), dtype=np.float32)
             self._masks = np.empty((self._max_size, *mask.shape), dtype=bool)
@@ -27,6 +80,7 @@ class ReplayBuffer:
             self._values = np.empty((self._max_size, 3), dtype=np.float32)
             self._tags = np.empty((self._max_size,), dtype=object)
 
+        # In-memory ring
         idx = self._index % self._max_size
         self._obs[idx] = obs.astype(np.float32)
         self._masks[idx] = mask
@@ -36,7 +90,20 @@ class ReplayBuffer:
         self._index += 1
         self._size = min(self._size + 1, self._max_size)
 
+        # SQLite — batch flush every 256 appends
+        if self._conn:
+            self._conn.execute(
+                "INSERT INTO states (step, obs, mask, policy, value, tag) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (step, _pack(obs), _pack_bool(mask), _pack(policy),
+                 _pack(value), tag))
+            self._pending += 1
+            if self._pending >= 256:
+                self._conn.commit()
+                self._pending = 0
+
     def sample(self, n: int) -> TrainInput:
+        """Random sample from the in-memory ring buffer."""
         indices = np.random.randint(0, self._size, size=n)
         return TrainInput(
             observation=self._obs[indices],
@@ -55,47 +122,74 @@ class ReplayBuffer:
         unique, counts = np.unique(valid, return_counts=True)
         return {str(k): int(v) for k, v in zip(unique, counts)}
 
-    def save(self, filepath: str):
-        if self._obs is None:
+    def flush(self):
+        """Commit any pending SQLite writes (call before shutdown)."""
+        if self._conn and self._pending > 0:
+            self._conn.commit()
+            self._pending = 0
+
+    def rollback(self, target_step: int):
+        """Delete all states with step > target_step, rebuild ring from DB."""
+        if not self._conn:
             return
-        tags_arr = np.array(self._tags[:self._size], dtype=str)
-        np.savez_compressed(
-            filepath,
-            obs=self._obs[:self._size],
-            masks=self._masks[:self._size],
-            policies=self._policies[:self._size],
-            values=self._values[:self._size],
-            tags=tags_arr,
-            index=self._index,
-            size=self._size,
-        )
+        self.flush()
+        self._conn.execute("DELETE FROM states WHERE step > ?", (target_step,))
+        self._conn.commit()
+        self._obs = None  # force re-allocation
+        self._load_ring_from_db()
+        self._size = min(self._size, self._max_size)
 
-    def load(self, filepath: str):
-        data = np.load(filepath)
-        self._size = int(data["size"])
-        self._index = int(data["index"])
-        self._max_size = max(self._max_size, self._size)
-        obs_shape = data["obs"].shape[1:]
-        mask_shape = data["masks"].shape[1:]
-        policy_shape = data["policies"].shape[1:]
-        self._obs = np.empty((self._max_size, *obs_shape), dtype=np.float32)
-        self._masks = np.empty((self._max_size, *mask_shape), dtype=bool)
-        self._policies = np.empty((self._max_size, *policy_shape), dtype=np.float32)
+    def close(self):
+        """Close the database connection."""
+        self.flush()
+        if self._conn:
+            self._conn.close()
+            self._conn = None
 
-        saved_values = data["values"]
-        if saved_values.ndim == 1:
-            raise ValueError(
-                "Old scalar buffer format detected.  Convert with:\n"
-                "  python train/core/replay_buffer.py <old.npz>")
+    # ── Internal ────────────────────────────────────────────────────────────
+
+    def _load_ring_from_db(self):
+        """Fill the in-memory ring from the most recent DB rows."""
+        cur = self._conn.execute(
+            "SELECT obs, mask, policy, value, tag FROM states "
+            "ORDER BY id DESC LIMIT ?", (self._max_size,))
+        rows = cur.fetchall()
+        if not rows:
+            self._index = 0
+            self._size = 0
+            return
+        rows.reverse()  # chronological order
+
+        n = len(rows)
+        # Reconstruct shapes from the first row (all rows share the same layout)
+        first_obs = np.frombuffer(rows[0][0], dtype=np.float32)
+        first_mask = np.frombuffer(rows[0][1], dtype=bool)
+        first_pol = np.frombuffer(rows[0][2], dtype=np.float32)
+
+        # Always re-allocate on reload (handles shape changes)
+        self._obs = np.empty((self._max_size, *first_obs.shape),
+                             dtype=np.float32)
+        self._masks = np.empty((self._max_size, *first_mask.shape),
+                               dtype=bool)
+        self._policies = np.empty((self._max_size, *first_pol.shape),
+                                  dtype=np.float32)
         self._values = np.empty((self._max_size, 3), dtype=np.float32)
         self._tags = np.empty((self._max_size,), dtype=object)
 
-        self._obs[:self._size] = data["obs"]
-        self._masks[:self._size] = data["masks"]
-        self._policies[:self._size] = data["policies"]
-        self._values[:self._size] = saved_values[:self._size]
-        if "tags" in data:
-            self._tags[:self._size] = data["tags"]
+        for i, (obs_b, mask_b, pol_b, val_b, tag) in enumerate(rows):
+            self._obs[i] = np.frombuffer(obs_b, dtype=np.float32)
+            self._masks[i] = np.frombuffer(mask_b, dtype=bool)
+            self._policies[i] = np.frombuffer(pol_b, dtype=np.float32)
+            self._values[i] = np.frombuffer(val_b, dtype=np.float32)
+            self._tags[i] = tag
+
+        self._size = n
+        # Recover total index from the DB
+        cur = self._conn.execute("SELECT MAX(id) FROM states")
+        max_id = cur.fetchone()[0]
+        self._index = max_id or n
+
+    # ── Properties ──────────────────────────────────────────────────────────
 
     def __len__(self) -> int:
         return self._size
@@ -118,7 +212,6 @@ class ReplayBuffer:
 
 def _convert_buffer(src_path: str, dst_path: str = None):
     """Convert old scalar buffer to WDL format.  Writes in-place if no dst."""
-    import os as _os
     data = np.load(src_path)
     vals = data["values"]
     if vals.ndim > 1:
@@ -144,13 +237,13 @@ def _convert_buffer(src_path: str, dst_path: str = None):
     tmp = out + ".converting.npz"
     np.savez_compressed(tmp, obs=obs, masks=masks, policies=policies,
                         values=wdl, tags=tags, index=idx, size=sz)
-    _os.replace(tmp, out)
+    os.replace(tmp, out)
     print(f"[convert] {vals.shape[0]} states: scalar → WDL → {out}")
 
 
 if __name__ == "__main__":
     import glob
     target = r"C:\Users\shouk\othello_train\cloud_wdl_w\buffer-checkpoint-240.npz"
-    paths = sorted(glob.glob(f"{target}/buffer-checkpoint-*.npz")) if __import__("os").path.isdir(target) else [target]
+    paths = sorted(glob.glob(f"{target}/buffer-checkpoint-*.npz")) if os.path.isdir(target) else [target]
     for p in paths:
         _convert_buffer(p)

@@ -275,6 +275,7 @@ class Model:
                 decay_params.append(param)
 
         self._lr = learning_rate
+        self._entropy_weight = 0.0  # set by training loop
         self._optimizer = torch.optim.AdamW([
             {"params": decay_params, "weight_decay": weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
@@ -379,7 +380,12 @@ class Model:
             if "bn" not in name and "bias" not in name
         ).item() * self._weight_decay
 
+        # Policy entropy bonus (encourage exploration)
+        ent_bonus = -(policy_pred * log_probs).sum(dim=-1).mean()
+
         total_loss = policy_loss + value_loss
+        if self._entropy_weight > 0:
+            total_loss = total_loss - self._entropy_weight * ent_bonus
 
         self._optimizer.zero_grad()
         total_loss.backward()

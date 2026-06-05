@@ -310,7 +310,7 @@ def main():
                         alpha = (offset + i) / denom
                         val = _mixed_target(returns[cur_player], q_value,
                                             draw_rate, alpha)
-                        buffer.append(obs, mask, policy, val, tag)
+                        buffer.append(obs, mask, policy, val, tag, step=step)
 
                     if game_outcome_p0 > 0:
                         outcomes["p0"] += 1
@@ -345,7 +345,8 @@ def main():
                             alpha = (offset + i) / denom
                             val = _mixed_target(returns[cur_player], q_value,
                                                 draw_rate, alpha)
-                            buffer.append(obs, mask, policy, val, tag)
+                            buffer.append(obs, mask, policy, val, tag,
+                                          step=step)
 
                         if game_outcome_p0 > 0:
                             outcomes["p0"] += 1
@@ -375,6 +376,7 @@ def main():
                         batch.value)
                     batch = TrainInput(observation=obs, legals_mask=mask,
                                        policy=policy, value=value)
+                model._entropy_weight = cfg.entropy_weight
                 loss = model.update(batch)
                 losses_list.append(loss)
                 # Policy entropy (nats) — per-sample, then averaged
@@ -426,8 +428,6 @@ def main():
             # ── Checkpoint ─────────────────────────────────────────────
             if step % cfg.checkpoint_freq == 0:
                 ckpt_path = model.save_checkpoint(step)
-                buffer.save(os.path.join(
-                    cfg.path, f"buffer-checkpoint-{step}.npz"))
                 _log(f"  [checkpoint] Saved {ckpt_path}")
 
             # Broadcast latest weights to actors + server
@@ -468,6 +468,8 @@ def main():
 
     finally:
         _log("[train] Shutting down ...")
+        buffer.flush()
+        buffer.close()
         # 1. Kill actors first (before server, to avoid deadlock on GPU queue)
         for p, q in actors:
             if p.is_alive():
