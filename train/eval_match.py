@@ -415,20 +415,20 @@ DEFAULT_TEMP_DROP = 7
 PLAYER = {
     0: {"strategy": "mcts",
         "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_db",
-        "checkpoint_step": 105,
+        "checkpoint_step": 495,
         "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
-    1: {"strategy": "mcts",
-        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_argmax", # argmax 240 us benchmark
-        "checkpoint_step": 240,
-        "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+    # 1: {"strategy": "mcts",
+    #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_argmax", # argmax 240 us benchmark
+    #     "checkpoint_step": 240,
+    #     "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
     # 1: {"strategy": "mcts",
     #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_b",
     #     "checkpoint_step": 990,
     #     "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
-    # 1: {"strategy": "mcts",
-    #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_128",
-    #     "checkpoint_step": 1200,
-    #     "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+    1: {"strategy": "mcts",
+        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_128",
+        "checkpoint_step": 1500,
+        "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
 }
 
 if __name__ == "__main__":

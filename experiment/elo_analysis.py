@@ -213,7 +213,7 @@ def plot_elo(trajectories: dict, n_rounds: int, output_path: str = None):
                        rotation=45, fontsize=7)
     ax.set_ylabel("Elo")
     ax.set_title("Final Elo by checkpoint")
-    ax.grid(True, alpha=0.3, axis="y")
+    ax.grid(True, alpha=0.3)
     ax.axhline(y=1000, color="gray", linestyle="--", alpha=0.5)
 
     fig.tight_layout()

@@ -351,6 +351,7 @@ def plot_metrics(records: List[StepRecord], smooth: int = 1,
         ax.plot(elo_steps, elo_vals, "o-", color="#2196F3", markersize=5,
                 linewidth=1.2)
         ax.axhline(y=1000, color="gray", linestyle="--", alpha=0.4, linewidth=0.8)
+        ax.grid(True, alpha=0.3)
         ax.set_title("Elo Rating")
     else:
         ax.text(0.5, 0.5, "no eval data", ha="center", va="center",

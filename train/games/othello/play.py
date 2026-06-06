@@ -6,6 +6,28 @@ from train.batch_mcts.mcts import compute_solved_policy
 from train.core.weak_move import try_weak_move
 
 
+def _should_prune(pruned, root, cur_player, config, max_utility, dice):
+    """Decide whether to prune the current game.
+
+    Returns (new_pruned, do_break).
+    Dice is consumed exactly once, on the first qualifying step.
+    """
+    if not config.prune_enabled or pruned["used"] or pruned["checked"]:
+        return pruned, False
+
+    qualifies = (
+        (root.outcome is not None and root.outcome[cur_player] > 0)
+        or root.q_value >= config.prune_threshold * max_utility
+    )
+    if not qualifies:
+        return pruned, False
+
+    pruned["checked"] = True
+    if dice < config.prune_prob:
+        return {"used": True, "cur_player": cur_player, "checked": True}, True
+    return pruned, False
+
+
 def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
               init_state=None, allow_weak=True):
     """Play one self-play game using BatchMCTS.
@@ -41,7 +63,7 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
         if weak_steps:
             logger.log_line(f"[weak steps = {sorted(weak_steps)}]")
 
-    pruned = {"used": False, "cur_player": None}
+    pruned = {"used": False, "cur_player": None, "checked": False}
 
     while not state.is_terminal():
         cur_player = state.current_player()
@@ -55,22 +77,16 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
         mcts = mcts_black if cur_player == 0 else mcts_white
         root = mcts.mcts_search(state)
 
-        # Early termination: MCTS solver proves a win, or Q ≥ threshold
-        if (config.prune_enabled and not pruned["used"]
-                and rng.random() < config.prune_prob):
-            proven_win = (root.outcome is not None
-                          and root.outcome[cur_player] > 0)
-            high_q = (root.q_value
-                      >= config.prune_threshold * game.max_utility())
-            if not (proven_win or high_q):
-                pass  # don't prune
-            else:
-                pruned = {"used": True, "cur_player": cur_player}
-                if logger is not None:
-                    logger.log_line(
-                        f"[prune] step {move_num} p{cur_player} "
-                        f"Q={root.q_value:+.3f} — early win\n{state}")
-                break
+        # Early termination: solver proves a win, or Q ≥ threshold.
+        pruned, do_break = _should_prune(
+            pruned, root, cur_player, config, game.max_utility(),
+            rng.random())
+        if do_break:
+            if logger is not None:
+                logger.log_line(
+                    f"[prune] step {move_num} p{cur_player} "
+                    f"Q={root.q_value:+.3f} — early win\n{state}")
+            break
 
         # Weak-move
         if ((move_num in weak_steps or (move_num + 1) in weak_steps)
