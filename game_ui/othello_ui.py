@@ -21,12 +21,12 @@ from train.model.othello_resnet import Model, OthelloResNet
 # ── Config — paths only, model settings read from checkpoint dir ────────
 # CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_v2"
 # CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_cloud"
-CHECKPOINT_DIR = r"C:\Users\shouk\othello_train\cloud_wdl_128"
-CHECKPOINT_STEP = 1500             # checkpoint step to load (must exist)
-MCTS_SIMULATIONS = 1024          # MCTS search budget per move
+CHECKPOINT_DIR = r"C:\Users\shouk\othello_train\cloud_wdl_db"
+CHECKPOINT_STEP = 825             # checkpoint step to load (must exist)
+MCTS_SIMULATIONS = 256          # MCTS search budget per move
 HINT_MAX_SIM = 12800
 MCTS_BATCH_SIZE = 16             # leaf evaluation batch size
-UCT_C = 2
+UCT_C = 5
 
 
 def load_model(game):
@@ -374,6 +374,10 @@ def main():
         hint_draw_rate = 0.0
         hint_root = None
         hint_state = None
+        hint_cfg = MCTSConfig(
+            max_simulations=HINT_MAX_SIM, batch_size=MCTS_BATCH_SIZE,
+            uct_c=UCT_C, policy_epsilon=0, verbose=False)
+        hint_mcts = None
         message = ""
         restart_game = False
         hvh = (human_color == -1)
@@ -410,7 +414,18 @@ def main():
                                 hints = None
                                 ai_value = None
                                 hint_draw_rate = 0.0
-                                hint_root = None
+                                # Reuse hint subtree if available
+                                if (hint_root is not None
+                                        and hint_root.explore_count > 0):
+                                    for c in hint_root.children:
+                                        if c.action == action:
+                                            hint_root = c
+                                            hint_state = str(state)
+                                            break
+                                    else:
+                                        hint_root = None
+                                else:
+                                    hint_root = None
                                 message = ""
                                 break
                             else:
@@ -442,10 +457,7 @@ def main():
                 if showing_hints and not state.is_terminal() and not freeze_hint:
                     # Persistent incremental search — tree accumulates sims.
                     if hint_root is None or hint_state != str(state):
-                        hint_cfg = MCTSConfig(
-                            max_simulations=64, batch_size=MCTS_BATCH_SIZE,
-                            uct_c=UCT_C,
-                            policy_epsilon=0, verbose=False)
+                        hint_cfg.max_simulations = 64  # start small, grow
                         hint_mcts = BatchMCTS(game, hint_cfg, evaluator,
                                               random_state=np.random.RandomState())
                         hint_root = hint_mcts.mcts_search(state)
@@ -470,22 +482,31 @@ def main():
                 pygame.display.flip()
 
                 # Run MCTS and display info
-                root = bot.mcts_search(state)
+                policy, action = bot.step_with_policy(state)
                 print_state(state)
-                print_mcts_info(root, state, evaluator)
-
-                action = root.best_child().action
+                print_mcts_info(bot._last_root, state, evaluator)
                 state.apply_action(action)
                 evaluator.clear_cache()
-                # Only auto-show hints if toggle is on
+                # Persistent hint tree for PvP auto-hints
                 if showing_hints:
-                    hints = get_hints_from_root(root)
-                    if root.outcome is not None:
-                        ai_value = root.outcome[current]
-                        hint_draw_rate = root.draw_rate
+                    if (hint_root is None or hint_state != str(state)
+                            or hint_root.visit_count < HINT_MAX_SIM):
+                        if hint_root is None or hint_state != str(state):
+                            hint_cfg.max_simulations = 64
+                            hint_mcts = BatchMCTS(game, hint_cfg, evaluator,
+                                                  random_state=np.random.RandomState())
+                            hint_root = hint_mcts.mcts_search(state)
+                            hint_state = str(state)
+                        else:
+                            hint_mcts.config.max_simulations = 64
+                            hint_root = hint_mcts.mcts_search(state, root=hint_root)
+                    hints = get_hints_from_root(hint_root)
+                    if hint_root.outcome is not None:
+                        ai_value = hint_root.outcome[current]
+                        hint_draw_rate = hint_root.draw_rate
                     else:
-                        ai_value = root.total_reward / max(root.explore_count, 1)
-                        hint_draw_rate = root.draw_rate
+                        ai_value = hint_root.total_reward / max(hint_root.explore_count, 1)
+                        hint_draw_rate = hint_root.draw_rate
                 else:
                     hints = None
                     ai_value = None

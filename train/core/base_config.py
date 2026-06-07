@@ -15,7 +15,9 @@ class BaseTrainConfig:
     learning_rate: float = 3e-4
     weight_decay: float = 1e-4
     train_batch_size: int = 128
-    entropy_weight: float = 0.01  # policy entropy bonus (0=off)
+    entropy_weight: float = 0.01   # policy entropy bonus (0=off)
+    policy_mix_alpha: float = 0.5   # advantage mixing weight
+    adv_temperature: float = 0.2    # softmax temperature (lower=sharper)
 
     # MCTS
     max_simulations: int = 64

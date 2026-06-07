@@ -3,6 +3,7 @@
 import numpy as np
 
 from train.batch_mcts.mcts import compute_solved_policy
+from train.core.policy import mix_advantage
 from train.core.weak_move import try_weak_move
 
 
@@ -28,6 +29,27 @@ def _should_prune(pruned, root, cur_player, config, max_utility, dice):
     return pruned, False
 
 
+def _setup_weak_moves(config, rng, *, allow_weak=True):
+    """Setup weak-move parameters for one game.  Testable in isolation.
+
+    Returns (weak_side, weak_max, weak_steps).
+    """
+    weak_side = None
+    weak_max = config.weak_max_per_game if allow_weak else 0
+    weak_steps = set()
+
+    if weak_max > 0 and rng.random() < config.weak_side_prob:
+        weak_side = rng.choice([0, 1])
+        n_weak = 1
+        while n_weak < weak_max and rng.random() < config.weak_move_prob:
+            n_weak += 1
+        max_step = config.weak_move_max_step
+        cand = list(range(2, max_step))
+        if len(cand) >= n_weak:
+            weak_steps = set(rng.choice(cand, size=n_weak, replace=False))
+    return weak_side, weak_max, weak_steps
+
+
 def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
               init_state=None, allow_weak=True):
     """Play one self-play game using BatchMCTS.
@@ -43,20 +65,9 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
     weak_enabled = allow_weak and init_state is None
 
     # Weak-move setup
-    weak_side = None
+    weak_side, weak_max, weak_steps = _setup_weak_moves(
+        config, rng, allow_weak=weak_enabled)
     weak_count = 0
-    weak_max = config.weak_max_per_game if weak_enabled else 0
-    weak_steps = set()
-
-    if weak_max > 0 and rng.random() < config.weak_side_prob:
-        weak_side = rng.choice([0, 1])
-        n_weak = 1
-        while n_weak < weak_max and rng.random() < config.weak_move_prob:
-            n_weak += 1
-        max_step = max(config.weak_move_max_step, 30)
-        cand = list(range(2, max_step))
-        if len(cand) >= n_weak:
-            weak_steps = set(rng.choice(cand, size=n_weak, replace=False))
 
     if logger is not None:
         logger.log_game_start(weak_side)
@@ -118,6 +129,15 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
             for a in state.legal_actions():
                 policy[a] = 1.0
             policy /= policy.sum()
+
+        # ── Advantage mixing for unsolved states ─────────────────────
+        if (config.policy_mix_alpha > 0
+                and root.outcome is None
+                and root.explore_count > 0):
+            policy = mix_advantage(policy, root, state,
+                                   game.num_distinct_actions(),
+                                   config.policy_mix_alpha,
+                                   config.adv_temperature)
 
         # Store raw visit-proportional policy + MCTS Q + draw rate
         # If root is proven, use the exact outcome instead of Q estimate.

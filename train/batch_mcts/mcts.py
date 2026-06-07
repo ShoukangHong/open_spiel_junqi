@@ -669,6 +669,7 @@ class BatchMCTS:
 
         t1 = time.time()
         root = self.mcts_search(state)
+        self._last_root = root
         best = root.best_child()
 
         if self.config.verbose:

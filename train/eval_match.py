@@ -408,27 +408,67 @@ def main():
         print(f"  first {L:>2d} moves:  {len(unique)} unique  "
               f"(top occurs {top_count}/{len(prefs)} = {pct:.0f}%)")
 
+    # ── Save detailed game log ───────────────────────────────────────
+    import datetime
+    out_dir = os.path.join(_sys_root, "temp")
+    os.makedirs(out_dir, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    log_path = os.path.join(out_dir, f"eval_{ts}.log")
+    with open(log_path, "w", encoding="utf-8") as f:
+        frame_names = [k for k in score if k != "draw"]
+        f.write(f"# {frame_names[0]} vs {frame_names[1]}\n")
+        f.write(f"# Score: {score}\n\n")
+        _write_eval_games(f, sequences, score)
+    print(f"[eval] Log saved to {log_path}")
+
+def _write_eval_games(f, sequences, score):
+    """Replay game sequences and write detailed board-by-board logs."""
+    game = _game_obj()
+    n = len(sequences)
+    frame_names = [k for k in score if k != "draw"]
+    name0, name1 = frame_names[0], frame_names[1]
+    for gi, (label, moves) in enumerate(sequences):
+        state = game.new_initial_state()
+        f.write(f"\n{'=' * 60}\nGame {gi + 1}/{n}  label={label}\n{'=' * 60}\n")
+        for mi, a in enumerate(moves):
+            cur = state.current_player()
+            pname = "BLACK(p0)" if cur == 0 else "WHITE(p1)"
+            f.write(f"\n── Move {mi + 1}  {pname}  action={a}"
+                    f" ({state.action_to_string(cur, a)}) ──\n")
+            state.apply_action(a)
+            f.write(f"{state}\n")
+        r = state.returns()
+        if r[0] > 0:
+            winner = f"{label} (Black)"
+        elif r[0] < 0:
+            winner = f"{name1 if label == name0 else name0} (White)"
+        else:
+            winner = "draw"
+        f.write(f"\n── Final (move {len(moves)}) ──\n"
+                f"Result: {winner} wins  Returns: {r[0]:+.0f}/{r[1]:+.0f}\n")
+
+
 DEFAULT_NUM_GAMES = 100
 DEFAULT_TEMPERATURE = 0.1
 DEFAULT_TEMP_DROP = 7
 
 PLAYER = {
     0: {"strategy": "mcts",
-        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_db",
-        "checkpoint_step": 495,
-        "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
-    # 1: {"strategy": "mcts",
+        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_mix",
+        "checkpoint_step": 50,
+        "mcts_simulations": 512, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+    # 1: {"strategy": "mcts", # 早期的benchmark
     #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_argmax", # argmax 240 us benchmark
     #     "checkpoint_step": 240,
     #     "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
-    # 1: {"strategy": "mcts",
-    #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_b",
-    #     "checkpoint_step": 990,
-    #     "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
-    1: {"strategy": "mcts",
-        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_128",
-        "checkpoint_step": 1500,
+    1: {"strategy": "mcts", # 中期的benchmark
+        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_b",
+        "checkpoint_step": 990,
         "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+    # 1: {"strategy": "mcts", # 晚期的benchmark，很强了
+    #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_128",
+    #     "checkpoint_step": 1200,
+    #     "mcts_simulations": 256, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
 }
 
 if __name__ == "__main__":

@@ -34,6 +34,8 @@ class _TestCfg:
     max_moves = 200
     max_steps = 1000
     prune_enabled = False
+    policy_mix_alpha = 0
+    adv_temperature = 0.2
 
 
 def test_temperature_sampling_not_argmax():
@@ -135,6 +137,53 @@ def main():
     print(f"\n{'=' * 40}")
     print(f"{'ALL PASSED' if failed == 0 else f'{failed} FAILED'}")
     print("=" * 40)
+
+
+# ── _setup_weak_moves ──────────────────────────────────────────────────────
+
+from train.games.othello.play import _setup_weak_moves
+
+
+class _WeakCfg:
+    weak_max_per_game = 3
+    weak_side_prob = 1.0
+    weak_move_prob = 0.5
+    weak_move_max_step = 50
+    temperature_drop = 10
+
+
+def test_weak_setup_expected_count():
+    """n_weak follows geometric: E[n] = 1/(1-p) with cap at weak_max."""
+    cfg = _WeakCfg()
+    n_trials = 5000
+    total = 0
+    rng = np.random.RandomState(42)
+    for _ in range(n_trials):
+        _, _, steps = _setup_weak_moves(cfg, rng, allow_weak=True)
+        total += len(steps)
+    avg = total / n_trials
+    # E[n] = 1 + p + p^2 for weak_max=3, p=0.5 → 1 + 0.5 + 0.25 = 1.75
+    expected = 1.75
+    assert abs(avg - expected) < 0.05, \
+        f"expected n_weak≈{expected:.2f}, got {avg:.3f}"
+
+
+def test_weak_setup_disabled():
+    cfg = _WeakCfg()
+    cfg.weak_max_per_game = 0
+    rng = np.random.RandomState(0)
+    side, wmax, steps = _setup_weak_moves(cfg, rng)
+    assert wmax == 0
+    assert side is None
+    assert len(steps) == 0
+
+
+def test_weak_setup_steps_in_range():
+    cfg = _WeakCfg()
+    rng = np.random.RandomState(0)
+    _, _, steps = _setup_weak_moves(cfg, rng)
+    for s in steps:
+        assert 2 <= s < cfg.weak_move_max_step
 
 
 # ── _should_prune ──────────────────────────────────────────────────────────

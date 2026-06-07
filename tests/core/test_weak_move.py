@@ -150,6 +150,36 @@ def test_weak_branches():
     print(f"  C3 (final): {wf_frac:.0%} weak_final  ({len(tags)}/{30} valid)")
 
 
+# Test C4: rare weak_count += 1, not exhausted
+
+def test_rare_weak_count_increment():
+    print("Test C4: rare weak_count += 1 ...", end=" ")
+    g = pyspiel.load_game("tic_tac_toe")
+    st = g.new_initial_state()
+    ev = _ControlledEval(nn_val=0.8, nn_argmax=st.legal_actions()[-1])
+    m = BatchMCTS(g, MCTSConfig(max_simulations=16, batch_size=4), ev,
+                  random_state=np.random.RandomState(42))
+    root = m.mcts_search(st.clone())
+    mcts_a = root.best_child().action
+    wa = st.legal_actions()[-1]
+    if mcts_a == wa:
+        m2 = BatchMCTS(g, MCTSConfig(max_simulations=8, batch_size=4), ev,
+                       random_state=np.random.RandomState(99))
+        root = m2.mcts_search(st.clone())
+    c = _cfg(rare_case_threshold=0.4, weak_move_threshold=0.2,
+             weak_move_prob=1.0, game="tic_tac_toe",
+             weak_max_per_game=3)
+
+    wc = 1
+    for run in range(2):
+        _, tag, wc, rs, _ = _try_weak_move(
+            m, st.clone(), root, c, weak_count=wc,
+            weak_max=c.weak_max_per_game, rng=np.random.RandomState(run))
+        assert wc > 0  # weak_count still alive
+    assert wc > 1, f"rare should increment weak_count, got {wc}"
+    print("PASSED")
+
+
 # Test D
 
 def test_fork_no_weak():
@@ -213,6 +243,7 @@ def test_perspective():
 def main():
     tests = [
         test_nn_raw_after_move, test_weak_max_zero, test_weak_branches,
+        test_rare_weak_count_increment,
         test_fork_no_weak, test_buffer_tags, test_perspective,
     ]
     failed = 0
