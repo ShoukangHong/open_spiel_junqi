@@ -4,7 +4,7 @@ import numpy as np
 import pyspiel
 from unittest import mock
 
-from train.games.othello.play import play_game
+from train.core.play import play_game
 
 
 def _make_mock_root(state, visits_list):
@@ -141,7 +141,7 @@ def main():
 
 # ── _setup_weak_moves ──────────────────────────────────────────────────────
 
-from train.games.othello.play import _setup_weak_moves
+from train.core.play import _setup_weak_moves
 
 
 class _WeakCfg:
@@ -188,7 +188,7 @@ def test_weak_setup_steps_in_range():
 
 # ── _should_prune ──────────────────────────────────────────────────────────
 
-from train.games.othello.play import _should_prune
+from train.core.play import _should_prune
 
 
 class _FakeCfg:

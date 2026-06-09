@@ -1,0 +1,49 @@
+{
+    "game": "xiangqi",
+
+    "nn_width": 64,
+    "nn_depth": 12,
+    "learning_rate": 0.01,
+    "weight_decay": 0.0001,
+    "train_batch_size": 64,
+    "entropy_weight": 0.01,
+    "policy_mix_alpha": 0.0,
+    "adv_temperature": 0.2,
+
+    "max_simulations": 64,
+    "mcts_batch_size": 8,
+    "inference_batch_size": 128,
+    "uct_c": 1.41,
+    "policy_epsilon": 0.25,
+    "policy_alpha": 1.0,
+    "temperature": 0.01,
+    "temperature_drop": 25,
+
+    "replay_buffer_size": 5000,
+    "buffer_sampling_frac": 0.2,
+    "symmetry": 1,
+
+    "num_actors": 1,
+    "max_steps": 300,
+    "checkpoint_freq": 10,
+
+    "evaluation_window": 50,
+    "eval_reference_count": 5,
+    "best_model_prob": 0.0,
+    "eval_min_interval": 1,
+
+    "prune_enabled": true,
+    "prune_threshold": 0.99,
+    "prune_prob": 0.9,
+
+    "weak_side_prob": 0.0,
+    "weak_move_prob": 0.0,
+    "rare_case_threshold": 0.0,
+    "weak_move_threshold": 0.0,
+    "weak_max_per_game": 3,
+    "weak_move_max_step": 200,
+
+    "path": "xiangqi_train",
+    "seed": 42,
+    "device": "cuda"
+}

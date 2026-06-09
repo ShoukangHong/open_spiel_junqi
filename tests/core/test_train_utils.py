@@ -57,19 +57,25 @@ def test_wstats_empty():
     assert wstats_summary(cfg) == "weak=(none)"
 
 
-# ── backward compat ─────────────────────────────────────────────────────────
+# ── import paths (post-refactor) ──────────────────────────────────────────
 
-def test_backward_compat_imports():
-    from train.train_othello import (
-        TrainConfig, ReplayBuffer, GameLogger, play_game,
-        _nn_raw_after_move, _try_weak_move,
-        _accum_wstats, _wstats_summary, _reset_wstats,
-    )
-    assert TrainConfig is not None
+def test_import_paths():
+    """Verify core modules are importable from their canonical locations."""
+    from train.core.replay_buffer import ReplayBuffer
+    from train.core.game_logger import GameLogger
+    from train.core.weak_move import nn_raw_after_move, try_weak_move
+    from train.core.weak_move import accum_wstats, wstats_summary, reset_wstats
+    from train.games.othello.config import OthelloTrainConfig
+    from train.games.othello.play import play_game
+    assert OthelloTrainConfig is not None
     assert ReplayBuffer is not None
     assert GameLogger is not None
     assert play_game is not None
-    assert _try_weak_move is not None
+    assert try_weak_move is not None
+    assert nn_raw_after_move is not None
+    assert accum_wstats is not None
+    assert wstats_summary is not None
+    assert reset_wstats is not None
 
 
 # ── eval references ─────────────────────────────────────────────────────────

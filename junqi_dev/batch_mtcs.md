@@ -12,8 +12,6 @@
   ├── model/
   │   ├── __init__.py
   │   └── othello_resnet.py  # PyTorch ResNet + ModelEvaluator 适配器
-  ├── verify_mcts.py          # 正确性验证脚本
-  └── train_othello_v2.py     # （后续）完整训练脚本
 
   Virtual Loss 算法流程
 

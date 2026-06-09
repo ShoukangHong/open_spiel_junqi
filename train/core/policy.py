@@ -1,4 +1,5 @@
 """Policy target computation utilities."""
+import math
 
 import numpy as np
 
@@ -19,7 +20,6 @@ def mix_advantage(visit_policy, root, state, num_actions, alpha,
         adv[c.action] = A
         if A > max_adv:
             max_adv = A
-
     legal = state.legal_actions()
     T = max(temperature, 0.01)
     exp_adv = np.exp((adv[legal] - max_adv) / T)

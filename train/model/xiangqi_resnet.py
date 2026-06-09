@@ -1,8 +1,8 @@
-"""PyTorch AlphaZero-style ResNet for Othello.
+"""PyTorch AlphaZero-style ResNet for Xiangqi (Chinese Chess).
 
-Input:  observation tensor  (batch, 4, 8, 8)
-Output: policy logits      (batch, 65) — 64 squares + pass
-        value               (batch,)   — tanh → [-1, 1]
+Input:  observation tensor  (batch, 15, 10, 9)
+Output: policy               (batch, 8100) — plane encoding: 90 src planes × 90 tgt cells
+        value                (batch, 3)    — WDL logits
 """
 
 import numpy as np
@@ -11,30 +11,27 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from train.model.blocks import ConvBlock, ResBlock
-from train.model.model import Model  # noqa: F401 — re-exported for backward compat
+from train.model.model import Model  # noqa: F401 — re-exported for convenience
 
 
-# ── Main model ──────────────────────────────────────────────────────────────
+class XiangqiResNet(nn.Module):
+    """AlphaZero ResNet for Xiangqi with plane-encoding policy head.
 
-class OthelloResNet(nn.Module):
-    """AlphaZero ResNet for Othello.
-
-    Args:
-        input_channels: observation tensor channels (4 for Othello: empty, black, white, player_to_move).
-        board_size: spatial size (8 for Othello).
-        output_size: number of distinct actions (65 for Othello).
-        nn_width: number of filters in conv layers.
-        nn_depth: number of residual blocks.
+    Policy head outputs 90 planes (one per source square), each 10×9 spatial
+    (target position).  Reshaped to flat 8100-way for masked softmax.
     """
 
-    def __init__(self, input_channels: int = 4, board_size: int = 8,
-                 output_size: int = 65, nn_width: int = 32, nn_depth: int = 5):
+    def __init__(self, input_channels: int = 15, board_rows: int = 10,
+                 board_cols: int = 9, output_size: int = 8100,
+                 nn_width: int = 32, nn_depth: int = 5):
         super().__init__()
         self.input_channels = input_channels
-        self.board_size = board_size
+        self.board_rows = board_rows
+        self.board_cols = board_cols
         self.output_size = output_size
         self.nn_width = nn_width
         self.nn_depth = nn_depth
+        num_src = board_rows * board_cols  # 90
 
         # Torso
         self.conv_in = ConvBlock(input_channels, nn_width, kernel_size=3)
@@ -42,24 +39,23 @@ class OthelloResNet(nn.Module):
             *[ResBlock(nn_width) for _ in range(nn_depth)]
         )
 
-        # Policy head
-        self.policy_conv = nn.Conv2d(nn_width, 2, 1, bias=False)
-        self.policy_bn = nn.BatchNorm2d(2)
-        self.policy_fc = nn.Linear(2 * board_size * board_size, output_size)
+        # Policy head — plane encoding: 1 plane per source square
+        self.policy_conv = nn.Conv2d(nn_width, num_src, 1, bias=False)
+        self.policy_bn = nn.BatchNorm2d(num_src)
 
-        # Value head — WDL: 3 output classes (win, draw, loss)
+        # Value head — WDL 3-class
         self.value_conv = nn.Conv2d(nn_width, 4, 1, bias=False)
         self.value_bn = nn.BatchNorm2d(4)
-        self.value_fc1 = nn.Linear(4 * board_size * board_size, nn_width)
+        self.value_fc1_in = 4 * board_rows * board_cols  # 360
+        self.value_fc1 = nn.Linear(self.value_fc1_in, nn_width)
         self.value_fc2 = nn.Linear(nn_width, 3)
 
         self._init_weights()
 
     def _init_weights(self):
-        """Explicit kaiming init for all conv/linear layers."""
         for name, m in self.named_modules():
             if isinstance(m, (nn.Conv2d, nn.Linear)):
-                if name in ("policy_fc", "value_fc2"):
+                if name in ("policy_conv", "value_fc2"):
                     nn.init.uniform_(m.weight, -0.03, 0.03)
                 else:
                     nn.init.kaiming_normal_(m.weight, mode="fan_out",
@@ -75,28 +71,21 @@ class OthelloResNet(nn.Module):
         return next(self.parameters()).device
 
     def forward(self, x):
-        """Forward pass.
-
-        Returns:
-            policy_logits: (batch, output_size)
-            value: (batch, 3) — WDL logits (no softmax).
-        """
         batch = x.shape[0]
 
         # Torso
         x = self.conv_in(x)
         x = self.res_blocks(x)
 
-        # Policy head
-        p = F.relu(self.policy_bn(self.policy_conv(x)))
-        p = p.reshape(batch, -1)
-        policy_logits = self.policy_fc(p)
+        # Policy head: 90 planes × (10, 9) → flat 8100
+        p = F.relu(self.policy_bn(self.policy_conv(x)))   # (batch, 90, 10, 9)
+        policy_logits = p.reshape(batch, -1)                # (batch, 8100)
 
         # Value head
-        v = F.relu(self.value_bn(self.value_conv(x)))
-        v = v.reshape(batch, -1)
+        v = F.relu(self.value_bn(self.value_conv(x)))       # (batch, 4, 10, 9)
+        v = v.reshape(batch, -1)                             # (batch, 360)
         v = F.relu(self.value_fc1(v))
-        value = self.value_fc2(v)  # (batch, 3) logits
+        value = self.value_fc2(v)                            # (batch, 3)
 
         return policy_logits, value
 
@@ -104,12 +93,8 @@ class OthelloResNet(nn.Module):
                   legals_mask: np.ndarray) -> tuple:
         """Single-sample inference (for MCTS).
 
-        Args:
-            observation: (input_channels, board_size, board_size) or flat.
-            legals_mask: (output_size,) bool array.
-
         Returns:
-            value: float
+            value: (3,) numpy array (softmaxed WDL).
             policy: (output_size,) numpy array (softmax over legal actions).
         """
         self.eval()
@@ -120,7 +105,7 @@ class OthelloResNet(nn.Module):
                 obs_t = obs_t.unsqueeze(0)
             else:
                 obs_t = obs_t.reshape(1, self.input_channels,
-                                      self.board_size, self.board_size)
+                                      self.board_rows, self.board_cols)
 
             mask_t = torch.from_numpy(
                 np.asarray(legals_mask, dtype=bool)).to(self.device)
@@ -143,13 +128,13 @@ class OthelloResNet(nn.Module):
         """Batch inference.
 
         Args:
-            observations: (batch, ...) — flat (batch, 256) or shaped
-                (batch, input_channels, board_size, board_size).
-            legals_masks: (batch, output_size).
+            observations: (batch, ...) — flat (batch, 1350) or shaped
+                (batch, 15, 10, 9).
+            legals_masks: (batch, 8100).
 
         Returns:
-            values: (batch,) numpy array
-            policies: (batch, output_size) numpy array
+            values: (batch, 3) numpy array
+            policies: (batch, 8100) numpy array
         """
         self.eval()
         with torch.no_grad():
@@ -158,22 +143,19 @@ class OthelloResNet(nn.Module):
             mask_t = torch.from_numpy(
                 np.asarray(legals_masks, dtype=bool)).to(self.device)
 
-            # NaN/Inf guard: corrupted weights produce NaN logits,
-            # which cause CUDA unknown error in downstream ops.
             if not torch.isfinite(obs_t).all():
                 raise RuntimeError("batch_inference: obs_t contains NaN/Inf")
 
-            # pyspiel returns flat observations — reshape to (C, H, W)
             if obs_t.dim() == 2:
                 obs_t = obs_t.reshape(obs_t.shape[0], self.input_channels,
-                                      self.board_size, self.board_size)
+                                      self.board_rows, self.board_cols)
 
             policy_logits, value = self.forward(obs_t)
 
             if not torch.isfinite(policy_logits).all():
-                raise RuntimeError("batch_inference: policy_logits contains NaN/Inf (model weights likely corrupted)")
+                raise RuntimeError("batch_inference: policy_logits NaN/Inf")
             if not torch.isfinite(value).all():
-                raise RuntimeError("batch_inference: value contains NaN/Inf (model weights likely corrupted)")
+                raise RuntimeError("batch_inference: value NaN/Inf")
 
             policy_logits = torch.clamp(policy_logits, -30, 30)
             policy_logits = torch.where(mask_t, policy_logits,
@@ -184,5 +166,3 @@ class OthelloResNet(nn.Module):
 
             value = F.softmax(value, dim=-1)
             return value.cpu().numpy(), policies.cpu().numpy()
-
-

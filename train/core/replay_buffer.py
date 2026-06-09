@@ -12,7 +12,7 @@ import zlib
 
 import numpy as np
 
-from train.model.othello_resnet import TrainInput
+from train.core.types import TrainInput
 
 _WAL_PRAGMAS = ("PRAGMA journal_mode=WAL;", "PRAGMA synchronous=NORMAL;")
 

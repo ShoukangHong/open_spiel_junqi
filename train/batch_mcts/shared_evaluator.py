@@ -81,10 +81,12 @@ class SharedEvaluator:
 _MAX_WAIT = 0.010
 
 
-def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch):
+def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
+               build_model_fn=None):
     """GPU inference process with multi-model support.
 
     *model_specs*: dict model_id → {state_dict, nn_width, nn_depth}
+    *build_model_fn*: callable(game, cfg_kwargs) → Model (default: build_othello_model)
     """
     import os as _os
 
@@ -110,7 +112,8 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch):
         print(f"[inference-server] CPU affinity failed: {_e}", flush=True)
 
     import pyspiel
-    from train.core.model_builder import build_othello_model
+    if build_model_fn is None:
+        from train.core.model_builder import build_othello_model as build_model_fn
 
     # ── Hardware monitoring (optional) ─────────────────────────────────────
     try:
@@ -138,7 +141,7 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch):
         if spec.get("model") is not None:
             models[mid] = spec["model"]
         else:
-            m = build_othello_model(game, {
+            m = build_model_fn(game, {
                 "nn_width": spec["nn_width"], "nn_depth": spec["nn_depth"],
                 "device": "cuda", "path": ".",
             })
@@ -298,11 +301,12 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch):
 
 class InferenceServer:
 
-    def __init__(self):
+    def __init__(self, build_model_fn=None):
         self._incoming = mp.Queue(maxsize=500)
         self._result_qs = {}
         self._model_specs = {}
         self._proc = None
+        self._build_model_fn = build_model_fn
 
     @property
     def incoming_queue(self):
@@ -329,7 +333,7 @@ class InferenceServer:
         self._proc = mp.Process(
             target=_run_server,
             args=(self._incoming, self._result_qs, self._model_specs,
-                  game_name, max_batch),
+                  game_name, max_batch, self._build_model_fn),
             daemon=True,
         )
         self._proc.start()

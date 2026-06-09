@@ -8,7 +8,8 @@ import numpy as np
 import torch
 import pyspiel
 
-from train.model.othello_resnet import Model, OthelloResNet, TrainInput, Losses
+from train.model.othello_resnet import Model, OthelloResNet
+from train.core.types import TrainInput, Losses
 
 CHECKPOINT_DIR = r"C:\Users\shouk\othello_train_v2"
 CHECKPOINT_STEP = 5

@@ -167,6 +167,36 @@ Rare case 触发后会 fork 一个新对局从弱着状态出发，目的是评�
 
 **教训**：温度系统和 fork 机制有隐含耦合。`move_num` 在 fork 对局中从 0 开始，但 fork 对局从残局出发不需要 warm-up 阶段的随机探索。
 
+### 23. 剪枝条件仅依赖 Q 值，忽略 solver outcome
+
+剪枝触发条件只用 `root.q_value >= threshold`，但 solver 已证明必胜时 `root.outcome = [1, -1]` 而 `q_value` 可能因搜索早停远低于 1.0。proven_win 应直接触发剪枝。
+
+**修复**：条件改为 `proven_win or Q >= threshold`。骰子仅在首次达标时掷一次（`pruned["checked"]`），不中后不再重试。
+
+### 24. Rare 触发后耗尽弱着配额
+
+Rare 分支设置 `weak_count = weak_max + 1`，导致该局后续弱着点全部跳过。阈值极低（0.02）时第一发几乎必中 rare → 每局只有一个 rare 进账。
+
+**修复**：rare 改为 `weak_count += 1`，仅 `weak_final` 耗尽配额。
+
+### 25. Policy target 直接用 MCTS visit 分布，忽略 action advantage
+
+MCTS 搜索可能把优势动作埋没在低 visit 中（Q=0.8 但 N=10 的动作只拿到 10% target）。模型学到的是"搜索偏好"而非"真实价值"。
+
+**修复**：新增 advantage mixing — `π'(a) ∝ (1-α)·π_mcts + α·softmax(A/T)`。只作用于 unsolved 状态。α=0.5, T=0.2。封装在 `train/core/policy.py`。
+
+### 26. SQLite buffer 文件体积过大
+
+BLOB 存原始字节，Othello obs 含大量 0，未压缩下 ~7-10× 于 .npz。
+
+**修复**：`_pack`/`_unpack` 加 zlib 压缩，14× 压缩比。旧未压缩 DB 可读（fallback），提供 `_compress_db` 转换脚本。
+
+### 27. 评估参考集随训练不同步
+
+训练早期只有少量 checkpoint，固定间隔里程碑选不到对手。后期里程碑不覆盖全部训练历史。
+
+**修复**：删 `eval_milestone_interval`，改为等分当前训练步数取最近 checkpoint。1 个 best + (N-1) 个等分点。`select_eval_references` 封装。
+
 ---
 
 ## 测试运行

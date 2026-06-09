@@ -4,7 +4,8 @@ import numpy as np
 import torch
 
 from train.core.replay_buffer import ReplayBuffer
-from train.model.othello_resnet import Model, OthelloResNet, TrainInput
+from train.model.othello_resnet import Model, OthelloResNet
+from train.core.types import TrainInput
 
 
 # ── Buffer round-trip ──────────────────────────────────────────────────────

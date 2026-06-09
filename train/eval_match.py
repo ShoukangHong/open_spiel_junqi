@@ -27,23 +27,31 @@ _mcts_bots = {}
 _mcts_evaluators = {}
 
 
-def _game_obj():
+def _get_build_fn(game_name):
+    if game_name == "xiangqi":
+        from train.core.model_builder import build_xiangqi_model
+        return build_xiangqi_model
+    from train.core.model_builder import build_othello_model
+    return build_othello_model
+
+
+def _game_obj(game_name=None):
     global _game
     if _game is None:
-        _game = pyspiel.load_game("othello")
+        _game = pyspiel.load_game(game_name or "othello")
     return _game
 
 
 def _model_for(player_cfg):
     key = (player_cfg["checkpoint_dir"], player_cfg.get("checkpoint_step", 0))
     if key not in _models:
-        game = _game_obj()
         config_path = os.path.join(player_cfg["checkpoint_dir"], "train_config.json")
         with open(config_path) as f:
             tc = json.load(f)
-        from train.core.model_builder import build_othello_model
         tc["path"] = player_cfg["checkpoint_dir"]  # override saved config
-        m = build_othello_model(game, tc)
+        build_fn = _get_build_fn(tc["game"])
+        game = pyspiel.load_game(tc["game"])
+        m = build_fn(game, tc)
         step = player_cfg.get("checkpoint_step", 0)
         if step > 0:
             m.load_checkpoint(step)
@@ -56,7 +64,11 @@ def _model_for(player_cfg):
 def _mcts_for(player_cfg):
     key = id(player_cfg)
     if key not in _mcts_bots:
-        game = _game_obj()
+        # Read game name from train_config.json
+        config_path = os.path.join(player_cfg["checkpoint_dir"], "train_config.json")
+        with open(config_path) as f:
+            tc = json.load(f)
+        game = pyspiel.load_game(tc["game"])
         model = _model_for(player_cfg)
         ev = PyTorchEvaluator(game, model)
         _mcts_evaluators[key] = ev
@@ -210,6 +222,7 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
 
     # Register models that need NN
     model_objs = {}
+    game_name = "othello"  # fallback
     for mid, pcfg in [("m0", cfg0), ("m1", cfg1)]:
         if pcfg["strategy"] not in ("mcts", "model"):
             continue
@@ -217,6 +230,7 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
                                     "train_config.json")
         with open(config_path) as f:
             tc = json.load(f)
+        game_name = tc.get("game", "othello")
         model_objs[mid] = _model_for(pcfg)
         server.register_model(mid, model_objs[mid]._model.state_dict(),
                               tc.get("nn_width", 32), tc.get("nn_depth", 6))
@@ -224,7 +238,7 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
     # Register all actor queues BEFORE start (fork/spawn copies _result_qs)
     actor_rqs = [server.register_actor(i) for i in range(num_actors)]
 
-    server.start("othello", 128)
+    server.start(game_name, 128)
 
     score = {name0: 0, name1: 0, "draw": 0}
     sequences = []
@@ -242,7 +256,7 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
         ge = num_games if w == num_actors - 1 else gs + games_per
         p = mp.Process(target=_eval_actor_process, args=(
             w, gs, ge, cfg0, cfg1, name0, name1, temperature, temp_drop,
-            server.incoming_queue, actor_rqs[w], stats_q))
+            server.incoming_queue, actor_rqs[w], stats_q, game_name))
         p.start()
         procs.append(p)
 
@@ -266,13 +280,13 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
 
 def _eval_actor_process(worker_id, g_start, g_end, cfg0, cfg1,
                         name0, name1, temperature, temp_drop,
-                        incoming_q, result_q, stats_out):
+                        incoming_q, result_q, stats_out, game_name):
     """Actor process body — runs at module level for Windows spawn compatibility."""
     import numpy as np
     import pyspiel
     from train.batch_mcts.shared_evaluator import SharedEvaluator
 
-    game = pyspiel.load_game("othello")
+    game = pyspiel.load_game(game_name)
 
     evals = {}
     for mid, pcfg in [("m0", cfg0), ("m1", cfg1)]:
@@ -363,7 +377,7 @@ def _act_parallel(player_cfg, state, move_num, temperature, temp_drop,
                 uct_c=player_cfg.get("mcts_uct_c", 1.41),
                 policy_epsilon=0, verbose=False)
             _act_parallel._mcts_cache[key] = BatchMCTS(
-                _game_obj(), cfg, shared_eval,
+                pyspiel.load_game(tc["game"]), cfg, shared_eval,
                 random_state=np.random.RandomState(worker_id * 1000))
         mcts = _act_parallel._mcts_cache[key]
         root = mcts.mcts_search(state)
@@ -455,20 +469,20 @@ DEFAULT_TEMP_DROP = 7
 PLAYER = {
     0: {"strategy": "mcts",
         "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_mix",
-        "checkpoint_step": 50,
-        "mcts_simulations": 512, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+        "checkpoint_step": 400,
+        "mcts_simulations": 512, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
     # 1: {"strategy": "mcts", # 早期的benchmark
     #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_argmax", # argmax 240 us benchmark
     #     "checkpoint_step": 240,
     #     "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
-    1: {"strategy": "mcts", # 中期的benchmark
-        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_b",
-        "checkpoint_step": 990,
+    # 1: {"strategy": "mcts", # 中期的benchmark
+    #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_b",
+    #     "checkpoint_step": 990,
+    #     "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+    1: {"strategy": "mcts", # 晚期的benchmark，很强了
+        "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_128",
+        "checkpoint_step": 1500,
         "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
-    # 1: {"strategy": "mcts", # 晚期的benchmark，很强了
-    #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_128",
-    #     "checkpoint_step": 1200,
-    #     "mcts_simulations": 256, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
 }
 
 if __name__ == "__main__":

@@ -5,9 +5,10 @@ import pyspiel
 
 from train.batch_mcts.config import MCTSConfig
 from train.batch_mcts.mcts import BatchMCTS
-from train.train_othello import (
-    _nn_raw_after_move, _try_weak_move, play_game, ReplayBuffer, TrainConfig
-)
+from train.core.replay_buffer import ReplayBuffer
+from train.core.weak_move import nn_raw_after_move, try_weak_move
+from train.games.othello.config import OthelloTrainConfig as TrainConfig
+from train.games.othello.play import play_game
 
 def _cfg(**kw):
     c = TrainConfig()
@@ -64,13 +65,13 @@ class _ControlledEval:
 
 # Test A
 
-def test_nn_raw_after_move():
-    print("Test A: _nn_raw_after_move evaluates post-move state ...", end=" ")
+def testnn_raw_after_move():
+    print("Test A: nn_raw_after_move evaluates post-move state ...", end=" ")
     g = pyspiel.load_game("othello")
     st = g.new_initial_state()
     ev = ZeroEvaluator()
     a = st.legal_actions()[0]
-    r = _nn_raw_after_move(ev, st, a)
+    r = nn_raw_after_move(ev, st, a)
     assert r == 0.0
     print("PASSED")
 
@@ -116,7 +117,7 @@ def _mk_weak_test(game_str, diff_val, threshold, weak_thresh,
                  weak_move_threshold=weak_thresh,
                  weak_move_prob=1.0, game=game_str)
         rng = np.random.RandomState(seed + run)
-        a, tag, wc, rs, _wc = _try_weak_move(
+        a, tag, wc, rs, _wc = try_weak_move(
             m, st.clone(), root, c, weak_count=0,
             weak_max=c.weak_max_per_game, rng=rng)
         tags.append((tag, rs is None, a == ra))
@@ -172,7 +173,7 @@ def test_rare_weak_count_increment():
 
     wc = 1
     for run in range(2):
-        _, tag, wc, rs, _ = _try_weak_move(
+        _, tag, wc, rs, _ = try_weak_move(
             m, st.clone(), root, c, weak_count=wc,
             weak_max=c.weak_max_per_game, rng=np.random.RandomState(run))
         assert wc > 0  # weak_count still alive
@@ -219,7 +220,7 @@ def test_buffer_tags():
 
 def test_perspective():
     print("Test F: perspective alignment ...", end=" ")
-    import train.train_othello as tto
+    import train.core.weak_move as wm
     g = pyspiel.load_game("othello")
     st = g.new_initial_state()
     st.apply_action(19)  # black move, now white to go
@@ -229,20 +230,20 @@ def test_perspective():
     root = m.mcts_search(st)
     c = _cfg(rare_case_threshold=0.9, weak_move_threshold=0.9,
              weak_move_prob=1.0)
-    _orig = tto._nn_raw_after_move
-    tto._nn_raw_after_move = lambda *_: 0.0  # neutral NN value
+    _orig = wm.nn_raw_after_move
+    wm.nn_raw_after_move = lambda *_: 0.0  # neutral NN value
     try:
-        _, tag, _, _, _ = _try_weak_move(
+        _, tag, _, _, _ = try_weak_move(
             m, st, root, c, weak_count=0, weak_max=1)
         assert tag in ("", "weak", "weak_final")  # perspective test: just no crash
     finally:
-        tto._nn_raw_after_move = _orig
+        wm.nn_raw_after_move = _orig
     print("PASSED")
 
 
 def main():
     tests = [
-        test_nn_raw_after_move, test_weak_max_zero, test_weak_branches,
+        testnn_raw_after_move, test_weak_max_zero, test_weak_branches,
         test_rare_weak_count_increment,
         test_fork_no_weak, test_buffer_tags, test_perspective,
     ]
