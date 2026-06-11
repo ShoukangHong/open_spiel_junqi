@@ -93,6 +93,7 @@ def init_training(cfg, game_module, model_builder, ReplayBuffer_class,
         uct_c=cfg.uct_c,
         policy_epsilon=cfg.policy_epsilon,
         policy_alpha=cfg.policy_alpha,
+        draw_penalty=cfg.draw_penalty,
         verbose=False,
     )
 

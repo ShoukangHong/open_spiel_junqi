@@ -36,11 +36,10 @@ class SharedEvaluator:
         return q
 
     def _inference(self, state):
-        value, prior = self._infer_one(state)
+        val, legal, probs = self._infer_one(state)
         policy = np.zeros(self._game.num_distinct_actions(), dtype=np.float32)
-        for a, p in prior:
-            policy[a] = p
-        return value, policy
+        policy[legal] = probs
+        return val, policy
 
     def _infer_one(self, state):
         obs = np.asarray(state.observation_tensor(), dtype=np.float32)
@@ -71,8 +70,11 @@ class SharedEvaluator:
                     raise results
                 break
 
-        values = np.asarray([v for v, _ in results], dtype=np.float32)
-        prior_list = [p for _, p in results]
+        values = np.stack([v for v, _, _ in results])
+        prior_list = [
+            list(zip(legal.astype(int).tolist(), probs.astype(float).tolist()))
+            for _, legal, probs in results
+        ]
         return values, prior_list
 
 
@@ -249,11 +251,10 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
         for actor_id, obs_list, _ in group:
             for j in range(len(obs_list)):
                 idx = cursor + j
-                legal = all_mask[idx].nonzero()[0]
-                prior = [(int(a), float(policies[idx, a]))
-                         for a in legal]
-                actor_results[actor_id].append(
-                    (values[idx].tolist(), prior))  # [w, d, l]
+                legal = all_mask[idx].nonzero()[0].astype(np.int32)
+                probs = policies[idx, legal].astype(np.float32)
+                val = values[idx].astype(np.float32)
+                actor_results[actor_id].append((val, legal, probs))
             cursor += len(obs_list)
         for actor_id, results in actor_results.items():
             result_qs[actor_id].put((actor_id, best_mid, results))

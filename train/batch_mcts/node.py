@@ -24,6 +24,8 @@ class Node:
         outcome: Terminal or proven outcome for all players, or None.
         children: Child Node instances.
     """
+    draw_penalty: float = 0.0  # class-level: penalise draw-heavy branches in PUCT
+
     __slots__ = (
         "action",
         "player",
@@ -99,7 +101,8 @@ class Node:
         n = self.visit_count
         u = uct_c * self.prior * math.sqrt(max(parent_explore_count, 1)) / (n + 1)
         vloss = -virtual_loss * self.virtual_visits / max(n, 1)
-        return self.q_value + u + vloss
+        q = self.q_value - Node.draw_penalty * self.draw_rate
+        return q + u + vloss
 
     # ── Best child ────────────────────────────────────────────────────────
 

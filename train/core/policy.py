@@ -22,7 +22,7 @@ def mix_advantage(visit_policy, root, state, num_actions, alpha,
             max_adv = A
     legal = state.legal_actions()
     T = max(temperature, 0.01)
-    exp_adv = np.exp((adv[legal] - max_adv) / T)
+    exp_adv = np.exp((adv[legal] - max_adv) / T)  # exp_adv = np.exp((adv[legal] - max_adv) / (T * math.sqrt(1 - abs(V)))) 不确定是否有用
     softmax = np.zeros(num_actions, dtype=np.float64)
     for i, a in enumerate(legal):
         softmax[a] = exp_adv[i] / exp_adv.sum()

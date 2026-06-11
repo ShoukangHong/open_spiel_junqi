@@ -17,6 +17,7 @@ from train.core.train_loop import run_training
 from train.core.model_builder import build_xiangqi_model
 from train.games.xiangqi.config import XiangqiTrainConfig
 from train.games.xiangqi.play import play_game
+from train.model.xiangqi_symmetry import XiangqiSymmetry
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -32,7 +33,7 @@ if __name__ == "__main__":
         config_class=XiangqiTrainConfig,
         build_model_fn=build_xiangqi_model,
         play_game_fn=play_game,
-        SymmetryClass=None,  # No symmetry augmentation for xiangqi (10×9 not square)
+        SymmetryClass=XiangqiSymmetry,  # No symmetry augmentation for xiangqi (10×9 not square)
         config_path=args.config,
         fresh=args.fresh,
     )

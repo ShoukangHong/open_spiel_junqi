@@ -191,6 +191,8 @@ class PyTorchEvaluator(BatchEvaluator):
 
         prior_list = []
         for state, policy_arr in zip(states, policies):
+            legal = state.legal_actions()
+            probs = policy_arr[legal]
             prior_list.append(
-                [(a, float(policy_arr[a])) for a in state.legal_actions()])
+                list(zip(legal, probs.astype(float).tolist())))
         return values, prior_list

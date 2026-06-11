@@ -218,11 +218,9 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
     name1 = (f"{s1}" if s1 in ("random", "greedy")
              else f"{s1}(step{st1},{cfg1.get('mcts_simulations', 0)}sim)")
 
-    server = InferenceServer()
-
-    # Register models that need NN
-    model_objs = {}
+    # Read game name from the first NN-based player config
     game_name = "othello"  # fallback
+    model_specs = {}
     for mid, pcfg in [("m0", cfg0), ("m1", cfg1)]:
         if pcfg["strategy"] not in ("mcts", "model"):
             continue
@@ -231,9 +229,13 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
         with open(config_path) as f:
             tc = json.load(f)
         game_name = tc.get("game", "othello")
-        model_objs[mid] = _model_for(pcfg)
-        server.register_model(mid, model_objs[mid]._model.state_dict(),
-                              tc.get("nn_width", 32), tc.get("nn_depth", 6))
+        model_objs = _model_for(pcfg)
+        model_specs[mid] = (model_objs._model.state_dict(),
+                            tc.get("nn_width", 32), tc.get("nn_depth", 6))
+
+    server = InferenceServer(build_model_fn=_get_build_fn(game_name))
+    for mid, (sd, w, d) in model_specs.items():
+        server.register_model(mid, sd, w, d)
 
     # Register all actor queues BEFORE start (fork/spawn copies _result_qs)
     actor_rqs = [server.register_actor(i) for i in range(num_actors)]
@@ -469,8 +471,8 @@ DEFAULT_TEMP_DROP = 7
 PLAYER = {
     0: {"strategy": "mcts",
         "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_mix",
-        "checkpoint_step": 400,
-        "mcts_simulations": 512, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
+        "checkpoint_step": 540,
+        "mcts_simulations": 512, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
     # 1: {"strategy": "mcts", # 早期的benchmark
     #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_argmax", # argmax 240 us benchmark
     #     "checkpoint_step": 240,
@@ -482,7 +484,7 @@ PLAYER = {
     1: {"strategy": "mcts", # 晚期的benchmark，很强了
         "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_128",
         "checkpoint_step": 1500,
-        "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+        "mcts_simulations": 512, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
 }
 
 if __name__ == "__main__":

@@ -10,10 +10,11 @@
     "policy_mix_alpha": 0.0,
     "adv_temperature": 0.2,
 
-    "max_simulations": 64,
+    "max_simulations": 128,
     "mcts_batch_size": 8,
     "inference_batch_size": 128,
     "uct_c": 1.41,
+    "draw_penalty": 0.05,
     "policy_epsilon": 0.25,
     "policy_alpha": 1.0,
     "temperature": 0.01,
@@ -23,7 +24,7 @@
     "buffer_sampling_frac": 0.2,
     "symmetry": 1,
 
-    "num_actors": 1,
+    "num_actors": 20,
     "max_steps": 300,
     "checkpoint_freq": 10,
 

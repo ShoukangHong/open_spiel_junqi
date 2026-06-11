@@ -24,6 +24,7 @@ class BaseTrainConfig:
     mcts_batch_size: int = 32
     inference_batch_size: int = 128  # server-side max batch for shared eval
     uct_c: float = 1.41
+    draw_penalty: float = 0.0   # penalise draw-heavy branches in PUCT selection
     policy_epsilon: float = 0.25
     policy_alpha: float = 1.0
     temperature: float = 0.01

@@ -102,6 +102,26 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
                 logger.log_line(
                     f"[prune] step {move_num} p{cur_player} "
                     f"Q={root.q_value:+.3f} — early win\n{state}")
+            # Record pruned state before exiting
+            obs = np.asarray(state.observation_tensor(), dtype=np.float32)
+            mask = np.asarray(state.legal_actions_mask(), dtype=bool)
+            policy_dict = compute_solved_policy(
+                root.children, cur_player, game.max_utility())
+            policy = np.zeros(game.num_distinct_actions(), dtype=np.float32)
+            for a, p in policy_dict.items():
+                policy[a] = p
+            policy_sum = policy.sum()
+            if policy_sum > 0:
+                policy /= policy_sum
+            else:
+                policy[...] = 1.0 / policy.size
+            if root.outcome is not None:
+                q = root.outcome[cur_player]
+                dr = 1.0 if q == 0 else 0.0
+            else:
+                q = root.q_value
+                dr = root.draw_rate
+            states_info.append((obs, mask, policy, cur_player, "", q, dr))
             break
 
         # Weak-move

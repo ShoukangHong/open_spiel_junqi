@@ -23,7 +23,7 @@ from game_ui.othello_render import (
     obs_to_board, action_label, build_display_data, draw_board)
 
 # ── Config ──────────────────────────────────────────────────────────────────
-BUFFER_FILE = r"C:\Users\shouk\othello_train\cloud_wdl_db\buffer.db"
+BUFFER_FILE = r"C:\Users\shouk\othello_train\cloud_wdl_mix\buffer.db"
 
 
 # ── Side panel ──────────────────────────────────────────────────────────────

@@ -20,7 +20,8 @@ import pygame
 
 from game_ui.core import (
     load_buffer, TagFilter, build_filtered_indices, tag_display,
-    TAG_COLORS, TAG_FILTERS, BLACK, WHITE, GRAY, LIGHT_GRAY, RED, BG, get_font)
+    TAG_COLORS, TAG_FILTERS, BLACK, WHITE, GRAY, LIGHT_GRAY, RED, YELLOW, BG,
+    get_font)
 from game_ui.xiangqi_render import (
     ROWS, COLS, SQ_SIZE, LABEL_MARGIN, BOARD_W, BOARD_H, PANEL_W, PADDING,
     obs_to_board, action_label, action_label_with_piece, build_display_data,
@@ -29,7 +30,7 @@ from game_ui.xiangqi_render import (
     compute_top_moves)
 
 # ── Config ──────────────────────────────────────────────────────────────────
-BUFFER_FILE = r"C:\Users\shouk\Github\open_spiel_junqi\train\xiangqi_train\buffer.db"
+BUFFER_FILE = r"C:\Users\shouk\xiangqi_train\buffer.db"
 
 
 # ── Side panel ──────────────────────────────────────────────────────────────

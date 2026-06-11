@@ -25,6 +25,9 @@ class MCTSConfig:
     temperature: float = 1.0     # Softmax temperature for move selection
     temperature_drop: int = 10   # Move after which to switch to argmax
 
+    # Draw penalty — PUCT Q is discounted by draw_penalty * draw_rate
+    draw_penalty: float = 0.0
+
     # Solver
     solve: bool = True           # Whether to back up proven terminal values
 

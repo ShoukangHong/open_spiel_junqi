@@ -572,6 +572,7 @@ class BatchMCTS:
 
         self._game = game
         self.config = config or MCTSConfig()
+        Node.draw_penalty = self.config.draw_penalty
         self.evaluator = evaluator
         self.max_utility = game.max_utility()
         self._random_state = random_state or np.random.RandomState()

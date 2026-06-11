@@ -327,20 +327,30 @@ def compute_top_moves(policy, mask, top_n=5):
     return moves[:top_n]
 
 
-def draw_move_arrows(screen, moves):
-    """Draw arrows for top policy moves.
+def _arrow_color(rank, total):
+    """Red (rank=0) → yellow (rank=total-1) gradient."""
+    if total <= 1:
+        return (220, 40, 40)
+    t = rank / (total - 1)
+    return (220, int(40 + 180 * t), 40)
 
-    *moves*: list of (from_sq, to_sq, weight) where weight is 0.0–1.0.
+
+_ARROW_WIDTHS = [10, 7, 5, 3, 2]
+
+
+def draw_move_arrows(screen, moves):
+    """Draw arrows for top policy moves — red→yellow gradient by rank.
+
+    *moves*: list of (from_sq, to_sq, weight) sorted by priority.
     """
     if not moves:
         return
     ox = LABEL_MARGIN
-    max_w = max(w for _, _, w in moves) or 1.0
+    n = len(moves)
 
-    for from_sq, to_sq, weight in moves:
+    for rank, (from_sq, to_sq, weight) in enumerate(moves):
         sr, sc = from_sq // COLS, from_sq % COLS
         tr, tc = to_sq // COLS, to_sq % COLS
-        # Skip same-square (shouldn't happen for legal moves)
         if (sr, sc) == (tr, tc):
             continue
 
@@ -349,37 +359,40 @@ def draw_move_arrows(screen, moves):
         x1 = ox + tc * SQ_SIZE + SQ_SIZE // 2
         y1 = tr * SQ_SIZE + SQ_SIZE // 2
 
-        # Offset from source center toward target so arrow doesn't cover the piece
         dx, dy = x1 - x0, y1 - y0
         dist = max((dx**2 + dy**2)**0.5, 1.0)
         ux, uy = dx / dist, dy / dist
-        offset = SQ_SIZE // 2 - 2
-        x0 += ux * offset
-        y0 += uy * offset
+        x0 += ux * 16                          # source gap
+        y0 += uy * 16
+        x1g = x1 - ux * 6                      # line gap before target
+        y1g = y1 - uy * 6
 
-        # Arrowhead lands before target piece center
-        x1 -= ux * offset
-        y1 -= uy * offset
+        width = _ARROW_WIDTHS[min(rank, len(_ARROW_WIDTHS) - 1)]
+        color = _arrow_color(rank, n) + (220,)
 
-        # Color: red=high weight, blue=low; alpha from weight
-        alpha = int(80 + 160 * (weight / max_w))
-        r = int(220 * (weight / max_w))
-        g = 40
-        b = int(220 * (1.0 - weight / max_w))
-        color = (r, g, b, alpha)
-
-        # Draw on a temporary surface for alpha blending
         arrow_surf = pygame.Surface((BOARD_W, BOARD_H), pygame.SRCALPHA)
-        pygame.draw.line(arrow_surf, color, (x0, y0), (x1, y1), max(2, int(5 * weight / max_w)))
+        pygame.draw.line(arrow_surf, color, (x0, y0), (x1g, y1g), width)
 
-        # Arrowhead
-        arrow_len = 10
+        arrow_len = 8 + width * 2
         angle = 0.5
         ax1 = x1 - ux * arrow_len + uy * arrow_len * angle
         ay1 = y1 - uy * arrow_len - ux * arrow_len * angle
         ax2 = x1 - ux * arrow_len - uy * arrow_len * angle
         ay2 = y1 - uy * arrow_len + ux * arrow_len * angle
         pygame.draw.polygon(arrow_surf, color, [(x1, y1), (ax1, ay1), (ax2, ay2)])
+
+        # Probability label at arrow midpoint
+        font = get_font(20 if rank == 0 else 16)
+        mid_x = int(x0 + ux * dist * 0.45)  # offset slightly toward source
+        mid_y = int(y0 + uy * dist * 0.45)
+        label = font.render(f"{weight:.1%}", True, (40, 40, 40))
+        # White outline for readability
+        for dx2, dy2 in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+            outline = font.render(f"{weight:.1%}", True, (255, 255, 255))
+            arrow_surf.blit(outline, (mid_x - outline.get_width()//2 + dx2,
+                                     mid_y - outline.get_height()//2 + dy2))
+        arrow_surf.blit(label, (mid_x - label.get_width()//2,
+                                mid_y - label.get_height()//2))
 
         screen.blit(arrow_surf, (0, 0))
 

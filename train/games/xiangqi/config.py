@@ -12,6 +12,7 @@ class XiangqiTrainConfig(BaseTrainConfig):
     temperature_drop: int = 25     # xiangqi games are long (~100-300 moves)
     max_simulations: int = 128
     mcts_batch_size: int = 8
+    draw_penalty: float = 0.05  # penalise draw-heavy branches in PUCT
 
     # Weak-move exploration
     weak_side_prob: float = 0.0

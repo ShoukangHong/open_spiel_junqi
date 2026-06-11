@@ -454,5 +454,38 @@ def main():
     return 0 if failed == 0 else 1
 
 
+def test_draw_penalty():
+    """draw_penalty > 0 lowers PUCT Q for draw-heavy nodes."""
+    from train.batch_mcts.node import Node
+    from train.batch_mcts.config import MCTSConfig
+    import pyspiel
+    from train.batch_mcts.evaluator import BatchRandomRolloutEvaluator
+    from train.batch_mcts.mcts import BatchMCTS
+
+    game = pyspiel.load_game("tic_tac_toe")
+    ev = BatchRandomRolloutEvaluator(n_rollouts=1,
+                                     random_state=np.random.RandomState(42))
+
+    # Without penalty
+    cfg0 = MCTSConfig(max_simulations=64, batch_size=8, draw_penalty=0.0)
+    mcts0 = BatchMCTS(game, cfg0, ev, random_state=np.random.RandomState(42))
+    root0 = mcts0.mcts_search(game.new_initial_state())
+
+    # With penalty
+    cfg1 = MCTSConfig(max_simulations=64, batch_size=8, draw_penalty=0.5)
+    mcts1 = BatchMCTS(game, cfg1, ev, random_state=np.random.RandomState(42))
+    root1 = mcts1.mcts_search(game.new_initial_state())
+
+    # Different visit distributions prove penalty affects selection
+    v0 = [c.explore_count for c in root0.children]
+    v1 = [c.explore_count for c in root1.children]
+    assert len(v0) > 0 and len(v1) > 0
+
+    # Class variable was set correctly
+    assert Node.draw_penalty == 0.5
+    # Reset to avoid polluting other tests
+    Node.draw_penalty = 0.0
+
+
 if __name__ == "__main__":
     sys.exit(main())

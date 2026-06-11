@@ -19,11 +19,11 @@ from train.core.model_builder import build_othello_model
 
 # ── Config ──────────────────────────────────────────────────────────────────
 CHECKPOINT_DIR = r"C:\Users\shouk\othello_train\cloud_wdl_mix"
-CHECKPOINT_STEP = 125
-MCTS_SIMULATIONS = 4096
-HINT_MAX_SIM = 12800
+CHECKPOINT_STEP = 540
+MCTS_SIMULATIONS = 1024
+HINT_MAX_SIM = 25600
 MCTS_BATCH_SIZE = 16
-UCT_C = 5
+UCT_C = 1.5
 
 WIDTH = BOARD_W
 HEIGHT = BOARD_H

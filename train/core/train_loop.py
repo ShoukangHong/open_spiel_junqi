@@ -95,7 +95,8 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
     mcts_cfg = MCTSConfig(
         max_simulations=cfg.max_simulations, batch_size=cfg.mcts_batch_size,
         uct_c=cfg.uct_c, policy_epsilon=cfg.policy_epsilon,
-        policy_alpha=cfg.policy_alpha, verbose=False)
+        policy_alpha=cfg.policy_alpha,
+        draw_penalty=cfg.draw_penalty, verbose=False)
     mcts_main = BatchMCTS(game, mcts_cfg, ev_main,
                           random_state=np.random.RandomState())
     mcts_best = BatchMCTS(game, mcts_cfg, ev_best,
@@ -175,7 +176,7 @@ def run_training(
         cfg.train_batch_size)
 
     # ── Shared inference server ────────────────────────────────────────────
-    inference_server = InferenceServer()
+    inference_server = InferenceServer(build_model_fn=build_model_fn)
     actors = []
     if cfg.num_actors > 1:
         model.save_checkpoint(_LATEST)
