@@ -547,6 +547,53 @@ def main():
     assert failed == 0
 
 
+def test_shm():
+    """Shared memory path: single + batch inference, various sizes."""
+    import threading
+    from train.batch_mcts.shm import ActorShm
+
+    game = pyspiel.load_game("tic_tac_toe")
+    mm = _MockModel("main", num_actions=9)
+    server = InferenceServer()
+    try:
+        rq = server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9,
+                                   pol_flat=9)
+        specs = {"main": {"model": mm}}
+        shm_name = server.actor_shm_name(0)
+        server._thread = threading.Thread(
+            target=_run_server,
+            args=(server.incoming_queue, server._result_qs, specs,
+                  "tic_tac_toe", 128, None, server._shm_bufs))
+        server._thread.start()
+        time.sleep(0.05)
+
+        actor_shm = ActorShm(shm_name, 8, 27, 9, 9, create=False)
+        ev = SharedEvaluator(game, server.incoming_queue, rq,
+                             actor_id=0, model_id="main", actor_shm=actor_shm)
+        # Single inference
+        s = _make_state([0, 4])
+        v, _ = ev._inference(s)
+        obs = np.asarray(s.observation_tensor(), dtype=np.float32)
+        exp = _expected_wdl("main", 0, obs)
+        assert np.allclose(np.asarray(v), exp, atol=0.01)
+
+        # Batch: 1 state
+        vals1, p1 = ev.batch_inference_raw([_make_state([0])])
+        assert vals1.shape == (1, 3) and len(p1) == 1
+
+        # Batch: 3 states
+        states = [_make_state([]), _make_state([0]), _make_state([0, 4])]
+        vals3, p3 = ev.batch_inference_raw(states)
+        assert vals3.shape == (3, 3) and len(p3) == 3
+
+        # Verify WDL values are valid
+        for val in vals3:
+            assert abs(val.sum() - 1.0) < 0.01
+            assert all(v >= 0 for v in val)
+    finally:
+        _stop_server(server)
+
+
 def test_shared_eval():
     main()
 

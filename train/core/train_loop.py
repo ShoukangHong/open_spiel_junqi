@@ -82,7 +82,7 @@ def _mixed_target(game_ret, q_value, draw_rate, alpha):
 # ── Actor process (multi-actor mode) ────────────────────────────────────────
 
 def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
-                  actor_id, play_game_fn):
+                  actor_id, play_game_fn, shm_name=None):
     """Actor subprocess: self-play loop pushing states to the trainer."""
     try:
         import os as _os
@@ -93,10 +93,17 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
         print(f"[actor-{actor_id}] CPU affinity failed: {_e}", flush=True)
     cfg = config_class(**cfg_dict)
     game = pyspiel.load_game(cfg.game)
+    actor_shm = None
+    if shm_name is not None:
+        obs_flat = int(np.prod(game.observation_tensor_shape()))
+        act_flat = game.num_distinct_actions()
+        from train.batch_mcts.shm import ActorShm
+        actor_shm = ActorShm(shm_name, cfg.mcts_batch_size,
+                             obs_flat, act_flat, act_flat, create=False)
     ev_main = SharedEvaluator(game, incoming_q, result_q, actor_id,
-                              model_id="main")
+                              model_id="main", actor_shm=actor_shm)
     ev_best = SharedEvaluator(game, incoming_q, result_q, actor_id,
-                              model_id="best")
+                              model_id="best", actor_shm=actor_shm)
     mcts_cfg = MCTSConfig(
         max_simulations=cfg.max_simulations, batch_size=cfg.mcts_batch_size,
         uct_c=cfg.uct_c, policy_epsilon=cfg.policy_epsilon,
@@ -189,8 +196,12 @@ def run_training(
         cfg_dict = asdict(cfg)
         cfg_dict["path"] = cfg.path
         incoming_q = inference_server.incoming_queue
+        obs_flat = int(np.prod(game.observation_tensor_shape()))
+        mask_flat = game.num_distinct_actions()
         for i in range(cfg.num_actors):
-            inference_server.register_actor(i)
+            inference_server.register_actor(i, cfg.mcts_batch_size,
+                                            obs_flat, mask_flat,
+                                            mask_flat)
         inference_server.register_model(
             "main", model._model.state_dict(),
             cfg.nn_width, cfg.nn_depth)
@@ -213,10 +224,11 @@ def run_training(
         inference_server.start(cfg.game, cfg.inference_batch_size)
         for i in range(cfg.num_actors):
             result_q = inference_server.result_queue(i)
+            shm_name = inference_server.actor_shm_name(i)
             state_q = mp.Queue(maxsize=200)
             p = mp.Process(target=actor_process,
                            args=(config_class, cfg_dict, incoming_q, result_q,
-                                 state_q, i, play_game_fn),
+                                 state_q, i, play_game_fn, shm_name),
                            name=f"actor-{i}")
             p.start()
             actors.append((p, state_q))

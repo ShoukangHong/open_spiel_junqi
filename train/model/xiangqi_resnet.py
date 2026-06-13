@@ -55,8 +55,10 @@ class XiangqiResNet(nn.Module):
     def _init_weights(self):
         for name, m in self.named_modules():
             if isinstance(m, (nn.Conv2d, nn.Linear)):
-                if name in ("policy_conv", "value_fc2"):
+                if name == "policy_conv":
                     nn.init.uniform_(m.weight, -0.03, 0.03)
+                elif name == "value_fc2":
+                    nn.init.zeros_(m.weight)
                 else:
                     nn.init.kaiming_normal_(m.weight, mode="fan_out",
                                             nonlinearity="relu")

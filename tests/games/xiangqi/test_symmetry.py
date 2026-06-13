@@ -69,25 +69,32 @@ def test_mask_maps_legal_to_legal():
     sym = XiangqiSymmetry()
     game = pyspiel.load_game("xiangqi")
 
-    for _ in range(10):
+    for trial in range(100):
         state = game.new_initial_state()
-        # Apply a few random moves to reach a non-trivial position
         for __ in range(8):
             legal = state.legal_actions()
             if not legal:
                 break
             state.apply_action(np.random.choice(legal))
 
+        if state.is_terminal():
+            continue
         mask = _legal_mask(state)
-        obs = _obs(state)
 
         for k in range(4):
             inv = sym._inv[k]
             new_mask = mask[inv]
-            # Count legal actions should match (augmented state should have
-            # same number of legal moves as original)
-            assert new_mask.sum() == mask.sum(), \
-                f"k={k}: legal count mismatch ({new_mask.sum()} vs {mask.sum()})"
+            if new_mask.sum() != mask.sum():
+                print(f"FAIL trial={trial} k={k}: {new_mask.sum()} vs {mask.sum()}")
+                # Check permutation integrity
+                mapped = set(int(inv[i]) for i in range(NUM_ACTIONS))
+                unmapped = set(range(NUM_ACTIONS)) - mapped
+                dup = len(inv) - len(set(inv))
+                print(f"  inv range: {min(inv)}..{max(inv)}  dup={dup}  missing={len(unmapped)}")
+                print(f"  mask_len={len(mask)}  inv_len={len(inv)}")
+                raise AssertionError(
+                    f"trial={trial} k={k}: {new_mask.sum()} vs {mask.sum()}")
+    print(f"  all 100 trials passed")
 
 
 # ── Value invariance ────────────────────────────────────────────────────────

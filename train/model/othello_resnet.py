@@ -59,8 +59,10 @@ class OthelloResNet(nn.Module):
         """Explicit kaiming init for all conv/linear layers."""
         for name, m in self.named_modules():
             if isinstance(m, (nn.Conv2d, nn.Linear)):
-                if name in ("policy_fc", "value_fc2"):
+                if name == "policy_fc":
                     nn.init.uniform_(m.weight, -0.03, 0.03)
+                elif name == "value_fc2":
+                    nn.init.zeros_(m.weight)
                 else:
                     nn.init.kaiming_normal_(m.weight, mode="fan_out",
                                             nonlinearity="relu")

@@ -1,8 +1,8 @@
 {
   "game": "othello",
 
-  "nn_width": 64,
-  "nn_depth": 12,
+  "nn_width": 32,
+  "nn_depth": 4,
 
   "learning_rate": 0.001,
   "weight_decay": 0.0001,

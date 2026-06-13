@@ -20,19 +20,22 @@ class SharedEvaluator:
     """BatchMCTS-compatible evaluator backed by a shared GPU process."""
 
     def __init__(self, game, incoming_q: mp.Queue, result_q: mp.Queue,
-                 actor_id: int = 0, model_id: str = "main"):
+                 actor_id: int = 0, model_id: str = "main",
+                 actor_shm=None):
         self._game = game
         self._incoming = incoming_q
         self._result = result_q
         self._actor_id = actor_id
         self._model_id = model_id
+        self._shm = actor_shm
+        self._use_shm = actor_shm is not None
 
     def scalar_value(self, state):
         """Return p0-perspective scalar Q from WDL output."""
         value, _ = self._inference(state)
-        q = float(value[0] - value[2])         # w - l from current player view
+        q = float(value[0] - value[2])
         if state.current_player() == 1:
-            q = -q                              # flip to p0 view
+            q = -q
         return q
 
     def _inference(self, state):
@@ -47,13 +50,8 @@ class SharedEvaluator:
         mask = np.asarray(state.legal_actions_mask(), dtype=bool)
         obs_b = obs.reshape(1, -1)
         mask_b = mask.reshape(1, -1)
-        self._incoming.put((self._actor_id, self._model_id, obs_b, mask_b))
-        while True:
-            aid, mid, data = self._result.get()
-            if aid == self._actor_id and mid == self._model_id:
-                if isinstance(data, Exception):
-                    raise data
-                break
+        self._send((obs_b, mask_b))
+        data = self._recv()
         values, priors = self._process_batch(data, mask_b)
         return values[0], priors[0]
 
@@ -68,15 +66,31 @@ class SharedEvaluator:
         obs_b = np.stack(obs_list, axis=0)
         mask_b = np.stack(mask_list, axis=0)
 
-        self._incoming.put((self._actor_id, self._model_id, obs_b, mask_b))
-        while True:
-            aid, mid, data = self._result.get()
-            if aid == self._actor_id and mid == self._model_id:
-                if isinstance(data, Exception):
-                    raise data
-                break
-
+        self._send((obs_b, mask_b))
+        data = self._recv()
         return self._process_batch(data, mask_b)
+
+    def _send(self, batch):
+        obs_b, mask_b = batch
+        if self._use_shm:
+            self._shm.write_input(obs_b, mask_b)
+            self._incoming.put((self._actor_id, self._model_id,
+                                "shm", obs_b.shape[0]))
+        else:
+            self._incoming.put((self._actor_id, self._model_id,
+                                obs_b, mask_b))
+
+    def _recv(self):
+        while True:
+            msg = self._result.get()
+            aid, mid = msg[:2]
+            if aid == self._actor_id and mid == self._model_id:
+                if len(msg) == 2:
+                    return self._shm.read_output()
+                if len(msg) >= 3 and isinstance(msg[2], Exception):
+                    raise msg[2]
+                # legacy: (actor_id, model_id, (policy_logits, value_logits))
+                return msg[2]
 
     def _process_batch(self, data, mask_b):
         """Sparse softmax on actor side — only over legal actions (~40 dims)."""
@@ -104,11 +118,10 @@ _MAX_WAIT = 0.010
 
 
 def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
-               build_model_fn=None):
+               build_model_fn=None, actor_shms=None):
     """GPU inference process with multi-model support.
 
-    *model_specs*: dict model_id → {state_dict, nn_width, nn_depth}
-    *build_model_fn*: callable(game, cfg_kwargs) → Model (default: build_othello_model)
+    *actor_shms*: dict actor_id → ActorShm (optional shared memory buffers).
     """
     import os as _os
 
@@ -174,6 +187,7 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
             m.eval()
             models[mid] = m
 
+    _actor_shms = actor_shms or {}
     _cfg = {"max_batch": max_batch}
     _srv_proc = psutil.Process() if _has_psutil else None
     if _srv_proc:
@@ -209,31 +223,43 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
                 _cfg["max_batch"] = mb
                 continue
 
-            actor_id, model_id, obs_batch, mask_batch = msg
+            # Shm-mode message: (actor_id, model_id, "shm", n_states)
+            if len(msg) == 4 and isinstance(msg[2], str) and msg[2] == "shm":
+                actor_id, model_id, _, n_states = msg
+                is_shm = True
+            else:
+                actor_id, model_id, obs_batch, mask_batch = msg
+                is_shm = False
             if model_id not in models:
                 if actor_id in result_qs:
                     result_qs[actor_id].put(
                         (actor_id, model_id,
                          RuntimeError(f"unknown model_id: {model_id}")))
                 continue
-            pending[model_id].append(
-                (time.time(), actor_id, obs_batch, mask_batch))
+            if is_shm:
+                pending[model_id].append(
+                    (time.time(), actor_id, None, None, n_states))
+            else:
+                pending[model_id].append(
+                    (time.time(), actor_id, obs_batch, mask_batch, None))
+
+        def _req_n(req):
+            return req[4] if req[4] is not None else len(req[2])
 
         # ── Batching: wait for more requests if batch isn't full ────────
-        total_states = sum(
-            sum(len(r[2]) for r in reqs) for reqs in pending.values())
+        total_pending = sum(
+            sum(_req_n(r) for r in reqs) for reqs in pending.values())
         oldest_arrival = min(
             (r[0] for reqs in pending.values() for r in reqs),
             default=time.time())
         oldest_ms = (time.time() - oldest_arrival) * 1000
 
-        # Only process when: batch full OR oldest request has waited enough
-        BATCH_WAIT_MS = 2.0   # max time to wait for batching
-        if total_states < _cfg["max_batch"] and oldest_ms < BATCH_WAIT_MS:
+        BATCH_WAIT_MS = 2.0
+        if total_pending < _cfg["max_batch"] and oldest_ms < BATCH_WAIT_MS:
             time.sleep(0.0005)
             continue
 
-        if total_states == 0:
+        if total_pending == 0:
             time.sleep(0.001)
             continue
 
@@ -245,8 +271,8 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
             if not reqs:
                 continue
             wait_ms = (now - reqs[0][0]) * 1000
-            n_states = sum(len(r[2]) for r in reqs)  # obs_batch.shape[0]
-            fill = min(n_states / _cfg["max_batch"], 1.0)
+            n_s = sum(_req_n(r) for r in reqs)
+            fill = min(n_s / _cfg["max_batch"], 1.0)
             score = wait_ms * (fill ** 0.5)
             if score > best_score:
                 best_score = score
@@ -257,10 +283,11 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
         total_states = 0
         kept = []
         for req in pending[best_mid]:
-            _, actor_id, obs_batch, mask_batch = req
-            n = len(obs_batch)
-            if total_states + n <= _cfg["max_batch"]:
-                group.append((actor_id, obs_batch, mask_batch))
+            _, actor_id, obs_batch, mask_batch, n_shm = req
+            n = n_shm if n_shm is not None else len(obs_batch)
+            can_take = total_states + n <= _cfg["max_batch"]
+            if can_take:
+                group.append((actor_id, obs_batch, mask_batch, n_shm))
                 total_states += n
             else:
                 kept.append(req)
@@ -274,8 +301,20 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
         model = models[best_mid]
 
         concat_t0 = time.time()
-        all_obs = np.concatenate([o for _, o, _ in group], axis=0)
-        all_mask = np.concatenate([m for _, _, m in group], axis=0)
+        # Read shm batches, build obs_batch/mask_batch from shm if needed
+        resolved = []
+        for actor_id, obs_batch, mask_batch, n_shm in group:
+            if n_shm is not None:
+                shm_buf = _actor_shms.get(actor_id)
+                obs_b, mask_b = shm_buf.read_input() if shm_buf else (None, None)
+                resolved.append((actor_id, obs_b, mask_b, n_shm, True))
+            else:
+                resolved.append((actor_id, obs_batch, mask_batch,
+                                 len(obs_batch), False))
+        all_obs = np.concatenate([o if isinstance(o, np.ndarray) else np.stack(o, axis=0)
+                                   for _, o, _, _, _ in resolved], axis=0)
+        all_mask = np.concatenate([m if isinstance(m, np.ndarray) else np.stack(m, axis=0)
+                                    for _, _, m, _, _ in resolved], axis=0)
         concat_ms = (time.time() - concat_t0) * 1000
 
         fwd_t0 = time.time()
@@ -284,12 +323,17 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
 
         scatter_t0 = time.time()
         cursor = 0
-        for actor_id, obs_batch, _ in group:
-            n = len(obs_batch)
-            result_qs[actor_id].put((
-                actor_id, best_mid,
-                (policy_logits[cursor:cursor + n],
-                 value_logits[cursor:cursor + n])))
+        for actor_id, _, _, n, is_shm in resolved:
+            pl = policy_logits[cursor:cursor + n]
+            vl = value_logits[cursor:cursor + n]
+            if is_shm:
+                shm_buf = _actor_shms.get(actor_id)
+                if shm_buf:
+                    shm_buf.write_output(pl, vl)
+                result_qs[actor_id].put((actor_id, best_mid))
+            else:
+                result_qs[actor_id].put(
+                    (actor_id, best_mid, (pl, vl)))
             cursor += n
         scatter_ms = (time.time() - scatter_t0) * 1000
 
@@ -374,15 +418,30 @@ class InferenceServer:
         self._model_specs = {}
         self._proc = None
         self._build_model_fn = build_model_fn
+        self._shm_bufs = {}    # actor_id → ActorShm
+        self._shm_names = {}   # actor_id → name (for actor to open)
 
     @property
     def incoming_queue(self):
         return self._incoming
 
-    def register_actor(self, actor_id: int):
+    def register_actor(self, actor_id: int, max_states: int = 16,
+                       obs_flat: int = 1530, mask_flat: int = 8100,
+                       pol_flat: int = 8100):
         q = mp.Queue(maxsize=100)
         self._result_qs[actor_id] = q
-        return q
+        # Create shared-memory buffer (unique name: pid + timestamp)
+        from train.batch_mcts.shm import ActorShm
+        import os as _os, time as _time
+        name = f"jq_{_os.getpid()}_{int(_time.monotonic()*1e6)}_{actor_id}"
+        shm = ActorShm(name, max_states, obs_flat, mask_flat, pol_flat,
+                       create=True)
+        self._shm_bufs[actor_id] = shm
+        self._shm_names[actor_id] = name
+        return q  # keep backward compat
+
+    def actor_shm_name(self, actor_id: int):
+        return self._shm_names.get(actor_id)
 
     def result_queue(self, actor_id: int):
         return self._result_qs[actor_id]
@@ -400,10 +459,22 @@ class InferenceServer:
         self._proc = mp.Process(
             target=_run_server,
             args=(self._incoming, self._result_qs, self._model_specs,
-                  game_name, max_batch, self._build_model_fn),
+                  game_name, max_batch, self._build_model_fn,
+                  self._shm_bufs),
             daemon=True,
         )
         self._proc.start()
+
+    def shutdown(self):
+        """Clean up shared memory buffers."""
+        for shm in self._shm_bufs.values():
+            try:
+                shm.close()
+                shm.unlink()
+            except Exception:
+                pass
+        self._shm_bufs.clear()
+        self._shm_names.clear()
 
     def update_weights(self, model_id: str, state_dict, max_batch):
         self._incoming.put((model_id, state_dict, max_batch))
