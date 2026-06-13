@@ -54,23 +54,28 @@ class BoardData:
 
     pieces: dict {(row, col): (player, piece_type)} — only occupied cells.
     cur_player: 0 (Red) or 1 (Black).
-    num_distinct_actions: 8100 for xiangqi.
+    move_norm: normalised move number (0..1).
+    msc_norm: normalised moves since capture (0..1).
     """
-    __slots__ = ("pieces", "cur_player")
+    __slots__ = ("pieces", "cur_player", "move_norm", "msc_norm")
 
-    def __init__(self, pieces=None, cur_player=0):
+    def __init__(self, pieces=None, cur_player=0,
+                 move_norm=0.0, msc_norm=0.0):
         self.pieces = pieces or {}
         self.cur_player = cur_player
+        self.move_norm = move_norm
+        self.msc_norm = msc_norm
 
 
 # ── Observation parsing ─────────────────────────────────────────────────────
 
 def obs_to_board(obs):
-    """Convert [15, 10, 9] observation to BoardData.
+    """Convert [17, 10, 9] observation to BoardData.
 
-    Planes 0-6: Red pieces, planes 7-13: Black pieces, plane 14: player-to-move.
+    Planes 0-6: Red, 7-13: Black, 14: player-to-move,
+    15: move_number/kMaxGameLength, 16: moves_since_capture/kMaxNoCapture.
     """
-    obs = np.asarray(obs, dtype=np.float32).reshape(15, ROWS, COLS)
+    obs = np.asarray(obs, dtype=np.float32).reshape(17, ROWS, COLS)
     cur_player = 0 if obs[14, 0, 0] == 1.0 else 1
     pieces = {}
     for player in (0, 1):
@@ -80,7 +85,10 @@ def obs_to_board(obs):
             rows, cols = np.where(obs[plane] > 0.5)
             for r, c in zip(rows, cols):
                 pieces[(int(r), int(c))] = (player, ptype)
-    return BoardData(pieces=pieces, cur_player=cur_player)
+    move_norm = float(obs[15, 0, 0])
+    msc_norm = float(obs[16, 0, 0])
+    return BoardData(pieces=pieces, cur_player=cur_player,
+                     move_norm=move_norm, msc_norm=msc_norm)
 
 
 # ── Action labels ───────────────────────────────────────────────────────────
@@ -296,12 +304,25 @@ def draw_legal_dots(screen, legal_targets):
         pygame.draw.circle(screen, GREEN, (cx, cy), 6)
 
 
-def hint_arrows(actions, visits, top_n=5):
-    """Convert MCTS hint data to arrow list. Returns [(from_sq, to_sq, weight), ...]."""
+def hint_arrows(actions, visits, root=None, top_n=5):
+    """Convert MCTS hint data to arrow list.
+
+    If root is given, uses solved-aware policy; otherwise visit proportions.
+    Returns [(from_sq, to_sq, weight, n_visits), ...].
+    """
     if not actions:
         return []
-    total = sum(visits) or 1
-    moves = [(a // 90, a % 90, float(v / total)) for a, v in zip(actions, visits)]
+    if root is not None:
+        from train.batch_mcts.mcts import compute_solved_policy
+        policy = compute_solved_policy(root.children, root.player, 1.0)
+        # Build n_visits lookup
+        n_map = {c.action: c.explore_count for c in root.children}
+        moves = [(a // 90, a % 90, float(policy.get(a, 0)), n_map.get(a, 0))
+                 for a in actions]
+    else:
+        total = sum(visits) or 1
+        moves = [(a // 90, a % 90, float(v / total), v)
+                 for a, v in zip(actions, visits)]
     moves.sort(key=lambda x: -x[2])
     return moves[:top_n]
 
@@ -348,7 +369,9 @@ def draw_move_arrows(screen, moves):
     ox = LABEL_MARGIN
     n = len(moves)
 
-    for rank, (from_sq, to_sq, weight) in enumerate(moves):
+    for rank, tup in enumerate(moves):
+        from_sq, to_sq, weight = tup[:3]
+        n_visits = tup[3] if len(tup) > 3 else 0
         sr, sc = from_sq // COLS, from_sq % COLS
         tr, tc = to_sq // COLS, to_sq % COLS
         if (sr, sc) == (tr, tc):
@@ -383,12 +406,12 @@ def draw_move_arrows(screen, moves):
 
         # Probability label at arrow midpoint
         font = get_font(20 if rank == 0 else 16)
-        mid_x = int(x0 + ux * dist * 0.45)  # offset slightly toward source
+        mid_x = int(x0 + ux * dist * 0.45)
         mid_y = int(y0 + uy * dist * 0.45)
-        label = font.render(f"{weight:.1%}", True, (40, 40, 40))
-        # White outline for readability
+        text = f"{weight:.1%}" + (f" N={n_visits}" if n_visits > 0 else "")
+        label = font.render(text, True, (40, 40, 40))
         for dx2, dy2 in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            outline = font.render(f"{weight:.1%}", True, (255, 255, 255))
+            outline = font.render(text, True, (255, 255, 255))
             arrow_surf.blit(outline, (mid_x - outline.get_width()//2 + dx2,
                                      mid_y - outline.get_height()//2 + dy2))
         arrow_surf.blit(label, (mid_x - label.get_width()//2,
@@ -477,6 +500,8 @@ def build_display_data(board_data, policy, legal_mask, value, tag, cur_player):
     d = {}
     d["pieces"] = board_data.pieces
     d["cur_player"] = cur_player
+    d["move_norm"] = getattr(board_data, 'move_norm', 0.0)
+    d["msc_norm"] = getattr(board_data, 'msc_norm', 0.0)
     d["src_probs"] = compute_source_probs(policy) if policy is not None else {}
 
     v = np.asarray(value, dtype=np.float32).ravel()

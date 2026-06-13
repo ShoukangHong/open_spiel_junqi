@@ -64,6 +64,9 @@ class Model:
                         legals_masks: np.ndarray) -> tuple:
         return self._model.batch_inference(observations, legals_masks)
 
+    def batch_forward_raw(self, observations: np.ndarray) -> np.ndarray:
+        return self._model.batch_forward_raw(observations)
+
     def update(self, batch: TrainInput) -> Losses:
         self._model.train()
 

@@ -36,21 +36,26 @@ class SharedEvaluator:
         return q
 
     def _inference(self, state):
-        val, legal, probs = self._infer_one(state)
+        val, prior = self._infer_one(state)
         policy = np.zeros(self._game.num_distinct_actions(), dtype=np.float32)
-        policy[legal] = probs
+        for a, p in prior:
+            policy[a] = p
         return val, policy
 
     def _infer_one(self, state):
         obs = np.asarray(state.observation_tensor(), dtype=np.float32)
         mask = np.asarray(state.legal_actions_mask(), dtype=bool)
-        self._incoming.put((self._actor_id, self._model_id, [obs], [mask]))
+        obs_b = obs.reshape(1, -1)
+        mask_b = mask.reshape(1, -1)
+        self._incoming.put((self._actor_id, self._model_id, obs_b, mask_b))
         while True:
-            aid, mid, results = self._result.get()
+            aid, mid, data = self._result.get()
             if aid == self._actor_id and mid == self._model_id:
-                if isinstance(results, Exception):
-                    raise results
-                return results[0]
+                if isinstance(data, Exception):
+                    raise data
+                break
+        values, priors = self._process_batch(data, mask_b)
+        return values[0], priors[0]
 
     def batch_inference_raw(self, states):
         if not states:
@@ -60,21 +65,36 @@ class SharedEvaluator:
                     for s in states]
         mask_list = [np.asarray(s.legal_actions_mask(), dtype=bool)
                      for s in states]
+        obs_b = np.stack(obs_list, axis=0)
+        mask_b = np.stack(mask_list, axis=0)
 
-        self._incoming.put((self._actor_id, self._model_id,
-                            obs_list, mask_list))
+        self._incoming.put((self._actor_id, self._model_id, obs_b, mask_b))
         while True:
-            aid, mid, results = self._result.get()
+            aid, mid, data = self._result.get()
             if aid == self._actor_id and mid == self._model_id:
-                if isinstance(results, Exception):
-                    raise results
+                if isinstance(data, Exception):
+                    raise data
                 break
 
-        values = np.stack([v for v, _, _ in results])
-        prior_list = [
-            list(zip(legal.astype(int).tolist(), probs.astype(float).tolist()))
-            for _, legal, probs in results
-        ]
+        return self._process_batch(data, mask_b)
+
+    def _process_batch(self, data, mask_b):
+        """Sparse softmax on actor side — only over legal actions (~40 dims)."""
+        policy_logits, value_logits = data
+        n = len(policy_logits)
+        values = np.empty((n, 3), dtype=np.float32)
+        prior_list = []
+        for i in range(n):
+            legal = mask_b[i].nonzero()[0]
+            pl = policy_logits[i, legal]
+            pl = np.clip(pl, -30, 30)
+            pl = np.exp(pl - pl.max())
+            probs = (pl / pl.sum()).astype(np.float32)
+            prior_list.append(
+                list(zip(legal.astype(int).tolist(), probs.astype(float).tolist())))
+            vl = value_logits[i]
+            vl = np.exp(vl - vl.max())
+            values[i] = vl / vl.sum()
         return values, prior_list
 
 
@@ -104,11 +124,12 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
         pass  # non-root — try CPU affinity fallback
 
     try:
-        allowed = sorted(_os.sched_getaffinity(0))  # respects cgroup cpuset
+        allowed = sorted(_os.sched_getaffinity(0))
         if len(allowed) >= 4:
-            reserved = {allowed[-1]}  # pin to 1 dedicated core
-            _os.sched_setaffinity(0, reserved)
-            print(f"[inference-server] CPU affinity: core {allowed[-1]} "
+            # Pin to different core based on process ID to avoid collisions
+            core = allowed[-(1 + (_os.getpid() % min(4, len(allowed) - 1)))]
+            _os.sched_setaffinity(0, {core})
+            print(f"[inference-server] CPU affinity: core {core} "
                   f"(of {len(allowed)} available)", flush=True)
     except Exception as _e:
         print(f"[inference-server] CPU affinity failed: {_e}", flush=True)
@@ -154,13 +175,16 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
             models[mid] = m
 
     _cfg = {"max_batch": max_batch}
+    _srv_proc = psutil.Process() if _has_psutil else None
+    if _srv_proc:
+        _srv_proc.cpu_percent()  # warmup: first call returns 0
     int_batches = 0
     int_states = 0
     int_fwd_ms = 0.0
     int_collect_ms = 0.0
     int_scatter_ms = 0.0
     last_report = time.time()
-    report_interval = 60.0  # seconds, doubles each report up to 32 min
+    report_interval = 15.0  # seconds, doubles each report up to 32 min
 
     # Per-model pending queues with arrival timestamps
     from collections import defaultdict
@@ -185,7 +209,7 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
                 _cfg["max_batch"] = mb
                 continue
 
-            actor_id, model_id, obs_list, mask_list = msg
+            actor_id, model_id, obs_batch, mask_batch = msg
             if model_id not in models:
                 if actor_id in result_qs:
                     result_qs[actor_id].put(
@@ -193,13 +217,27 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
                          RuntimeError(f"unknown model_id: {model_id}")))
                 continue
             pending[model_id].append(
-                (time.time(), actor_id, obs_list, mask_list))
+                (time.time(), actor_id, obs_batch, mask_batch))
 
-        # ── Pick model by score: wait_time * sqrt(fill_ratio) ─────────
-        if not any(pending.values()):
+        # ── Batching: wait for more requests if batch isn't full ────────
+        total_states = sum(
+            sum(len(r[2]) for r in reqs) for reqs in pending.values())
+        oldest_arrival = min(
+            (r[0] for reqs in pending.values() for r in reqs),
+            default=time.time())
+        oldest_ms = (time.time() - oldest_arrival) * 1000
+
+        # Only process when: batch full OR oldest request has waited enough
+        BATCH_WAIT_MS = 2.0   # max time to wait for batching
+        if total_states < _cfg["max_batch"] and oldest_ms < BATCH_WAIT_MS:
+            time.sleep(0.0005)
+            continue
+
+        if total_states == 0:
             time.sleep(0.001)
             continue
 
+        # ── Pick model ──────────────────────────────────────────────────
         now = time.time()
         best_score = -1.0
         best_mid = None
@@ -207,7 +245,7 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
             if not reqs:
                 continue
             wait_ms = (now - reqs[0][0]) * 1000
-            n_states = sum(len(r[2]) for r in reqs)
+            n_states = sum(len(r[2]) for r in reqs)  # obs_batch.shape[0]
             fill = min(n_states / _cfg["max_batch"], 1.0)
             score = wait_ms * (fill ** 0.5)
             if score > best_score:
@@ -219,10 +257,11 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
         total_states = 0
         kept = []
         for req in pending[best_mid]:
-            _, actor_id, obs_list, mask_list = req
-            if total_states + len(obs_list) <= _cfg["max_batch"]:
-                group.append((actor_id, obs_list, mask_list))
-                total_states += len(obs_list)
+            _, actor_id, obs_batch, mask_batch = req
+            n = len(obs_batch)
+            if total_states + n <= _cfg["max_batch"]:
+                group.append((actor_id, obs_batch, mask_batch))
+                total_states += n
             else:
                 kept.append(req)
         pending[best_mid] = kept
@@ -231,33 +270,27 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
             time.sleep(0.001)
             continue
 
-        # ── Forward for this model ─────────────────────────────────────
+        # ── Forward for this model ────────────────────────────────────
         model = models[best_mid]
 
         concat_t0 = time.time()
-        all_obs = np.concatenate([np.stack(o, axis=0)
-                                   for _, o, _ in group], axis=0)
-        all_mask = np.concatenate([np.stack(m, axis=0)
-                                    for _, _, m in group], axis=0)
+        all_obs = np.concatenate([o for _, o, _ in group], axis=0)
+        all_mask = np.concatenate([m for _, _, m in group], axis=0)
         concat_ms = (time.time() - concat_t0) * 1000
 
         fwd_t0 = time.time()
-        values, policies = model.batch_inference(all_obs, all_mask)
+        policy_logits, value_logits = model.batch_forward_raw(all_obs)
         fwd_ms = (time.time() - fwd_t0) * 1000
 
         scatter_t0 = time.time()
-        actor_results = {aid: [] for aid, _, _ in group}
         cursor = 0
-        for actor_id, obs_list, _ in group:
-            for j in range(len(obs_list)):
-                idx = cursor + j
-                legal = all_mask[idx].nonzero()[0].astype(np.int32)
-                probs = policies[idx, legal].astype(np.float32)
-                val = values[idx].astype(np.float32)
-                actor_results[actor_id].append((val, legal, probs))
-            cursor += len(obs_list)
-        for actor_id, results in actor_results.items():
-            result_qs[actor_id].put((actor_id, best_mid, results))
+        for actor_id, obs_batch, _ in group:
+            n = len(obs_batch)
+            result_qs[actor_id].put((
+                actor_id, best_mid,
+                (policy_logits[cursor:cursor + n],
+                 value_logits[cursor:cursor + n])))
+            cursor += n
         scatter_ms = (time.time() - scatter_t0) * 1000
 
         int_batches += 1
@@ -277,9 +310,42 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
                 vram = torch.cuda.memory_allocated() / (1024 ** 3)
                 hw += f"  gpu={util.gpu}% vram={vram:.1f}GB"
             if _has_psutil:
-                cpu = psutil.cpu_percent()
-                mem = psutil.virtual_memory().percent
-                hw += f"  cpu={cpu}% mem={mem}%"
+                srv_cpu = _srv_proc.cpu_percent() or 0.0
+                # Collect + cache actor Process objects (lazy, first report)
+                if "_actor_procs" not in _cfg:
+                    _cfg["_actor_procs"] = []
+                    _cfg["_actor_pids"] = set()
+                    try:
+                        for sib in _srv_proc.parent().children():
+                            if sib.pid != _srv_proc.pid:
+                                sib.cpu_percent()  # warmup
+                                _cfg["_actor_procs"].append(sib)
+                                _cfg["_actor_pids"].add(sib.pid)
+                    except Exception:
+                        pass
+                else:
+                    # Remove dead actors, add new ones
+                    try:
+                        cur_pids = {c.pid for c in _srv_proc.parent().children()
+                                    if c.pid != _srv_proc.pid}
+                        new = cur_pids - _cfg["_actor_pids"]
+                        for sib in _srv_proc.parent().children():
+                            if sib.pid in new:
+                                sib.cpu_percent()
+                                _cfg["_actor_procs"].append(sib)
+                                _cfg["_actor_pids"].add(sib.pid)
+                        _cfg["_actor_procs"] = [p for p in _cfg["_actor_procs"]
+                                                if p.pid in cur_pids]
+                        _cfg["_actor_pids"] &= cur_pids
+                    except Exception:
+                        pass
+                act_cpu = sum(
+                    (p.cpu_percent() or 0.0) for p in _cfg["_actor_procs"]
+                )
+                act_count = len(_cfg["_actor_procs"])
+                hw += (f"  cpu_srv={srv_cpu:.0f}%"
+                       f"  cpu_act={act_cpu:.0f}%(@{act_count})"
+                       f"  mem={psutil.virtual_memory().percent}%")
             print(f"[inference-server] batches={int_batches}  "
                   f"states={int_states}  "
                   f"avg_batch={int_states/n:.1f}  "

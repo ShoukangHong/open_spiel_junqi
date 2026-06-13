@@ -215,5 +215,32 @@ def main():
     assert failed == 0
 
 
+def test_db_rotate():
+    """DB rotates to a new file when max_db_rows is reached."""
+    import numpy as np, glob
+    base = _tempfile.mktemp(suffix=".db")
+    buf = ReplayBuffer(max_size=10, db_path=base, max_db_rows=50)
+    obs = np.zeros(4 * 8 * 8, dtype=np.float32)
+    mask = np.ones(65, dtype=bool)
+    pol = np.ones(65, dtype=np.float32) / 65
+    val = np.array([0.5, 0.3, 0.2], dtype=np.float32)
+
+    for i in range(60):
+        buf.append(obs, mask, pol, val, step=1)
+    buf.flush()
+
+    # Current DB has <= 50 rows
+    cur = buf._conn.execute("SELECT COUNT(*) FROM states")
+    assert cur.fetchone()[0] <= 50
+
+    # Old file exists with remaining rows
+    rotated = glob.glob(base.replace(".db", "_*.db"))
+    assert len(rotated) >= 1
+
+    buf.close()
+    for f in [base] + rotated:
+        _os.remove(f)
+
+
 if __name__ == "__main__":
     main()

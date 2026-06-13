@@ -23,9 +23,14 @@ from dataclasses import asdict
 if mp.get_start_method(allow_none=True) is None:
     mp.set_start_method("spawn")
 
+# Pin BLAS to single-thread before numpy/torch import (actors re-import this module)
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import numpy as np
 import pyspiel
 import torch
+torch.set_num_threads(1)
 
 from train.batch_mcts.config import MCTSConfig
 from train.batch_mcts.evaluator import PyTorchEvaluator
@@ -120,7 +125,8 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
             init_state=init_state, allow_weak=allow_weak)
         for rs in rare_games:
             pending.append((rs, False, "rare", use_best))
-        if tag_override == "rare" and init_state is not None:
+        if (tag_override == "rare" and init_state is not None
+                and not init_state.is_terminal()):
             weak_player = 1 - init_state.current_player()
             if returns[weak_player] > 0:
                 tag_override = "rare_flip"
@@ -278,6 +284,7 @@ def run_training(
                         pending.append((rs, False, "rare", use_best))
 
                     if (tag_override == "rare" and init_state is not None
+                            and not init_state.is_terminal()
                             and returns[1 - init_state.current_player()] > 0):
                         tag_override = "rare_flip"
                         wstats["rare_flip"] = wstats.get("rare_flip", 0) + 1

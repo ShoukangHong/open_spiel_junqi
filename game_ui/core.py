@@ -271,7 +271,7 @@ def print_mcts_info(root, state, evaluator=None, action_label_fn=None):
     total_visits = sum(c.explore_count for c in root.children)
 
     BAR_W = 30
-    for a, mcts_n, mcts_v, mcts_solved, nn_p in rows[:12]:
+    for a, mcts_n, mcts_v, mcts_solved, nn_p in rows:
         mcts_p = mcts_n / max(total_visits, 1)
         nn_bar = "█" * int(nn_p * BAR_W) if nn_p > 0.001 else ""
         mcts_bar = "█" * int(mcts_p * BAR_W) if mcts_n > 0 else ""
@@ -290,46 +290,60 @@ def _unpack_blob(raw, dtype):
         return np.frombuffer(raw, dtype=dtype)
 
 
+class LazyBufferReader:
+    """On-demand buffer access — only loads rows when needed, not all at startup."""
+
+    def __init__(self, path):
+        if path.endswith(".db"):
+            self._init_db(path)
+        else:
+            self._init_npz(path)
+
+    def _init_npz(self, path):
+        self._conn = None
+        self._data = np.load(path, allow_pickle=True)
+        self.total = len(self._data["values"])
+        if "tags" in self._data:
+            self.tags = np.asarray(self._data["tags"], dtype=str)
+        else:
+            self.tags = None
+
+    def _init_db(self, path):
+        self._conn = sqlite3.connect(path)
+        self._data = None
+        cur = self._conn.execute("SELECT COUNT(*) FROM states")
+        self.total = cur.fetchone()[0]
+        # Load only tags (small, needed for filtering)
+        cur = self._conn.execute("SELECT tag FROM states ORDER BY id")
+        self.tags = np.array([r[0] for r in cur.fetchall()], dtype=object)
+
+    def read(self, idx):
+        """Read one sample by index. Returns (obs, mask, policy, value, tag)."""
+        if self._conn is not None:
+            cur = self._conn.execute(
+                "SELECT obs, mask, policy, value, tag FROM states "
+                "ORDER BY id LIMIT 1 OFFSET ?", (int(idx),))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            obs = _unpack_blob(row[0], np.float32)
+            mask = _unpack_blob(row[1], bool)
+            policy = _unpack_blob(row[2], np.float32)
+            value = _unpack_blob(row[3], np.float32)
+            return obs, mask, policy, value, row[4]
+        else:
+            return (self._data["obs"][idx], self._data["masks"][idx],
+                    self._data["policies"][idx], self._data["values"][idx],
+                    self.tags[idx] if self.tags is not None else None)
+
+    def close(self):
+        if self._conn:
+            self._conn.close()
+
+
 def load_buffer(path):
-    """Load replay buffer from .npz or .db.  Returns (obs, masks, policies, values, tags)."""
-    if path.endswith(".db"):
-        return _load_buffer_db(path)
-    return _load_buffer_npz(path)
-
-
-def _load_buffer_npz(path):
-    data = np.load(path, allow_pickle=True)
-    tags = None
-    if "tags" in data:
-        tags = np.asarray(data["tags"], dtype=str)
-    return data["obs"], data["masks"], data["policies"], data["values"], tags
-
-
-def _load_buffer_db(db_path):
-    conn = sqlite3.connect(db_path)
-    cur = conn.execute(
-        "SELECT obs, mask, policy, value, tag FROM states ORDER BY id")
-    rows = cur.fetchall()
-    n = len(rows)
-    if n == 0:
-        conn.close()
-        return None, None, None, None, None
-    first_obs = _unpack_blob(rows[0][0], np.float32)
-    first_mask = _unpack_blob(rows[0][1], bool)
-    first_pol = _unpack_blob(rows[0][2], np.float32)
-    obs_arr = np.empty((n, *first_obs.shape), dtype=np.float32)
-    mask_arr = np.empty((n, *first_mask.shape), dtype=bool)
-    pol_arr = np.empty((n, *first_pol.shape), dtype=np.float32)
-    val_arr = np.empty((n, 3), dtype=np.float32)
-    tag_arr = np.empty((n,), dtype=object)
-    for i, (obs_b, mask_b, pol_b, val_b, tag) in enumerate(rows):
-        obs_arr[i] = _unpack_blob(obs_b, np.float32)
-        mask_arr[i] = _unpack_blob(mask_b, bool)
-        pol_arr[i] = _unpack_blob(pol_b, np.float32)
-        val_arr[i] = _unpack_blob(val_b, np.float32)
-        tag_arr[i] = tag
-    conn.close()
-    return obs_arr, mask_arr, pol_arr, val_arr, tag_arr
+    """Load replay buffer — fast path using LazyBufferReader."""
+    return LazyBufferReader(path)
 
 
 # ── Tag utilities ───────────────────────────────────────────────────────────

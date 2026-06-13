@@ -30,7 +30,7 @@ from game_ui.xiangqi_render import (
     compute_top_moves)
 
 # ── Config ──────────────────────────────────────────────────────────────────
-BUFFER_FILE = r"C:\Users\shouk\xiangqi_train\buffer.db"
+BUFFER_FILE = r"C:\Users\shouk\xiangqi_train\cloud\buffer.db"
 
 
 # ── Side panel ──────────────────────────────────────────────────────────────
@@ -58,7 +58,10 @@ def draw_side_panel(screen, index, total, global_idx, tag_filter_name,
     # Sample info
     _line(f"Sample #{global_idx}  ({index + 1}/{total})")
     pname = "RED" if disp["cur_player"] == 0 else "BLACK"
+    mn = disp.get("move_norm", 0) * 400  # kMaxGameLength
+    mc = disp.get("msc_norm", 0) * 40   # kMaxMovesWithoutCapture
     _line(f"Turn: {pname}    Pieces: {len(disp['pieces'])}")
+    _line(f"Move: {mn:.0f}/500    No-capture: {mc:.0f}/40")
     if disp["wdl"] is not None:
         w, d, l = disp["wdl"]
         _line(f"Value: {disp['value']:+.3f}  ({disp['win_pct']:.1f}%)")
@@ -156,10 +159,10 @@ def main():
         return
 
     print(f"Loading {path}...")
-    obs_arr, masks_arr, policies_arr, values_arr, tags_arr = load_buffer(path)
-    total_global = len(values_arr)
-    if tags_arr is not None:
-        unique, counts = np.unique(tags_arr, return_counts=True)
+    buf = load_buffer(path)
+    total_global = buf.total
+    if buf.tags is not None:
+        unique, counts = np.unique(buf.tags, return_counts=True)
         tc = {str(k): int(v) for k, v in zip(unique, counts)}
         print(f"Loaded {total_global}  tags={tc}")
     else:
@@ -170,14 +173,14 @@ def main():
     pygame.display.set_caption(f"Xiangqi Buffer Viewer — {os.path.basename(path)}")
     clock = pygame.time.Clock()
 
-    tag_filter = TagFilter(tags_arr, "all")
+    tag_filter = TagFilter(buf.tags, "all")
     show_heatmap = True
-    selected_src = None   # (row, col) of selected source square
+    selected_src = None
     _disp = None
     _last_gi = -1
-    _policy_cache = None  # cached policy for target heatmap
-    _top_moves = []       # cached top-N moves for arrows
-    _mask_cache = None    # cached mask for compute_top_moves
+    _policy_cache = None
+    _top_moves = []
+    _mask_cache = None
 
     def refresh_disp():
         nonlocal _disp, _last_gi, _policy_cache, _top_moves, _mask_cache
@@ -186,15 +189,14 @@ def main():
             _disp = None; return
         pos = tag_filter.pos % len(idx)
         g_idx = int(idx[pos])
-        tag = tags_arr[g_idx] if tags_arr is not None else None
-        board_data = obs_to_board(obs_arr[g_idx])
-        policy = policies_arr[g_idx]
-        mask = masks_arr[g_idx]
-        _policy_cache = policy
-        _mask_cache = mask
-        _top_moves = compute_top_moves(policy, mask, top_n=8)
+        row = buf.read(g_idx)
+        tag = row[4]
+        board_data = obs_to_board(row[0])
+        _policy_cache = row[2]
+        _mask_cache = row[1]
+        _top_moves = compute_top_moves(row[2], row[1], top_n=8)
         _disp = build_display_data(
-            board_data, policy, mask, values_arr[g_idx], tag,
+            board_data, row[2], row[1], row[3], tag,
             board_data.cur_player)
         _last_gi = g_idx
 
@@ -276,7 +278,7 @@ def main():
 
             draw_side_panel(screen, tag_filter.pos, len(tag_filter.indices),
                            tag_filter.current_global_idx, tag_filter.name,
-                           _disp, tag_filter, tags_arr, selected_src)
+                           _disp, tag_filter, buf.tags, selected_src)
         pygame.display.flip()
         clock.tick(30)
 

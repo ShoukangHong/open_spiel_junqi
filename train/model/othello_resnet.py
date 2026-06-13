@@ -138,6 +138,24 @@ class OthelloResNet(nn.Module):
             val = F.softmax(value, dim=-1)[0].cpu().numpy()
             return val, policy[0].cpu().numpy()
 
+    def batch_forward_raw(self, observations: np.ndarray) -> np.ndarray:
+        """Forward only — returns (policy_logits, value_logits), no softmax."""
+        self.eval()
+        with torch.no_grad():
+            obs_t = torch.from_numpy(
+                np.ascontiguousarray(observations, dtype=np.float32)).to(self.device)
+            if not torch.isfinite(obs_t).all():
+                raise RuntimeError("batch_forward_raw: obs_t contains NaN/Inf")
+            if obs_t.dim() == 2:
+                obs_t = obs_t.reshape(obs_t.shape[0], self.input_channels,
+                                      self.board_size, self.board_size)
+            policy_logits, value = self.forward(obs_t)
+            if not torch.isfinite(policy_logits).all():
+                raise RuntimeError("batch_forward_raw: NaN in policy_logits")
+            if not torch.isfinite(value).all():
+                raise RuntimeError("batch_forward_raw: NaN in value")
+            return policy_logits.cpu().numpy(), value.cpu().numpy()
+
     def batch_inference(self, observations: np.ndarray,
                         legals_masks: np.ndarray) -> tuple:
         """Batch inference.

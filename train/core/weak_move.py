@@ -14,6 +14,9 @@ def nn_raw_after_move(evaluator, state, action):
     """
     s = state.clone()
     s.apply_action(action)
+    if s.is_terminal():
+        r = s.returns()
+        return float(r[0])
     if hasattr(evaluator, 'scalar_value'):
         return evaluator.scalar_value(s)
     nn_val, _ = evaluator._inference(s)   # duck-typed fallback (tests)

@@ -21,8 +21,8 @@ from game_ui.xiangqi_render import (
 from train.core.model_builder import build_xiangqi_model
 
 # ── Config ──────────────────────────────────────────────────────────────────
-CHECKPOINT_DIR = r"C:\Users\shouk\Github\open_spiel_junqi\train\xiangqi_train"
-CHECKPOINT_STEP = 10
+CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\fast"
+CHECKPOINT_STEP = 30
 MCTS_SIMULATIONS = 512
 HINT_MAX_SIM = 4096
 MCTS_BATCH_SIZE = 16
@@ -93,8 +93,9 @@ def main():
         ai_value = None
         hint_draw_rate = 0.0
         hint_src_probs = None
-        hint_arrows = None
+        _hint_arrows = None
         hint_frozen = False
+        show_hints = False
         message = ""
         restart = False
         hvh = (human_color == -1)
@@ -113,43 +114,37 @@ def main():
                         if action is not None:
                             state.apply_action(action)
                             evaluator.clear_cache()
-                            hints = None; ai_value = None
-                            hint_src_probs = None; hint_arrows = None
-                            hint_draw_rate = 0.0
                             hint_engine.subtree_inherit(action)
+                            if not show_hints:
+                                hints = None; ai_value = None
+                                hint_src_probs = None; _hint_arrows = None
+                                hint_draw_rate = 0.0
+                            else:
+                                hints = None  # force re-search in hint update section
                             selector.reset()
                             message = f"Played: {action_label(action)}"
                     if event.type == pygame.KEYDOWN:
                         if event.key == pygame.K_h:
                             hint_frozen = False
-                            if hints is None:
-                                act, vst, qv, ai_val, dr = hint_engine.search(state)
-                                hints = (act, vst, qv)
-                                ai_value = ai_val; hint_draw_rate = dr
-                                # Compute source-aggregated probs from visit counts
-                                src_visits = {}
-                                for a, v in zip(act, vst):
-                                    sq = a // 90
-                                    src_visits[sq] = src_visits.get(sq, 0) + v
-                                total = sum(src_visits.values()) or 1
-                                hint_src_probs = {k: v/total for k, v in src_visits.items()}
-                                hint_arrows = hint_arrows(act, vst)
-                            else:
+                            hint_engine.unfreeze()
+                            show_hints = not show_hints
+                            if not show_hints:
                                 hints = None; ai_value = None
-                                hint_src_probs = None; hint_arrows = None
+                                hint_src_probs = None; _hint_arrows = None
                                 hint_draw_rate = 0.0
                         elif event.key == pygame.K_f and hints is not None:
                             hint_engine.freeze()
                             hint_frozen = True
-                            print_mcts_info(hint_engine._root, state,
-                                           evaluator, action_label)
+                            if hint_engine._root is not None:
+                                print_mcts_info(hint_engine._root, state,
+                                               evaluator, action_label)
                             message = "Hint FROZEN"
                         elif event.key == pygame.K_r:
                             restart = True
                         elif event.key == pygame.K_q:
                             pygame.quit(); sys.exit()
 
-                if hints is not None and not hint_frozen:
+                if show_hints and not hint_frozen:
                     act, vst, qv, ai_val, dr = hint_engine.search(state)
                     hints = (act, vst, qv)
                     ai_value = ai_val; hint_draw_rate = dr
@@ -159,14 +154,14 @@ def main():
                         src_visits[sq] = src_visits.get(sq, 0) + v
                     total = sum(src_visits.values()) or 1
                     hint_src_probs = {k: v/total for k, v in src_visits.items()}
-                    hint_arrows = hint_arrows(act, vst)
+                    _hint_arrows = hint_arrows(act, vst, hint_engine._root)
             else:
                 message = "AI thinking..."
                 screen.fill(BG_COLOR)
                 draw_board_ui(screen, board_data, legal,
                              selected_src=selector.selected_src,
                              hint_data=hints, hint_heatmap=hint_src_probs,
-                             move_arrows=hint_arrows)
+                             move_arrows=_hint_arrows)
                 draw_panel(screen, cur, message, value=ai_value,
                           draw_rate=hint_draw_rate)
                 pygame.display.flip()
@@ -177,21 +172,13 @@ def main():
                 evaluator.clear_cache()
                 hint_engine.subtree_inherit(action)
 
-                if hints is not None and not hint_frozen:
-                    act, vst, qv, ai_val, dr = hint_engine.search(state)
-                    hints = (act, vst, qv)
-                    ai_value = ai_val; hint_draw_rate = dr
-                    src_visits = {}
-                    for a, v in zip(act, vst):
-                        sq = a // 90
-                        src_visits[sq] = src_visits.get(sq, 0) + v
-                    total = sum(src_visits.values()) or 1
-                    hint_src_probs = {k: v/total for k, v in src_visits.items()}
-                    hint_arrows = hint_arrows(act, vst)
-                else:
+                hint_engine.subtree_inherit(action)
+                if not show_hints:
                     hints = None; ai_value = None
-                    hint_src_probs = None; hint_arrows = None
+                    hint_src_probs = None; _hint_arrows = None
                     hint_draw_rate = 0.0
+                else:
+                    hints = None  # force re-search next human turn
                 message = f"AI played: {action_label(action)}"
 
             if not state.is_terminal():
@@ -200,7 +187,7 @@ def main():
                 draw_board_ui(screen, board_data, legal,
                              selected_src=selector.selected_src,
                              hint_data=hints, hint_heatmap=hint_src_probs,
-                             move_arrows=hint_arrows)
+                             move_arrows=_hint_arrows)
                 draw_panel(screen, state.current_player(), message,
                           value=ai_value, draw_rate=hint_draw_rate)
 

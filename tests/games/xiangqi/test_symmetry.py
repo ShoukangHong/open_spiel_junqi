@@ -96,7 +96,7 @@ def test_value_is_invariant():
     """WDL is unchanged by all symmetry transforms."""
     sym = XiangqiSymmetry()
     B = 4
-    obs = np.random.randn(B, 1350).astype(np.float32)
+    obs = np.random.randn(B, 1530).astype(np.float32)
     mask = np.random.rand(B, NUM_ACTIONS).astype(np.float32) > 0.5
     policy = np.random.rand(B, NUM_ACTIONS).astype(np.float32)
     policy /= policy.sum(axis=-1, keepdims=True)
@@ -112,7 +112,7 @@ def test_value_is_invariant():
 def test_swap_flips_player_to_move():
     """Swap (k>=2) inverts player-to-move indicator. Tested on manual apply."""
     # Build obs: Red to move, one Red piece at (6,0), one Black piece at (3,0)
-    obs = np.zeros((15, ROWS, COLS), dtype=np.float32)
+    obs = np.zeros((17, ROWS, COLS), dtype=np.float32)
     obs[0, 6, 0] = 1.0    # Red General at (6,0) — plane 0
     obs[7, 3, 0] = 1.0    # Black General at (3,0) — plane 7
     obs[14, :, :] = 1.0    # Red to move
@@ -152,8 +152,8 @@ K_NAMES = ["Identity", "Mirror(L-R)", "Swap(color+V)", "Mirror+Swap"]
 
 
 def _obs_to_board_str(obs):
-    """Convert flat [1350] obs to a 10×9 Chinese character grid."""
-    obs = obs.reshape(15, ROWS, COLS)
+    """Convert flat [1530] obs to a 10×9 Chinese character grid."""
+    obs = obs.reshape(17, ROWS, COLS)
     rows = []
     header = "    " + "".join(_CCOLS)
     rows.append(header)
@@ -240,7 +240,7 @@ def test_write_symmetry_viz():
         # Show original state with Chinese glyphs
         f.write("Original state:\n")
         f.write(_obs_to_board_str(obs))
-        player0 = "Red" if obs.reshape(15, ROWS, COLS)[14, 0, 0] > 0.5 else "Black"
+        player0 = "Red" if obs.reshape(17, ROWS, COLS)[14, 0, 0] > 0.5 else "Black"
         f.write(f"\n\nPlayer: {player0}    Value: W={value[0]:.2f} D={value[1]:.2f} L={value[2]:.2f}\n")
         f.write("\nTop moves (original):\n")
         f.write(_top_moves_str(policy, mask, np.arange(NUM_ACTIONS)))
@@ -250,7 +250,7 @@ def test_write_symmetry_viz():
             f.write(f"  Transform {k}: {K_NAMES[k]}\n")
             f.write(f"{'=' * 60}\n\n")
 
-            o = obs.reshape(15, ROWS, COLS).copy()
+            o = obs.reshape(17, ROWS, COLS).copy()
             mirror = k % 2 == 1
             swap = k >= 2
             if mirror:

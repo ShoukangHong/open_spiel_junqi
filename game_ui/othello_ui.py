@@ -116,6 +116,7 @@ def main():
                     if event.type == pygame.KEYDOWN:
                         if event.key == pygame.K_h:
                             hint_frozen = False
+                            hint_engine.unfreeze()
                             if hints is None:
                                 act, vst, qv, ai_val, dr = hint_engine.search(state)
                                 hints = (act, vst, qv)

@@ -12,7 +12,7 @@ from train.core.types import TrainInput
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _make_net(nn_width=8, nn_depth=1):
-    return XiangqiResNet(input_channels=15, board_rows=10, board_cols=9,
+    return XiangqiResNet(input_channels=17, board_rows=10, board_cols=9,
                          output_size=8100, nn_width=nn_width,
                          nn_depth=nn_depth)
 
@@ -22,7 +22,7 @@ def _make_net(nn_width=8, nn_depth=1):
 def test_forward_shapes():
     """Forward returns policy_logits (batch, 8100) and value (batch, 3)."""
     net = _make_net()
-    x = torch.randn(2, 15, 10, 9)
+    x = torch.randn(2, 17, 10, 9)
     pl, v = net(x)
     assert pl.shape == (2, 8100)
     assert v.shape == (2, 3)
@@ -31,7 +31,7 @@ def test_forward_shapes():
 def test_inference_shapes():
     """Single inference returns value (3,) and policy (8100,)."""
     net = _make_net()
-    obs = np.zeros((15, 10, 9), dtype=np.float32)
+    obs = np.zeros((17, 10, 9), dtype=np.float32)
     mask = np.ones(8100, dtype=bool)
     val, pol = net.inference(obs, mask)
     assert val.shape == (3,)
@@ -43,7 +43,7 @@ def test_inference_shapes():
 def test_batch_inference_shapes():
     """Batch inference returns values (batch, 3) and policies (batch, 8100)."""
     net = _make_net()
-    obs = np.zeros((4, 1350), dtype=np.float32)  # flat input
+    obs = np.zeros((4, 1530), dtype=np.float32)  # flat input
     mask = np.ones((4, 8100), dtype=bool)
     vals, pols = net.batch_inference(obs, mask)
     assert vals.shape == (4, 3)
@@ -54,7 +54,7 @@ def test_batch_inference_shapes():
 def test_inference_respects_mask():
     """Policy is zero on masked (illegal) actions."""
     net = _make_net()
-    obs = np.zeros((15, 10, 9), dtype=np.float32)
+    obs = np.zeros((17, 10, 9), dtype=np.float32)
     mask = np.zeros(8100, dtype=bool)
     mask[0] = True  # only action 0 is legal
     _, pol = net.inference(obs, mask)
@@ -116,7 +116,7 @@ def test_model_update_wdl():
     """Model.update with WDL targets returns positive losses."""
     net = _make_net()
     model = Model(net, device="cpu")
-    obs = np.random.randn(4, 1350).astype(np.float32)
+    obs = np.random.randn(4, 1530).astype(np.float32)
     mask = np.ones((4, 8100), dtype=bool)
     pol = np.random.rand(4, 8100).astype(np.float32)
     pol /= pol.sum(axis=-1, keepdims=True)
@@ -177,7 +177,7 @@ def test_build_xiangqi_model():
     assert model.num_trainable_variables > 0
 
     # Verify forward pass works
-    obs = np.zeros((2, 1350), dtype=np.float32)
+    obs = np.zeros((2, 1530), dtype=np.float32)
     mask = np.ones((2, 8100), dtype=bool)
     vals, pols = model.batch_inference(obs, mask)
     assert vals.shape == (2, 3)
@@ -216,7 +216,7 @@ def test_play_game_xiangqi():
     # Each state_info entry: (obs, mask, policy, cur_player, tag, q, dr)
     for item in states_info:
         obs, mask, policy, cur_player, tag, q, dr = item
-        assert obs.shape == (1350,)  # 15*10*9 flat
+        assert obs.shape == (1530,)  # 15*10*9 flat
         assert mask.shape == (8100,)
         assert policy.shape == (8100,)
         assert abs(policy.sum() - 1.0) < 0.02

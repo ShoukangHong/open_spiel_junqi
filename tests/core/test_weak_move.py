@@ -218,6 +218,30 @@ def test_buffer_tags():
 
 # Test F
 
+def test_nn_raw_after_move_terminal():
+    """When weak move captures general, use game returns, not NN."""
+    print("Test G: nn_raw_after_move on general-capture ...", end=" ")
+    g = pyspiel.load_game("xiangqi")
+    st = g.new_initial_state()
+    # Walk the legal moves to find one that directly captures a general
+    found = False
+    for a in st.legal_actions():
+        s2 = st.clone()
+        s2.apply_action(a)
+        if s2.is_terminal() and s2.returns()[0] != 0:
+            class _Dummy:
+                def scalar_value(self, s):
+                    raise RuntimeError("should not call NN")
+            r = nn_raw_after_move(_Dummy(), st, a)
+            assert r == s2.returns()[0], f"{r} != {s2.returns()[0]}"
+            found = True
+            break
+    if found:
+        print("PASSED")
+    else:
+        print("SKIP (no direct-capture action found)")
+
+
 def test_perspective():
     print("Test F: perspective alignment ...", end=" ")
     import train.core.weak_move as wm
@@ -245,7 +269,8 @@ def main():
     tests = [
         testnn_raw_after_move, test_weak_max_zero, test_weak_branches,
         test_rare_weak_count_increment,
-        test_fork_no_weak, test_buffer_tags, test_perspective,
+        test_fork_no_weak, test_buffer_tags,
+        test_nn_raw_after_move_terminal, test_perspective,
     ]
     failed = 0
     for fn in tests:

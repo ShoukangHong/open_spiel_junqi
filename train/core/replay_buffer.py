@@ -42,9 +42,11 @@ class ReplayBuffer:
                  (backward compat for tests).
     """
 
-    def __init__(self, max_size: int, db_path: str = None):
+    def __init__(self, max_size: int, db_path: str = None,
+                 max_db_rows: int = 1_000_000):
         self._max_size = max_size
         self._db_path = db_path
+        self._max_db_rows = max_db_rows
         self._obs = None
         self._masks = None
         self._policies = None
@@ -109,6 +111,7 @@ class ReplayBuffer:
             if self._pending >= 256:
                 self._conn.commit()
                 self._pending = 0
+                self._rotate_db()
 
     def sample(self, n: int) -> TrainInput:
         """Random sample from the in-memory ring buffer."""
@@ -135,51 +138,74 @@ class ReplayBuffer:
         if self._conn and self._pending > 0:
             self._conn.commit()
             self._pending = 0
-
-    def rollback(self, target_step: int):
-        """Delete all states with step > target_step, rebuild ring from DB."""
-        if not self._conn:
-            return
-        self.flush()
-        self._conn.execute("DELETE FROM states WHERE step > ?", (target_step,))
-        self._conn.commit()
-        self._obs = None  # force re-allocation
-        self._load_ring_from_db()
-        self._size = min(self._size, self._max_size)
-
-    def close(self):
-        """Close the database connection."""
-        self.flush()
         if self._conn:
-            self._conn.close()
-            self._conn = None
+            self._rotate_db()
 
-    # ── Internal ────────────────────────────────────────────────────────────
+    def _rotate_db(self, db_path=None):
+        """If current DB exceeds max_db_rows, archive it and start a new one."""
+        if db_path is None:
+            db_path = self._db_path
+        cur = self._conn.execute("SELECT COUNT(*) FROM states")
+        if cur.fetchone()[0] < self._max_db_rows:
+            return
+        self._conn.close()
+        suffix = self._index - self._max_db_rows  # approx row count in archived file
+        rotated = db_path.replace(".db", f"_{suffix}.db")
+        os.rename(db_path, rotated)
+        self._conn = sqlite3.connect(db_path, timeout=30)
+        for p in _WAL_PRAGMAS:
+            self._conn.execute(p)
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS states ("
+            "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "  step INTEGER NOT NULL,"
+            "  obs BLOB NOT NULL,"
+            "  mask BLOB NOT NULL,"
+            "  policy BLOB NOT NULL,"
+            "  value BLOB NOT NULL,"
+            "  tag TEXT NOT NULL DEFAULT ''"
+            ")"
+        )
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_step ON states(step)")
+        self._conn.commit()
+
+    def _all_db_paths(self):
+        """Return all buffer DB paths (current + archived), newest first."""
+        import glob as _glob
+        base = self._db_path
+        archived = sorted(_glob.glob(base.replace(".db", "_*.db")), reverse=True)
+        if os.path.exists(base):
+            return [base] + archived
+        return archived
 
     def _load_ring_from_db(self):
-        """Fill the in-memory ring from the most recent DB rows."""
-        cur = self._conn.execute(
-            "SELECT obs, mask, policy, value, tag FROM states "
-            "ORDER BY id DESC LIMIT ?", (self._max_size,))
-        rows = cur.fetchall()
-        if not rows:
-            self._index = 0
-            self._size = 0
-            return
+        """Fill the in-memory ring from the most recent DB rows across all files."""
+        paths = self._all_db_paths()
+        rows = []
+        for p in paths:
+            conn = sqlite3.connect(p)
+            cur = conn.execute(
+                "SELECT obs, mask, policy, value, tag FROM states "
+                "ORDER BY id DESC LIMIT ?", (self._max_size,))
+            rows.extend(cur.fetchall())
+            conn.close()
+            if len(rows) >= self._max_size:
+                break
+        rows = rows[:self._max_size]
         rows.reverse()  # chronological order
 
         n = len(rows)
-        # Reconstruct shapes from the first row (all rows share the same layout)
+        if n == 0:
+            self._index = 0
+            self._size = 0
+            return
         first_obs = _unpack(rows[0][0], np.float32)
         first_mask = _unpack(rows[0][1], bool)
         first_pol = _unpack(rows[0][2], np.float32)
 
-        self._obs = np.empty((self._max_size, *first_obs.shape),
-                             dtype=np.float32)
-        self._masks = np.empty((self._max_size, *first_mask.shape),
-                               dtype=bool)
-        self._policies = np.empty((self._max_size, *first_pol.shape),
-                                  dtype=np.float32)
+        self._obs = np.empty((self._max_size, *first_obs.shape), dtype=np.float32)
+        self._masks = np.empty((self._max_size, *first_mask.shape), dtype=bool)
+        self._policies = np.empty((self._max_size, *first_pol.shape), dtype=np.float32)
         self._values = np.empty((self._max_size, 3), dtype=np.float32)
         self._tags = np.empty((self._max_size,), dtype=object)
 
@@ -191,10 +217,42 @@ class ReplayBuffer:
             self._tags[i] = tag
 
         self._size = n
-        # Recover total index from the DB
-        cur = self._conn.execute("SELECT MAX(id) FROM states")
-        max_id = cur.fetchone()[0]
-        self._index = max_id or n
+        # Recover _index: total rows across all files
+        total = 0
+        for p in paths:
+            conn = sqlite3.connect(p)
+            cur = conn.execute("SELECT COUNT(*) FROM states")
+            total += cur.fetchone()[0]
+            conn.close()
+        self._index = max(total, n)
+
+    def rollback(self, target_step: int):
+        """Delete states with step > target_step from all DB files, reload ring."""
+        if not self._conn:
+            return
+        self.flush()
+        # Only touch files that might have step > target_step.
+        # Archived files are named buffer_<first_index>.db — skip if all rows
+        # in the file predate the target step.
+        for p in self._all_db_paths():
+            conn = sqlite3.connect(p)
+            cur = conn.execute("SELECT MAX(step) FROM states")
+            max_s = cur.fetchone()[0]
+            if max_s is not None and max_s <= target_step:
+                conn.close()
+                continue
+            conn.execute("DELETE FROM states WHERE step > ?", (target_step,))
+            conn.commit()
+            conn.close()
+        self._obs = None
+        self._load_ring_from_db()
+
+    def close(self):
+        """Close the database connection."""
+        self.flush()
+        if self._conn:
+            self._conn.close()
+            self._conn = None
 
     # ── Properties ──────────────────────────────────────────────────────────
 

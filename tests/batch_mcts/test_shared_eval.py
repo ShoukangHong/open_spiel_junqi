@@ -12,18 +12,31 @@ from train.batch_mcts.shared_evaluator import (
 class _MockModel:
     """Mock model returning WDL values from deterministic hash."""
 
-    def __init__(self, model_id: str):
+    def __init__(self, model_id: str, num_actions: int = 9):
         self.mid = model_id
         self._step = 0
+        self.num_actions = num_actions
 
     def step_up(self):
         self._step += 1
 
+    def batch_forward_raw(self, obs):
+        """Raw logits that softmax back to _wdl values."""
+        n = obs.shape[0]
+        na = self.num_actions
+        policy_logits = np.zeros((n, na), dtype=np.float32)
+        value_logits = np.zeros((n, 3), dtype=np.float32)
+        for i in range(n):
+            wdl = np.maximum(self._wdl(obs[i]), 1e-9)
+            value_logits[i] = np.log(wdl)
+        return policy_logits, value_logits
+
     def batch_inference(self, obs, mask):
         n = obs.shape[0]
+        na = self.num_actions
         values = np.array([self._wdl(obs[i]) for i in range(n)],
                           dtype=np.float32)
-        policies = np.zeros((n, 65), dtype=np.float32)
+        policies = np.zeros((n, na), dtype=np.float32)
         for i in range(n):
             legals = np.where(mask[i])[0]
             for a in legals:
@@ -207,10 +220,16 @@ def test_wdl_scalar_value_perspective():
 
     # Fixed WDL model: current player always winning (w=0.8, d=0.1, l=0.1)
     class _FixedWDLModel:
+        def batch_forward_raw(self, obs):
+            n = obs.shape[0]
+            wdl = np.array([0.8, 0.1, 0.1], dtype=np.float32)
+            return (np.zeros((n, 9), dtype=np.float32),
+                    np.tile(np.log(wdl), (n, 1)))
+
         def batch_inference(self, obs, mask):
             n = obs.shape[0]
             return (np.array([[0.8, 0.1, 0.1]] * n, dtype=np.float32),
-                    np.ones((n, 65), dtype=np.float32) / 65)
+                    np.ones((n, mask.shape[1]), dtype=np.float32) / mask.shape[1])
 
     server = InferenceServer()
     try:

@@ -54,7 +54,7 @@ class XiangqiSymmetry:
         """Apply random symmetry to each sample in the batch.
 
         Args:
-            obs:    (B, 1350) flat or (B, 15, 10, 9) float32
+            obs:    (B, 1530) flat or (B, 17, 10, 9) float32
             mask:   (B, 8100) bool
             policy: (B, 8100) float32
             value:  (B, 3) float32 [w,d,l], optional — invariant under all transforms
@@ -75,7 +75,7 @@ class XiangqiSymmetry:
             swap = k >= 2
 
             # --- observation ---
-            o = obs[i].reshape(15, ROWS, COLS)
+            o = obs[i].reshape(17, ROWS, COLS)
             if mirror:
                 o = o[:, :, ::-1]                     # flip columns
             if swap:

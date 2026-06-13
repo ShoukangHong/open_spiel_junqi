@@ -12,24 +12,27 @@ from train.core.weak_move import try_weak_move
 
 
 def _should_prune(pruned, root, cur_player, config, max_utility, dice):
-    """Decide whether to prune the current game.
+    """Decide whether to prune (win) or truncate (draw) the current game.
 
     Returns (new_pruned, do_break).
-    Dice is consumed exactly once, on the first qualifying step.
+    Checks every move; dice is rolled each time.
     """
-    if not config.prune_enabled or pruned["used"] or pruned["checked"]:
+    if not config.prune_enabled or pruned["used"]:
         return pruned, False
 
-    qualifies = (
-        (root.outcome is not None and root.outcome[cur_player] > 0)
-        or root.q_value >= config.prune_threshold * max_utility
-    )
+    proven_win = root.outcome is not None and root.outcome[cur_player] > 0
+    high_q = root.q_value >= config.prune_threshold * max_utility
+    draw_rate = getattr(root, 'draw_rate', 0.0) or 0.0
+    high_draw = draw_rate >= config.prune_threshold
+
+    qualifies = proven_win or high_q or high_draw
     if not qualifies:
         return pruned, False
 
-    pruned["checked"] = True
     if dice < config.prune_prob:
-        return {"used": True, "cur_player": cur_player, "checked": True}, True
+        is_draw = high_draw and not (proven_win or high_q)
+        return {"used": True, "cur_player": cur_player,
+                "draw_truncate": is_draw}, True
     return pruned, False
 
 
@@ -80,7 +83,7 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
         if weak_steps:
             logger.log_line(f"[weak steps = {sorted(weak_steps)}]")
 
-    pruned = {"used": False, "cur_player": None, "checked": False}
+    pruned = {"used": False, "cur_player": None}
 
     while not state.is_terminal():
         cur_player = state.current_player()
@@ -205,7 +208,9 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
         state.apply_action(action)
         move_num += 1
 
-    if pruned["used"]:
+    if pruned.get("draw_truncate"):
+        returns = np.array([0.0, 0.0], dtype=np.float64)
+    elif pruned["used"]:
         max_u = game.max_utility()
         p = pruned["cur_player"]
         returns = np.array([max_u if i == p else -max_u for i in range(2)],

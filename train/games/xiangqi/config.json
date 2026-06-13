@@ -20,31 +20,31 @@
     "temperature": 0.01,
     "temperature_drop": 25,
 
-    "replay_buffer_size": 5000,
+    "replay_buffer_size": 10000,
     "buffer_sampling_frac": 0.2,
-    "symmetry": 1,
+    "symmetry": 4,
 
-    "num_actors": 20,
+    "num_actors": 26,
     "max_steps": 300,
     "checkpoint_freq": 10,
 
-    "evaluation_window": 50,
-    "eval_reference_count": 5,
+    "evaluation_window": 5,
+    "eval_reference_count": 2,
     "best_model_prob": 0.0,
     "eval_min_interval": 1,
 
     "prune_enabled": true,
     "prune_threshold": 0.99,
-    "prune_prob": 0.9,
+    "prune_prob": 0.25,
 
-    "weak_side_prob": 0.0,
-    "weak_move_prob": 0.0,
+    "weak_side_prob": 0.6,
+    "weak_move_prob": 0.6,
     "rare_case_threshold": 0.0,
     "weak_move_threshold": 0.0,
     "weak_max_per_game": 3,
     "weak_move_max_step": 200,
 
-    "path": "xiangqi_train",
+    "path": "C:\\Users\\shouk\\xiangqi_train\\fast",
     "seed": 42,
     "device": "cuda"
 }

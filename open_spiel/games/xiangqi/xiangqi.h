@@ -41,11 +41,12 @@ inline constexpr int kNumCols = 9;
 inline constexpr int kNumCells = kNumRows * kNumCols;  // 90
 inline constexpr int kNumPieceTypes = 7;
 inline constexpr int kNumDistinctActions = kNumCells * kNumCells;  // 8100
-inline constexpr int kMaxGameLength = 500;
+inline constexpr int kMaxGameLength = 400;
+inline constexpr int kMaxMovesWithoutCapture = 40;
 
 // Observation tensor: 7 planes per player (one per piece type) + 1 current
 // player plane = 15 planes total.
-inline constexpr int kNumObservationPlanes = kNumPieceTypes * 2 + 1;  // 15
+inline constexpr int kNumObservationPlanes = kNumPieceTypes * 2 + 1 + 2;  // 17
 
 enum PieceType {
   kEmpty = 0,
@@ -91,6 +92,7 @@ struct MoveHistoryEntry {
   int from;
   int to;
   Piece captured;
+  int moves_since_capture_before;
 };
 
 class XiangqiState : public State {
@@ -142,6 +144,8 @@ class XiangqiState : public State {
 
   Player outcome_ = kInvalidPlayer;
   bool no_legal_moves_ = false;
+
+  int moves_since_capture_ = 0;
 
   std::array<Piece, kNumCells> board_;
   Player current_player_ = 0;  // Red goes first

@@ -240,7 +240,7 @@ def plot_metrics(records: List[StepRecord], smooth: int = 1,
         ent = moving_average(ent, smooth)
     ax.plot(steps, ent, color="#4CAF50", linewidth=1.2)
     ax.set_title("Policy Entropy")
-    ax.set_ylim(0.8, 1.8)
+    # ax.set_ylim(0.8, 1.8)
     ax.grid(True, alpha=0.25)
     ax.axhline(y=np.log(65), color="gray", linestyle="--", alpha=0.4, linewidth=0.8)
 
@@ -490,7 +490,7 @@ def main():
         plot_metrics(records, smooth=args.smooth, output_path=output_path,
                      elo_pairs=elo_pairs)
 
-DEFAULT_LOG = r"C:\Users\shouk\othello_train\cloud_wdl_mix\train.log"
+DEFAULT_LOG = r"C:\Users\shouk\xiangqi_train\fast\train.log"
 DEFAULT_SMOOTH = 5
 DEFAULT_NO_PLOT = False
 

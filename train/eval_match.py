@@ -37,7 +37,7 @@ def _get_build_fn(game_name):
 
 def _game_obj(game_name=None):
     global _game
-    if _game is None:
+    if _game is None or game_name is not None:
         _game = pyspiel.load_game(game_name or "othello")
     return _game
 
@@ -148,11 +148,16 @@ def run_match(cfg0, cfg1, num_games=100, temperature=0.1, temp_drop=4,
     name1 = (f"{s1}" if s1 in ("random", "greedy")
              else f"{s1}(step{st1},{cfg1.get('mcts_simulations', 0)}sim)")
 
-    # Pre-load models (unconditionally to populate caches)
+    # Pre-load models and determine game
+    game_name = "othello"
     for cfg in (cfg0, cfg1):
         s = cfg["strategy"]
         if s in ("model", "mcts"):
             _model_for(cfg)
+            config_path = os.path.join(cfg["checkpoint_dir"], "train_config.json")
+            with open(config_path) as f:
+                game_name = json.load(f).get("game", "othello")
+    game = pyspiel.load_game(game_name)
 
     if not quiet:
         print(f"\nMatch: {name0} (black) vs {name1} (white), {num_games} games\n")
@@ -168,7 +173,7 @@ def run_match(cfg0, cfg1, num_games=100, temperature=0.1, temp_drop=4,
             cfg_b, cfg_w = cfg1, cfg0
             label_b, label_w = name1, name0
 
-        state = _game_obj().new_initial_state()
+        state = game.new_initial_state()
         move_num = 0
         moves = []
         while not state.is_terminal():
@@ -485,6 +490,25 @@ PLAYER = {
         "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_128",
         "checkpoint_step": 1500,
         "mcts_simulations": 512, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+}
+
+PLAYER = {
+    0: {"strategy": "mcts",
+        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\fast",
+        "checkpoint_step": 10,
+        "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+    # 1: {"strategy": "mcts", # 早期的benchmark
+    #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_argmax", # argmax 240 us benchmark
+    #     "checkpoint_step": 240,
+    #     "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+    # 1: {"strategy": "mcts", # 中期的benchmark
+    #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_b",
+    #     "checkpoint_step": 990,
+    #     "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+    1: {"strategy": "mcts",
+        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\fast",
+        "checkpoint_step": 30,
+        "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
 }
 
 if __name__ == "__main__":

@@ -604,7 +604,6 @@ class BatchMCTS:
                 paths.append((path_nodes, leaf_node, leaf_state))
 
             # ── Phase 2: Deduplicate & batch evaluate ─────────────────
-            # Map leaf_node -> evaluation result; order for array indexing
             unique_nodes = []
             node_to_idx = {}
             for _, leaf_node, leaf_state in paths:
@@ -612,7 +611,7 @@ class BatchMCTS:
                     node_to_idx[leaf_node] = len(unique_nodes)
                     unique_nodes.append(leaf_node)
 
-            values_map = {}   # leaf_node -> (value_scalar, prior_list, draw_prob)
+            values_map = {}
             if unique_nodes:
                 states_to_eval = [n.state for n in unique_nodes]
                 values_arr, priors_list = self.evaluator.batch_inference_raw(
@@ -643,7 +642,6 @@ class BatchMCTS:
 
                 self._backprop(path_nodes, returns, draw_prob)
 
-                # Propagate solved outcomes upward (MCTS-Solver)
                 for node in reversed(path_nodes):
                     if self._check_solved(node):
                         if node is root:
@@ -760,30 +758,27 @@ class BatchMCTS:
             # Apply virtual loss
             best_child.virtual_visits += 1
 
-            state.apply_action(best_child.action)
+            if best_child.state is not None:
+                state = best_child.state.clone()
+            else:
+                state.apply_action(best_child.action)
             node = best_child
             path.append(node)
 
+        # Lazy: only set state for the leaf (needed by Phase 2 inference)
+        if node.state is None:
+            node.state = state.clone()
         return path, node, state
 
     def _expand(self, node, state, prior):
         """Create children for *node* from the prior probabilities.
-
-        Args:
-            node: leaf Node to expand.
-            state: the game state at this node (used for action strings).
-            prior: list of (action, prob) tuples.
+        Child states are created lazily when _select reaches a leaf.
         """
         player = state.current_player()
-        # Shuffle to reduce move-generation-order bias
         self._random_state.shuffle(prior)
         node.children = [
             Node(action, player, prob) for action, prob in prior
         ]
-        # Cache the state so future traversals can clone from here
-        for child in node.children:
-            child.state = state.clone()
-            child.state.apply_action(child.action)
 
     def _backprop(self, path, returns, draw_prob=0.0):
         """Backpropagate *returns* and *draw_prob* along *path*."""

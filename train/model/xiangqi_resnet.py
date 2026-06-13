@@ -1,6 +1,6 @@
 """PyTorch AlphaZero-style ResNet for Xiangqi (Chinese Chess).
 
-Input:  observation tensor  (batch, 15, 10, 9)
+Input:  observation tensor  (batch, 17, 10, 9)
 Output: policy               (batch, 8100) — plane encoding: 90 src planes × 90 tgt cells
         value                (batch, 3)    — WDL logits
 """
@@ -21,7 +21,7 @@ class XiangqiResNet(nn.Module):
     (target position).  Reshaped to flat 8100-way for masked softmax.
     """
 
-    def __init__(self, input_channels: int = 15, board_rows: int = 10,
+    def __init__(self, input_channels: int = 17, board_rows: int = 10,
                  board_cols: int = 9, output_size: int = 8100,
                  nn_width: int = 32, nn_depth: int = 5):
         super().__init__()
@@ -122,6 +122,27 @@ class XiangqiResNet(nn.Module):
 
             val = F.softmax(value, dim=-1)[0].cpu().numpy()
             return val, policy[0].cpu().numpy()
+
+    def batch_forward_raw(self, observations: np.ndarray) -> np.ndarray:
+        """Forward only — returns (policy_logits, value_logits), no softmax.
+
+        For server-side inference where softmax is deferred to scatter phase.
+        """
+        self.eval()
+        with torch.no_grad():
+            obs_t = torch.from_numpy(
+                np.ascontiguousarray(observations, dtype=np.float32)).to(self.device)
+            if not torch.isfinite(obs_t).all():
+                raise RuntimeError("batch_forward_raw: obs_t contains NaN/Inf")
+            if obs_t.dim() == 2:
+                obs_t = obs_t.reshape(obs_t.shape[0], self.input_channels,
+                                      self.board_rows, self.board_cols)
+            policy_logits, value = self.forward(obs_t)
+            if not torch.isfinite(policy_logits).all():
+                raise RuntimeError("batch_forward_raw: NaN in policy_logits")
+            if not torch.isfinite(value).all():
+                raise RuntimeError("batch_forward_raw: NaN in value")
+            return policy_logits.cpu().numpy(), value.cpu().numpy()
 
     def batch_inference(self, observations: np.ndarray,
                         legals_masks: np.ndarray) -> tuple:

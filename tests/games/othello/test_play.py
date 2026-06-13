@@ -197,69 +197,81 @@ class _FakeCfg:
     prune_prob = 0.9
 
 
-def _fake_root(q=0.5, outcome=None):
+def _fake_root(q=0.5, outcome=None, draw_rate=0.0):
     r = mock.MagicMock()
     r.q_value = q
     r.outcome = outcome
+    r.draw_rate = draw_rate
     return r
 
 
 def test_prune_skips_when_disabled():
     cfg = _FakeCfg()
     cfg.prune_enabled = False
-    p = {"used": False, "checked": False}
+    p = {"used": False}
     p2, br = _should_prune(p, _fake_root(1.0), 0, cfg, 1.0, 0.5)
     assert not br
-    assert not p2["checked"]
 
 
 def test_prune_triggers_on_high_q():
-    p = {"used": False, "checked": False}
+    p = {"used": False}
     p2, br = _should_prune(p, _fake_root(1.0), 0, _FakeCfg(), 1.0, 0.5)
     assert br
     assert p2["used"]
 
 
-def test_prune_dice_fail_marks_checked():
-    p = {"used": False, "checked": False}
+def test_prune_dice_fail_allows_retry():
+    p = {"used": False}
     p2, br = _should_prune(p, _fake_root(1.0), 0, _FakeCfg(), 1.0, 0.95)
     assert not br
-    assert p2["checked"]
     assert not p2["used"]
-
-
-def test_prune_no_retry_after_dice_fail():
-    p = {"used": False, "checked": True}
-    p2, br = _should_prune(p, _fake_root(1.0), 0, _FakeCfg(), 1.0, 0.5)
-    assert not br  # already checked, no retry
+    # Retry with winning dice — should now trigger
+    p2, br = _should_prune(p2, _fake_root(1.0), 0, _FakeCfg(), 1.0, 0.5)
+    assert br
 
 
 def test_prune_no_retry_after_used():
-    p = {"used": True, "checked": True}
+    p = {"used": True}
     p2, br = _should_prune(p, _fake_root(1.0), 0, _FakeCfg(), 1.0, 0.5)
     assert not br
 
 
 def test_prune_skips_low_q():
-    p = {"used": False, "checked": False}
+    p = {"used": False}
     p2, br = _should_prune(p, _fake_root(0.5), 0, _FakeCfg(), 1.0, 0.5)
     assert not br
-    assert not p2["checked"]
 
 
 def test_prune_triggers_on_proven_win():
-    p = {"used": False, "checked": False}
+    p = {"used": False}
     p2, br = _should_prune(p, _fake_root(0.0, [1, -1]), 0, _FakeCfg(), 1.0, 0.5)
     assert br
     assert p2["used"]
 
 
 def test_prune_skips_proven_loss():
-    p = {"used": False, "checked": False}
+    p = {"used": False}
     p2, br = _should_prune(p, _fake_root(-1.0, [-1, 1]), 0, _FakeCfg(), 1.0, 0.5)
     # proven_loss: outcome[0]=-1, not > 0. Q=-1.0, not >= 0.99.
     assert not br
-    assert not p2["checked"]
+
+
+def test_draw_truncate_triggers():
+    """High draw_rate triggers truncation with draw_truncate flag."""
+    p = {"used": False}
+    p2, br = _should_prune(
+        p, _fake_root(0.0, draw_rate=0.99), 0, _FakeCfg(), 1.0, 0.5)
+    assert br
+    assert p2["draw_truncate"]
+
+
+def test_draw_truncate_not_when_also_winning():
+    """If also winning (high Q), mark as win, not draw."""
+    p = {"used": False}
+    p2, br = _should_prune(
+        p, _fake_root(1.0, draw_rate=0.99), 0, _FakeCfg(), 1.0, 0.5)
+    assert br
+    assert not p2["draw_truncate"]
 
 
 def test_play():

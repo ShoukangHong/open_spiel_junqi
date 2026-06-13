@@ -138,10 +138,10 @@ def main():
         return
 
     print(f"Loading {path}...")
-    obs_arr, masks_arr, policies_arr, values_arr, tags_arr = load_buffer(path)
-    total_global = len(values_arr)
-    if tags_arr is not None:
-        unique, counts = np.unique(tags_arr, return_counts=True)
+    buf = load_buffer(path)
+    total_global = buf.total
+    if buf.tags is not None:
+        unique, counts = np.unique(buf.tags, return_counts=True)
         tc = {str(k): int(v) for k, v in zip(unique, counts)}
         print(f"Loaded {total_global}  tags={tc}")
     else:
@@ -152,7 +152,7 @@ def main():
     pygame.display.set_caption(f"Buffer Viewer — {os.path.basename(path)}")
     clock = pygame.time.Clock()
 
-    tag_filter = TagFilter(tags_arr, "all")
+    tag_filter = TagFilter(buf.tags, "all")
     show_heatmap = True
     _disp = None
     _last_gi = -1
@@ -164,11 +164,11 @@ def main():
             _disp = None; return
         pos = tag_filter.pos % len(idx)
         g_idx = int(idx[pos])
-        tag = tags_arr[g_idx] if tags_arr is not None else None
-        board, cp = obs_to_board(obs_arr[g_idx])
+        row = buf.read(g_idx)
+        tag = row[4]
+        board, cp = obs_to_board(row[0])
         _disp = build_display_data(
-            board, policies_arr[g_idx], masks_arr[g_idx],
-            values_arr[g_idx], tag, cp)
+            board, row[2], row[1], row[3], tag, cp)
         _last_gi = g_idx
 
     refresh_disp()
@@ -226,7 +226,7 @@ def main():
             draw_board(screen, _disp, show_heatmap)
             draw_side_panel(screen, tag_filter.pos, len(tag_filter.indices),
                            tag_filter.current_global_idx, tag_filter.name,
-                           _disp, tag_filter, tags_arr)
+                           _disp, tag_filter, buf.tags)
         pygame.display.flip()
         clock.tick(30)
 

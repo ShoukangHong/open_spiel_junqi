@@ -148,17 +148,29 @@ void XiangqiState::SetupInitialBoard() {
 
 std::vector<Action> XiangqiState::LegalActions() const {
   if (IsTerminal()) return {};
-  std::vector<Action> pseudo;
-  GeneratePseudoLegalMoves(&pseudo);
-
   std::vector<Action> legal;
-  legal.reserve(pseudo.size());
-  for (Action action : pseudo) {
-    auto [from, to] = DecodeMove(action);
-    if (!WouldLeaveInCheck(from, to)) {
-      legal.push_back(action);
+  GeneratePseudoLegalMoves(&legal);
+
+  // Flying-general capture: if the two generals face each other with
+  // nothing between, the current player can capture the opponent's general.
+  int our_gen = FindGeneral(current_player_);
+  int their_gen = FindGeneral(1 - current_player_);
+  if (our_gen >= 0 && their_gen >= 0 &&
+      SquareCol(our_gen) == SquareCol(their_gen)) {
+    int min_r = std::min(SquareRow(our_gen), SquareRow(their_gen));
+    int max_r = std::max(SquareRow(our_gen), SquareRow(their_gen));
+    bool blocked = false;
+    for (int r = min_r + 1; r < max_r; ++r) {
+      if (!board_[SquareIndex(r, SquareCol(our_gen))].IsEmpty()) {
+        blocked = true;
+        break;
+      }
+    }
+    if (!blocked) {
+      legal.push_back(EncodeMove(our_gen, their_gen));
     }
   }
+
   std::sort(legal.begin(), legal.end());
   return legal;
 }
@@ -502,10 +514,16 @@ void XiangqiState::DoApplyAction(Action action) {
   SPIEL_CHECK_EQ(board_[from].player, current_player_);
 
   Piece captured = board_[to];
-  undo_stack_.push_back({from, to, captured});
+  undo_stack_.push_back({from, to, captured, moves_since_capture_});
 
   board_[to] = board_[from];
   board_[from] = kEmptyPiece;
+
+  if (!captured.IsEmpty()) {
+    moves_since_capture_ = 0;
+  } else {
+    ++moves_since_capture_;
+  }
 
   // Check if a general was captured.
   if (captured.type == kGeneral) {
@@ -513,16 +531,6 @@ void XiangqiState::DoApplyAction(Action action) {
   }
 
   current_player_ = 1 - current_player_;
-
-  // Check if the new current player has no legal moves (stalemate = loss).
-  if (outcome_ == kInvalidPlayer) {
-    std::vector<Action> next_legal = LegalActions();
-    if (next_legal.empty()) {
-      // The player who just moved wins because opponent has no legal moves.
-      outcome_ = 1 - current_player_;
-      no_legal_moves_ = true;
-    }
-  }
 }
 
 void XiangqiState::UndoAction(Player player, Action action) {
@@ -536,12 +544,15 @@ void XiangqiState::UndoAction(Player player, Action action) {
   current_player_ = player;
   outcome_ = kInvalidPlayer;
   no_legal_moves_ = false;
+  moves_since_capture_ = entry.moves_since_capture_before;
   history_.pop_back();
   --move_number_;
 }
 
 bool XiangqiState::IsTerminal() const {
-  return outcome_ != kInvalidPlayer || move_number_ >= kMaxGameLength;
+  return outcome_ != kInvalidPlayer
+      || move_number_ >= kMaxGameLength
+      || moves_since_capture_ >= kMaxMovesWithoutCapture;
 }
 
 std::vector<double> XiangqiState::Returns() const {
@@ -615,7 +626,24 @@ void XiangqiState::ObservationTensor(Player player,
   float player_val = (current_player_ == 0) ? 1.0f : 0.0f;
   for (int r = 0; r < kNumRows; ++r) {
     for (int c = 0; c < kNumCols; ++c) {
-      view[{kNumObservationPlanes - 1, r, c}] = player_val;
+      view[{14, r, c}] = player_val;
+    }
+  }
+
+  // Plane 15: normalised move number (0..1).
+  float move_norm = static_cast<float>(move_number_) / kMaxGameLength;
+  for (int r = 0; r < kNumRows; ++r) {
+    for (int c = 0; c < kNumCols; ++c) {
+      view[{15, r, c}] = move_norm;
+    }
+  }
+
+  // Plane 16: normalised moves since capture (0..1).
+  float msc_norm = static_cast<float>(moves_since_capture_)
+                   / kMaxMovesWithoutCapture;
+  for (int r = 0; r < kNumRows; ++r) {
+    for (int c = 0; c < kNumCols; ++c) {
+      view[{16, r, c}] = msc_norm;
     }
   }
 }

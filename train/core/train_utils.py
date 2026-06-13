@@ -224,9 +224,18 @@ def run_eval_background(cfg_path, current_step, ref_steps, num_games,
         from train.eval_match import run_match_parallel as _run
         _kwargs = {"num_actors": num_actors}
 
+    # Read training config to match MCTS settings
+    import json
+    train_cfg_path = os.path.join(cfg_path, "train_config.json")
+    tc = {}
+    if os.path.exists(train_cfg_path):
+        with open(train_cfg_path) as f:
+            tc = json.load(f)
     mcts_cfg = {"strategy": "mcts",
                 "checkpoint_dir": cfg_path,
-                "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41}
+                "mcts_simulations": tc.get("max_simulations", 128),
+                "mcts_batch_size": tc.get("mcts_batch_size", 8),
+                "mcts_uct_c": tc.get("uct_c", 1.41)}
     cur = dict(mcts_cfg, checkpoint_step=current_step)
 
     for ref_step in ref_steps:
