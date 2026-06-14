@@ -73,7 +73,7 @@ class SharedEvaluator:
     def _send(self, batch):
         obs_b, mask_b = batch
         if self._use_shm:
-            self._shm.write_input(obs_b, mask_b)
+            self._shm.write_input_obs(obs_b)
             self._incoming.put((self._actor_id, self._model_id,
                                 "shm", obs_b.shape[0]))
         else:
@@ -172,6 +172,7 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
         _has_psutil = False
 
     game = pyspiel.load_game(game_name)
+    obs_dim = int(np.prod(game.observation_tensor_shape()))
     models = {}
     for mid, spec in model_specs.items():
         if spec.get("model") is not None:
@@ -188,7 +189,8 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
             models[mid] = m
 
     _actor_shms = actor_shms or {}
-    _cfg = {"max_batch": max_batch}
+    _cfg = {"max_batch": max_batch,
+            "obs_buf": np.empty((max_batch, obs_dim), dtype=np.float32)}
     _srv_proc = psutil.Process() if _has_psutil else None
     if _srv_proc:
         _srv_proc.cpu_percent()  # warmup: first call returns 0
@@ -202,68 +204,88 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
 
     # Per-model pending queues with arrival timestamps
     from collections import defaultdict
-    pending = defaultdict(list)  # model_id → [(arrival_time, actor_id, obs_list, mask_list), ...]
+    pending = defaultdict(list)
+
+    def _req_n(req):
+        return req[4] if req[4] is not None else len(req[2])
+
+    def _total_pending():
+        return sum(sum(_req_n(r) for r in reqs) for reqs in pending.values())
+
+    def _oldest_ms():
+        if not any(pending.values()):
+            return 0.0
+        return (time.time() - min(r[0] for reqs in pending.values()
+                                  for r in reqs)) * 1000
+
+    def _handle_msg(msg):
+        """Process one incoming message. Returns True if server should stop."""
+        if msg == "__STOP__":
+            return True
+
+        if isinstance(msg, tuple) and len(msg) == 3 \
+                and isinstance(msg[1], dict):
+            mid, sd, mb = msg
+            if mid in models:
+                target = getattr(models[mid], '_model', models[mid])
+                if hasattr(target, 'load_state_dict'):
+                    target.load_state_dict(sd)
+            if mb != _cfg["max_batch"]:
+                _cfg["max_batch"] = mb
+                _cfg["obs_buf"] = np.empty((mb, obs_dim), dtype=np.float32)
+            return False
+
+        is_shm = (len(msg) == 4 and isinstance(msg[2], str)
+                  and msg[2] == "shm")
+        if is_shm:
+            actor_id, model_id, _, n_states = msg
+            obs_batch, mask_batch = None, None
+        else:
+            actor_id, model_id, obs_batch, mask_batch = msg
+            n_states = None
+        if model_id not in models:
+            if actor_id in result_qs:
+                result_qs[actor_id].put(
+                    (actor_id, model_id,
+                     RuntimeError(f"unknown model_id: {model_id}")))
+            return False
+        pending[model_id].append(
+            (time.time(), actor_id, obs_batch, mask_batch, n_states))
+        return False
 
     while True:
-        # ── Collect all incoming messages ──────────────────────────────
+        # ── Drain all queued messages (non-blocking) ──────────────────
         while True:
             try:
                 msg = incoming_q.get_nowait()
             except queue.Empty:
                 break
-
-            if msg == "__STOP__":
+            if _handle_msg(msg):
                 return
 
-            if isinstance(msg, tuple) and len(msg) == 3 \
-                    and isinstance(msg[1], dict):
-                mid, sd, mb = msg
-                if mid in models and hasattr(models[mid], '_model'):
-                    models[mid]._model.load_state_dict(sd)
-                _cfg["max_batch"] = mb
+        # ── Decide next action ─────────────────────────────────────────
+        total = _total_pending()
+        if total == 0:
+            # Idle: block until a message arrives (no CPU spinning)
+            try:
+                msg = incoming_q.get(timeout=0.1)
+            except queue.Empty:
                 continue
+            if _handle_msg(msg):
+                return
+            continue  # drain remaining + re-check
 
-            # Shm-mode message: (actor_id, model_id, "shm", n_states)
-            if len(msg) == 4 and isinstance(msg[2], str) and msg[2] == "shm":
-                actor_id, model_id, _, n_states = msg
-                is_shm = True
-            else:
-                actor_id, model_id, obs_batch, mask_batch = msg
-                is_shm = False
-            if model_id not in models:
-                if actor_id in result_qs:
-                    result_qs[actor_id].put(
-                        (actor_id, model_id,
-                         RuntimeError(f"unknown model_id: {model_id}")))
-                continue
-            if is_shm:
-                pending[model_id].append(
-                    (time.time(), actor_id, None, None, n_states))
-            else:
-                pending[model_id].append(
-                    (time.time(), actor_id, obs_batch, mask_batch, None))
+        if total < _cfg["max_batch"] and _oldest_ms() < 2.0:
+            # Batch not full: short block for more messages
+            try:
+                msg = incoming_q.get(timeout=0.002)
+            except queue.Empty:
+                continue  # timeout → re-check conditions
+            if _handle_msg(msg):
+                return
+            continue  # drain remaining + re-check
 
-        def _req_n(req):
-            return req[4] if req[4] is not None else len(req[2])
-
-        # ── Batching: wait for more requests if batch isn't full ────────
-        total_pending = sum(
-            sum(_req_n(r) for r in reqs) for reqs in pending.values())
-        oldest_arrival = min(
-            (r[0] for reqs in pending.values() for r in reqs),
-            default=time.time())
-        oldest_ms = (time.time() - oldest_arrival) * 1000
-
-        BATCH_WAIT_MS = 2.0
-        if total_pending < _cfg["max_batch"] and oldest_ms < BATCH_WAIT_MS:
-            time.sleep(0.0005)
-            continue
-
-        if total_pending == 0:
-            time.sleep(0.001)
-            continue
-
-        # ── Pick model ──────────────────────────────────────────────────
+        # ── Batch ready: pick model ────────────────────────────────────
         now = time.time()
         best_score = -1.0
         best_mid = None
@@ -301,24 +323,27 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
         model = models[best_mid]
 
         concat_t0 = time.time()
-        # Read shm batches, build obs_batch/mask_batch from shm if needed
+        # Scatter-copy directly into pre-allocated buffer (no malloc)
+        obs_buf = _cfg["obs_buf"]
         resolved = []
+        cursor = 0
         for actor_id, obs_batch, mask_batch, n_shm in group:
             if n_shm is not None:
                 shm_buf = _actor_shms.get(actor_id)
-                obs_b, mask_b = shm_buf.read_input() if shm_buf else (None, None)
-                resolved.append((actor_id, obs_b, mask_b, n_shm, True))
+                obs_b = shm_buf.read_input_obs() if shm_buf else None
+                n = n_shm
+                if obs_b is not None:
+                    obs_buf[cursor:cursor + n] = obs_b
+                resolved.append((actor_id, None, None, n, True))
             else:
-                resolved.append((actor_id, obs_batch, mask_batch,
-                                 len(obs_batch), False))
-        all_obs = np.concatenate([o if isinstance(o, np.ndarray) else np.stack(o, axis=0)
-                                   for _, o, _, _, _ in resolved], axis=0)
-        all_mask = np.concatenate([m if isinstance(m, np.ndarray) else np.stack(m, axis=0)
-                                    for _, _, m, _, _ in resolved], axis=0)
+                n = len(obs_batch)
+                obs_buf[cursor:cursor + n] = obs_batch
+                resolved.append((actor_id, obs_batch, mask_batch, n, False))
+            cursor += n
         concat_ms = (time.time() - concat_t0) * 1000
 
         fwd_t0 = time.time()
-        policy_logits, value_logits = model.batch_forward_raw(all_obs)
+        policy_logits, value_logits = model.batch_forward_raw(obs_buf[:cursor])
         fwd_ms = (time.time() - fwd_t0) * 1000
 
         scatter_t0 = time.time()
@@ -425,20 +450,20 @@ class InferenceServer:
     def incoming_queue(self):
         return self._incoming
 
-    def register_actor(self, actor_id: int, max_states: int = 16,
-                       obs_flat: int = 1530, mask_flat: int = 8100,
-                       pol_flat: int = 8100):
+    def register_actor(self, actor_id: int, max_states: int = 0,
+                       obs_flat: int = 0, mask_flat: int = 0,
+                       pol_flat: int = 0):
         q = mp.Queue(maxsize=100)
         self._result_qs[actor_id] = q
-        # Create shared-memory buffer (unique name: pid + timestamp)
-        from train.batch_mcts.shm import ActorShm
-        import os as _os, time as _time
-        name = f"jq_{_os.getpid()}_{int(_time.monotonic()*1e6)}_{actor_id}"
-        shm = ActorShm(name, max_states, obs_flat, mask_flat, pol_flat,
-                       create=True)
-        self._shm_bufs[actor_id] = shm
-        self._shm_names[actor_id] = name
-        return q  # keep backward compat
+        if max_states > 0:
+            from train.batch_mcts.shm import ActorShm
+            import os as _os, time as _time
+            name = f"jq_{_os.getpid()}_{int(_time.monotonic()*1e6)}_{actor_id}"
+            shm = ActorShm(name, max_states, obs_flat, mask_flat, pol_flat,
+                           create=True)
+            self._shm_bufs[actor_id] = shm
+            self._shm_names[actor_id] = name
+        return q
 
     def actor_shm_name(self, actor_id: int):
         return self._shm_names.get(actor_id)

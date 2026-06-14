@@ -109,7 +109,8 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
             obs = np.asarray(state.observation_tensor(), dtype=np.float32)
             mask = np.asarray(state.legal_actions_mask(), dtype=bool)
             policy_dict = compute_solved_policy(
-                root.children, cur_player, game.max_utility())
+                root.children, cur_player, game.max_utility(),
+                root_visits=root.explore_count)
             policy = np.zeros(game.num_distinct_actions(), dtype=np.float32)
             for a, p in policy_dict.items():
                 policy[a] = p
@@ -146,7 +147,8 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
         mcts_action = root.best_child().action
 
         policy_dict = compute_solved_policy(
-            root.children, state.current_player(), game.max_utility())
+            root.children, state.current_player(), game.max_utility(),
+            root_visits=root.explore_count)
         policy = np.zeros(game.num_distinct_actions(), dtype=np.float32)
         for a, p in policy_dict.items():
             policy[a] = p

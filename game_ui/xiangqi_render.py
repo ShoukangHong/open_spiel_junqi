@@ -549,13 +549,8 @@ def draw_board_ui(screen, board_data, legal_actions=None, selected_src=None,
     """
     draw_board_bg(screen)
 
-    if move_arrows:
-        draw_move_arrows(screen, move_arrows)
-
     if hint_heatmap:
         draw_source_heatmap(screen, hint_heatmap)
-    elif hint_data is not None:
-        pass  # draw_mcts_hints called separately
 
     draw_pieces(screen, board_data.pieces, highlight_src=selected_src)
 
@@ -571,3 +566,6 @@ def draw_board_ui(screen, board_data, legal_actions=None, selected_src=None,
     if hint_data is not None:
         actions, visits, q_values = hint_data
         draw_mcts_hints(screen, actions, visits, q_values)
+
+    if move_arrows:
+        draw_move_arrows(screen, move_arrows)

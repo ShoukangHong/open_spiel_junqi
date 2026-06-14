@@ -22,7 +22,8 @@ def _make_mock_root(state, visits_list):
         c.q_value = 0.0
         children.append(c)
     root.children = children
-    root.best_child.return_value = children[0]  # highest visits = first legal
+    root.explore_count = sum(visits_list)  # needed by compute_solved_policy
+    root.best_child.return_value = children[0]
     return root
 
 

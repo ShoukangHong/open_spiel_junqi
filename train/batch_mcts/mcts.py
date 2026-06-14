@@ -31,18 +31,24 @@ from train.batch_mcts.node import Node
 from train.batch_mcts.config import MCTSConfig
 
 
-def compute_solved_policy(children, player, max_utility, alpha=2.0):
+def compute_solved_policy(children, player, max_utility, alpha=5.0,
+                          root_visits=None):
     """Solved-aware policy from root children.
+
+    Confidence uses *root_visits* (not per-child) because solving stops
+    individual exploration — only the parent accumulates more visits.
 
     Three cases:
       1. All children proven → best-outcome children split evenly.
-      2. Some non-loss proven → reward/penalty model:
-         weight = exp(α × diff × √N)  where diff = eff_i - best_val.
-         eff_i = outcome for proven, Q for unproven.
+      2. Some non-loss proven → reward/penalty: weight = exp(α×diff×√root_N).
       3. Only loss-proven or none → visit-proportional, loss proven zeroed.
 
     Returns: dict {action: probability}.
     """
+    if root_visits is None:
+        root_visits = max(sum(c.explore_count for c in children), 1)
+    root_conf = math.sqrt(max(root_visits, 1))
+
     # Case 1: fully solved
     all_solved = all(c.outcome is not None for c in children)
     non_loss = [c for c in children
@@ -71,8 +77,8 @@ def compute_solved_policy(children, player, max_utility, alpha=2.0):
         for c in children:
             c_eff = eff.get(c.action, 0.0)
             diff = c_eff - best_val
-            confidence = math.sqrt(max(c.explore_count, 1))
-            weights[c.action] = math.exp(alpha * diff * confidence)
+            conf = root_conf if c.outcome is not None else math.sqrt(max(c.explore_count, 1))
+            weights[c.action] = math.exp(alpha * diff * conf)
         total_w = sum(weights.values())
         return {a: w / max(total_w, 1e-9) for a, w in weights.items()}
 
@@ -680,7 +686,8 @@ class BatchMCTS:
         # Solved-aware policy.
         player = state.current_player()
         policy_dict = compute_solved_policy(
-            root.children, player, self.max_utility)
+            root.children, player, self.max_utility,
+            root_visits=root.explore_count)
         policy = [(a, policy_dict.get(a, 0.0))
                   for a in state.legal_actions(state.current_player())]
 

@@ -72,6 +72,18 @@ class ActorShm:
         import sys
         return sys.platform != "win32"
 
+    def write_input_obs(self, obs):
+        """Server only needs obs — skip mask for zero-copy efficiency."""
+        n = obs.shape[0]
+        self._write_bytes(0, np.int32(n).tobytes())
+        off = self._in_off
+        if self._has_direct_view():
+            dst = np.ndarray(obs.shape, dtype=np.float32,
+                             buffer=self._shm.buf, offset=off)
+            np.copyto(dst, obs)
+        else:
+            self._write_bytes(off, obs.astype(np.float32).tobytes(order='C'))
+
     def write_input(self, obs, mask):
         n = obs.shape[0]
         self._write_bytes(0, np.int32(n).tobytes())
@@ -102,6 +114,16 @@ class ActorShm:
         size = n * self._mask_flat
         mask = np.frombuffer(self._shm.buf, dtype=np.bool_, count=size, offset=off)
         return obs.reshape(n, self._obs_flat), mask.reshape(n, self._mask_flat)
+
+    def read_input_obs(self):
+        """Server-side: read only obs, skip mask (not needed for forward)."""
+        n = int(np.frombuffer(self._shm.buf[0:4], dtype=np.int32)[0])
+        if n <= 0:
+            return None
+        off = self._in_off
+        size = n * self._obs_flat
+        return np.frombuffer(self._shm.buf, dtype=np.float32,
+                             count=size, offset=off).reshape(n, self._obs_flat)
 
     def write_output(self, policy_logits, value_logits):
         """Pad policy to pol_flat, write to output area."""

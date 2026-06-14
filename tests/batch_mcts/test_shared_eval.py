@@ -20,6 +20,9 @@ class _MockModel:
     def step_up(self):
         self._step += 1
 
+    def load_state_dict(self, sd):
+        pass  # weight-update handled via step_up()
+
     def batch_forward_raw(self, obs):
         """Raw logits that softmax back to _wdl values."""
         n = obs.shape[0]
@@ -97,6 +100,15 @@ def _stop_server(server):
         server._thread.join(timeout=3)
     except Exception:
         pass
+    # Clean up shared memory buffers
+    for shm in list(server._shm_bufs.values()):
+        try:
+            shm.close()
+            shm.unlink()
+        except Exception:
+            pass
+    server._shm_bufs.clear()
+    server._shm_names.clear()
 
 
 # ── Tests ───────────────────────────────────────────────────────────────────
@@ -106,7 +118,7 @@ def test_single_inference():
     mm = _MockModel("main")
     server = InferenceServer()
     try:
-        rq = server.register_actor(0)
+        rq = server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9)
         _start_server(server, {"main": mm})
 
         ev = SharedEvaluator(game, server.incoming_queue, rq, actor_id=0,
@@ -126,7 +138,7 @@ def test_batch_order():
     mm = _MockModel("main")
     server = InferenceServer()
     try:
-        rq = server.register_actor(0)
+        rq = server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9)
         _start_server(server, {"main": mm})
 
         ev = SharedEvaluator(game, server.incoming_queue, rq, actor_id=0,
@@ -148,7 +160,7 @@ def test_multi_model_routing():
     m0, m1 = _MockModel("m0"), _MockModel("m1")
     server = InferenceServer()
     try:
-        rq0, rq1 = server.register_actor(0), server.register_actor(1)
+        rq0, rq1 = server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9), server.register_actor(1, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9)
         _start_server(server, {"m0": m0, "m1": m1})
 
         ev0 = SharedEvaluator(game, server.incoming_queue, rq0, actor_id=0,
@@ -173,7 +185,7 @@ def test_weight_update_changes_output():
     mm = _MockModel("main")
     server = InferenceServer()
     try:
-        rq = server.register_actor(0)
+        rq = server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9)
         _start_server(server, {"main": mm})
 
         ev = SharedEvaluator(game, server.incoming_queue, rq, actor_id=0,
@@ -199,7 +211,7 @@ def test_wdl_mode():
     mm = _MockModel("main_wdl", )
     server = InferenceServer()
     try:
-        rq = server.register_actor(0)
+        rq = server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9)
         _start_server(server, {"main_wdl": mm}, )
 
         ev = SharedEvaluator(game, server.incoming_queue, rq, actor_id=0,
@@ -233,7 +245,7 @@ def test_wdl_scalar_value_perspective():
 
     server = InferenceServer()
     try:
-        rq = server.register_actor(0)
+        rq = server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9)
         specs = {"wdl": {"model": _FixedWDLModel()}}
         server._thread = threading.Thread(
             target=_run_server,
@@ -273,7 +285,7 @@ def test_same_actor_different_models():
     m0, m1 = _MockModel("m0"), _MockModel("m1")
     server = InferenceServer()
     try:
-        rq = server.register_actor(0)
+        rq = server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9)
         _start_server(server, {"m0": m0, "m1": m1})
 
         ev0 = SharedEvaluator(game, server.incoming_queue, rq, actor_id=0,
@@ -300,7 +312,7 @@ def test_multi_actor_multi_model():
     m0, m1 = _MockModel("m0"), _MockModel("m1")
     server = InferenceServer()
     try:
-        rq0, rq1 = server.register_actor(0), server.register_actor(1)
+        rq0, rq1 = server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9), server.register_actor(1, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9)
         _start_server(server, {"m0": m0, "m1": m1})
 
         ev0_m0 = SharedEvaluator(game, server.incoming_queue, rq0, actor_id=0,
@@ -384,7 +396,7 @@ def test_stress_concurrent():
     server = InferenceServer()
     try:
         num_actors = 4
-        rqs = [server.register_actor(i) for i in range(num_actors)]
+        rqs = [server.register_actor(i, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9) for i in range(num_actors)]
         _start_server(server, {"m0": m0, "m1": m1})
 
         states = [_make_state([]), _make_state([0]), _make_state([0, 4]),
@@ -420,7 +432,7 @@ def test_stress_concurrent_wdl():
     server = InferenceServer()
     try:
         num_actors = 4
-        rqs = [server.register_actor(i) for i in range(num_actors)]
+        rqs = [server.register_actor(i, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9) for i in range(num_actors)]
         _start_server(server, {"m0_wdl": m0, "m1_wdl": m1}, )
 
         states = [_make_state([]), _make_state([0]), _make_state([0, 4]),
@@ -459,7 +471,7 @@ def test_best_model_routing():
     m_best = _MockModel("best")
     server = InferenceServer()
     try:
-        rq = server.register_actor(0)
+        rq = server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9)
         _start_server(server, {"main": m_main, "best": m_best})
         ev_main = SharedEvaluator(game, server.incoming_queue, rq,
                                   actor_id=0, model_id="main")
@@ -483,7 +495,7 @@ def test_best_model_weight_update():
     m_best = _MockModel("best")
     server = InferenceServer()
     try:
-        rq = server.register_actor(0)
+        rq = server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9)
         _start_server(server, {"best": m_best})
         ev = SharedEvaluator(game, server.incoming_queue, rq,
                              actor_id=0, model_id="best")

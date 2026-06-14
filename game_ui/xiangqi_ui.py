@@ -21,11 +21,11 @@ from game_ui.xiangqi_render import (
 from train.core.model_builder import build_xiangqi_model
 
 # ── Config ──────────────────────────────────────────────────────────────────
-CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\fast"
-CHECKPOINT_STEP = 30
-MCTS_SIMULATIONS = 512
-HINT_MAX_SIM = 4096
-MCTS_BATCH_SIZE = 16
+CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud"
+CHECKPOINT_STEP = 40
+MCTS_SIMULATIONS = 4096
+HINT_MAX_SIM = 16000
+MCTS_BATCH_SIZE = 64
 UCT_C = 1.41
 
 WIDTH = BOARD_W

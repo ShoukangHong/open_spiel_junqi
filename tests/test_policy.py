@@ -99,7 +99,7 @@ def run_tests():
     ]
     p = compute_solved_policy(c2b, PLAYER, MAX_UTIL)
     print_policy("O: 2b: DRAW vs LOSS(5v) vs unvisited", c2b, p)
-    assert 0.005 < p[5] < 0.05, f"LOSS(5v) policy={p[5]:.4f}"
+    assert p[5] < 0.005, f"LOSS(5v) should be near-zero with root_conf, got {p[5]:.4f}"
     assert p[2] > p[5]
     print("  PASSED")
 
@@ -112,8 +112,8 @@ def run_tests():
     ]
     p = compute_solved_policy(c2c, PLAYER, MAX_UTIL)
     print_policy("O: 2c: DRAW vs unproven(Q=-0.06) vs LOSS", c2c, p)
-    assert p[2] > 0.65, f"DRAW={p[2]:.3f}"
-    assert 0.2 < p[6] < 0.35, f"unproven={p[6]:.3f}"
+    assert p[2] > 0.85, f"DRAW should dominate, got {p[2]:.3f}"
+    assert p[6] < 0.15, f"unproven={p[6]:.3f} (crushed by root_conf + alpha=5)"
     assert p[5] < 0.01
     print("  PASSED")
 
@@ -125,8 +125,8 @@ def run_tests():
     ]
     p = compute_solved_policy(c2d, PLAYER, MAX_UTIL)
     print_policy("O: 2d: DRAW(10v) vs unproven(Q=-0.02, 200v)", c2d, p)
-    assert p[2] > 0.6, f"DRAW={p[2]:.3f}"
-    assert p[6] > 0.3, f"unproven={p[6]:.3f}"
+    assert p[2] > 0.78, f"DRAW={p[2]:.3f} (root_conf dominates small-N proven)"
+    assert p[6] > 0.15, f"unproven={p[6]:.3f}"
     print("  PASSED")
 
     # 2e: Proven WIN dominates

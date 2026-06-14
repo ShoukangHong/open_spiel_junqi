@@ -19,6 +19,18 @@ from train.games.othello.config import OthelloTrainConfig
 from train.games.othello.play import play_game
 from train.model.symmetry import OthelloSymmetry
 
+# Backward-compat aliases
+from train.core.replay_buffer import ReplayBuffer
+from train.core.game_logger import GameLogger
+from train.core.weak_move import (
+    nn_raw_after_move as _nn_raw_after_move,
+    try_weak_move as _try_weak_move,
+    accum_wstats as _accum_wstats,
+    wstats_summary as _wstats_summary,
+    reset_wstats as _reset_wstats,
+)
+TrainConfig = OthelloTrainConfig
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Othello AlphaZero training (BatchMCTS + PyTorch)")
