@@ -12,7 +12,7 @@
 
     "max_simulations": 400,
     "mcts_batch_size": 16,
-    "inference_batch_size": 200,
+    "inference_batch_size": 256,
     "uct_c": 1.41,
     "draw_penalty": 0.1,
     "policy_epsilon": 0.25,
@@ -24,7 +24,8 @@
     "buffer_sampling_frac": 0.1,
     "symmetry": 8,
 
-    "num_actors": 40,
+    "num_actors": 80,
+    "num_gpus": 2,
     "max_steps": 1000,
     "checkpoint_freq": 10,
 

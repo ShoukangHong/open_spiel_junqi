@@ -22,11 +22,12 @@ from train.core.model_builder import build_xiangqi_model
 
 # ── Config ──────────────────────────────────────────────────────────────────
 CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud"
-CHECKPOINT_STEP = 40
+CHECKPOINT_STEP = 30
 MCTS_SIMULATIONS = 4096
 HINT_MAX_SIM = 16000
-MCTS_BATCH_SIZE = 64
+MCTS_BATCH_SIZE = 32
 UCT_C = 1.41
+AI_TEMPERATURE = 0.1  # τ for AI move selection (0 = argmax)
 
 WIDTH = BOARD_W
 HEIGHT = BOARD_H
@@ -166,7 +167,7 @@ def main():
                           draw_rate=hint_draw_rate)
                 pygame.display.flip()
 
-                policy, action = bot.step_with_policy(state)
+                policy, action = bot.step_with_policy(state, AI_TEMPERATURE)
                 print_mcts_info(bot._last_root, state, evaluator, action_label)
                 state.apply_action(action)
                 evaluator.clear_cache()

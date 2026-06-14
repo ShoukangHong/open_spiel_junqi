@@ -88,7 +88,9 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
         import os as _os
         allowed = sorted(_os.sched_getaffinity(0))
         if len(allowed) >= 4:
-            _os.sched_setaffinity(0, set(allowed[:-1]))
+            num_gpus = max(cfg_dict.get('num_gpus', 1), 1)
+            leave = min(num_gpus, len(allowed) - 1)
+            _os.sched_setaffinity(0, set(allowed[:-leave]))
     except Exception as _e:
         print(f"[actor-{actor_id}] CPU affinity failed: {_e}", flush=True)
     cfg = config_class(**cfg_dict)
@@ -188,23 +190,18 @@ def run_training(
         int(cfg.replay_buffer_size * cfg.buffer_sampling_frac),
         cfg.train_batch_size)
 
-    # ── Shared inference server ────────────────────────────────────────────
-    inference_server = InferenceServer(build_model_fn=build_model_fn)
+    # ── Inference servers (one per GPU) ─────────────────────────────────
+    num_gpus = max(getattr(cfg, 'num_gpus', 1), 1)
+    servers = []  # list of (server, a_start, a_end, gpu_id)
     actors = []
     if cfg.num_actors > 1:
         model.save_checkpoint(_LATEST)
         cfg_dict = asdict(cfg)
         cfg_dict["path"] = cfg.path
-        incoming_q = inference_server.incoming_queue
         obs_flat = int(np.prod(game.observation_tensor_shape()))
         mask_flat = game.num_distinct_actions()
-        for i in range(cfg.num_actors):
-            inference_server.register_actor(i, cfg.mcts_batch_size,
-                                            obs_flat, mask_flat,
-                                            mask_flat)
-        inference_server.register_model(
-            "main", model._model.state_dict(),
-            cfg.nn_width, cfg.nn_depth)
+
+        # Best-model state dict (shared across all servers)
         best_sd = model._model.state_dict()
         best_file = os.path.join(cfg.path, "best_step.txt")
         if os.path.exists(best_file):
@@ -219,20 +216,41 @@ def run_training(
                     _log(f"[train] Best model: step {best_step}")
             except Exception:
                 pass
-        inference_server.register_model(
-            "best", best_sd, cfg.nn_width, cfg.nn_depth)
-        inference_server.start(cfg.game, cfg.inference_batch_size)
-        for i in range(cfg.num_actors):
-            result_q = inference_server.result_queue(i)
-            shm_name = inference_server.actor_shm_name(i)
-            state_q = mp.Queue(maxsize=200)
-            p = mp.Process(target=actor_process,
-                           args=(config_class, cfg_dict, incoming_q, result_q,
-                                 state_q, i, play_game_fn, shm_name),
-                           name=f"actor-{i}")
-            p.start()
-            actors.append((p, state_q))
-        _log(f"[train] Spawned {cfg.num_actors} actor processes")
+
+        actors_per_gpu = (cfg.num_actors + num_gpus - 1) // num_gpus
+        for gpu_id in range(num_gpus):
+            server = InferenceServer(build_model_fn=build_model_fn, gpu_id=gpu_id)
+            a_start = gpu_id * actors_per_gpu
+            a_end = min(a_start + actors_per_gpu, cfg.num_actors)
+            if a_start >= a_end:
+                break  # fewer actors than GPUs
+
+            # Register actor slots for this GPU (local IDs: 0, 1, ...)
+            for local_id in range(a_end - a_start):
+                server.register_actor(local_id, cfg.mcts_batch_size,
+                                      obs_flat, mask_flat, mask_flat)
+            server.register_model("main", model._model.state_dict(),
+                                  cfg.nn_width, cfg.nn_depth)
+            server.register_model("best", best_sd, cfg.nn_width, cfg.nn_depth)
+            server.start(cfg.game, cfg.inference_batch_size)
+            servers.append((server, a_start, a_end, gpu_id))
+
+        # Spawn actors, each connected to its GPU's server
+        for server, a_start, a_end, gpu_id in servers:
+            incoming_q = server.incoming_queue
+            for global_id in range(a_start, a_end):
+                local_id = global_id - a_start
+                result_q = server.result_queue(local_id)
+                shm_name = server.actor_shm_name(local_id)
+                state_q = mp.Queue(maxsize=200)
+                p = mp.Process(target=actor_process,
+                               args=(config_class, cfg_dict, incoming_q, result_q,
+                                     state_q, local_id, play_game_fn, shm_name),
+                               name=f"actor-gpu{gpu_id}-{local_id}")
+                p.start()
+                actors.append((p, state_q))
+        _log(f"[train] {len(actors)} actors on {len(servers)} GPU(s)"
+             f" ({actors_per_gpu} each)")
 
     # ── Training state ─────────────────────────────────────────────────────
     global_rng = np.random.RandomState(cfg.seed + start_step)
@@ -437,12 +455,13 @@ def run_training(
                 ckpt_path = model.save_checkpoint(step)
                 _log(f"  [checkpoint] Saved {ckpt_path}")
 
-            # ── Broadcast weights to actors ────────────────────────────
-            if cfg.num_actors > 1:
+            # ── Broadcast weights to all GPU servers ──────────────────
+            if cfg.num_actors > 1 and servers:
                 model.save_checkpoint(_LATEST)
-                inference_server.update_weights(
-                    "main", model._model.state_dict(),
-                    cfg.inference_batch_size)
+                main_sd = model._model.state_dict()
+                for server, _, _, _ in servers:
+                    server.update_weights("main", main_sd,
+                                          cfg.inference_batch_size)
                 _last_best = getattr(run_training, "_last_best_step", 0)
                 best_file = os.path.join(cfg.path, "best_step.txt")
                 if os.path.exists(best_file):
@@ -456,8 +475,9 @@ def run_training(
                                 best_sd = torch.load(
                                     ckpt, map_location="cpu",
                                     weights_only=False)["model_state_dict"]
-                                inference_server.update_weights(
-                                    "best", best_sd, cfg.inference_batch_size)
+                                for server, _, _, _ in servers:
+                                    server.update_weights(
+                                        "best", best_sd, cfg.inference_batch_size)
                                 _log(f"  [best] updated → step {cur_best}")
                             run_training._last_best_step = cur_best
                     except Exception:
@@ -481,7 +501,10 @@ def run_training(
                 p.terminate()
         for p, q in actors:
             p.join(timeout=5)
-        inference_server.terminate()
+        for server, _, _, _ in servers:
+            server.stop()
+            server.shutdown()
+            server.terminate()
         for child in mp.active_children():
             child.terminate()
             child.join(timeout=3)

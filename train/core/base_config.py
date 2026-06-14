@@ -37,6 +37,7 @@ class BaseTrainConfig:
 
     # Training loop
     num_actors: int = 1
+    num_gpus: int = 1             # self-play inference across this many GPUs
     max_steps: int = 300
     checkpoint_freq: int = 10
 

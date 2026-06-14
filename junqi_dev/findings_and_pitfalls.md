@@ -197,6 +197,40 @@ BLOB 存原始字节，Othello obs 含大量 0，未压缩下 ~7-10× 于 .npz�
 
 **修复**：删 `eval_milestone_interval`，改为等分当前训练步数取最近 checkpoint。1 个 best + (N-1) 个等分点。`select_eval_references` 封装。
 
+### 28. `compute_solved_policy` 置信度用 root_visits 而非 child_visits
+
+原公式对所有 child 用 `sqrt(child_N)` 算置信度。但 solver 停止子节点探索后，已证明的子节点访问量不再增长，只有根节点继续累积。一个小-N 的 proven win 用 `sqrt(child_N)` 只有弱置信度，容易被高-N 的 unproven 子节点压过。
+
+**修复**：proven child 改用 `sqrt(root_N)`（根节点总访问量），unproven 保持 `sqrt(child_N)`。同时 α 从 2.0 提升到 5.0，增强 proven 节点的区分力。
+
+### 29. 新模型 `value_fc2` 均匀初始化导致 draw bias
+
+某些随机种子下，`nn.init.xavier_uniform_` 初始化的 value 头 logits 几乎相等 → softmax 后 W≈0, D≈0.99, L≈0。MCTS 开局时 D 值极高，导致所有着法 Q≈0，搜索无方向。
+
+**修复**：`nn.init.zeros_(m.weight)` 使 logits 全零 → softmax 均匀 [0.33, 0.33, 0.33] → 正确反映开局不确定性。
+
+### 30. Windows 共享内存 `buf[slice] = bytes` 不支持
+
+Python 3.11 Windows 上，`SharedMemory.buf` 返回的 `memoryview` 不支持 `buf[offset:offset+n] = bytes_obj` 的切片赋值（Linux 可以）。`np.ndarray(buffer=shm.buf, offset=off)` 的零拷贝视图在 Windows 上也不稳定。
+
+**修复**：`_write_bytes` fallback 用 `np.frombuffer(data, dtype=np.uint8)` 中转，再通过 `np.ndarray` 写入 buffer。`_has_direct_view()` 在非 Windows 平台才启用 `np.copyto` 零拷贝路径。
+
+### 31. 消息处理循环重复 append 导致结果队列残留
+
+合并 `shared_evaluator.py` 时旧版消息处理代码未被完全删除，每条推理消息被 append 到 `pending` 两次。服务器返回两份结果：`_recv` 取走第一份（正确），第二份残留队列中被下一次 `_recv` 提前取走，拿到过期的前一步推理结果。
+
+**现象**：`test_weight_update_changes_output` 权重更新后推理结果不变。
+
+**修复**：删除重复的旧代码块。
+
+**教训**：合并冲突解决后必须逐行对比 diff，确认删除了所有旧逻辑。自动化测试的权重更新场景能检测这类问题。
+
+### 32. Inference server 纯 busy-polling 浪费 CPU
+
+原主循环用 `get_nowait()` + `sleep(0.001)` / `sleep(0.0005)` 轮询，空闲时每秒空转 1000 次，凑 batch 时每秒 2000 次。CPU 被无效轮询占据。
+
+**修复**：空闲时 `get(timeout=0.1)` 阻塞等待，有消息才唤醒；凑 batch 时 `get(timeout=0.002)` 短暂阻塞。提取 `_handle_msg()` 内部函数消除 drain / 等待 / 处理三处重复代码。预分配 `obs_buf = np.empty((max_batch, obs_dim))` 消除每次 batch 的 `np.concatenate` malloc/memcpy。
+
 ---
 
 ## 测试运行

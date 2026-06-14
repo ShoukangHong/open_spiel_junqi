@@ -6,8 +6,10 @@ import tempfile
 
 import numpy as np
 
+from train.batch_mcts.node import Node
 from train.core.checkpoint import find_latest_checkpoint
 from train.core.base_config import BaseTrainConfig, load_base_config
+from train.core.play import _stable_qdr
 from train.core.weak_move import accum_wstats, reset_wstats, wstats_summary
 
 
@@ -210,6 +212,30 @@ def test_sqlite_expand_buffer():
         except: pass
 
 
+def test_sqlite_recent_db():
+    """Recent DB limits rows to the latest N."""
+    db = _tempfile.mktemp(suffix=".db")
+    rdb = db.replace(".db", "_recent.db")
+    try:
+        obs, mask, pol, val = _make_state()
+        buf = ReplayBuffer(100, db_path=db, recent_db_rows=50)
+        for i in range(120):
+            buf.append(obs, mask, pol, val, step=i // 10, tag="")
+        buf.flush()
+        buf.close()
+
+        # Recent DB should have ≤ 50 rows
+        import sqlite3
+        rc = sqlite3.connect(rdb)
+        cnt = rc.execute("SELECT COUNT(*) FROM states").fetchone()[0]
+        assert cnt <= 50, f"recent DB should have ≤50 rows, got {cnt}"
+        rc.close()
+    finally:
+        for f in (db, rdb):
+            try: os.unlink(f)
+            except: pass
+
+
 def test_sqlite_empty_start():
     db = _tempfile.mktemp(suffix=".db")
     try:
@@ -373,6 +399,72 @@ def test_eval_refs_count_never_exceeds():
         os.remove(best_file)
 
 
+def test_stable_qdr():
+    """_stable_qdr skips children with ≤1 visit (forced-explore noise)."""
+    root = Node(None, 0, 1.0)
+    root.explore_count = 10
+    root.total_reward = 1.0
+    root.draw_reward = 0.3
+
+    # Child with >1 visit — should be included
+    c1 = Node(1, 0, 0.5)
+    c1.explore_count = 5
+    c1.total_reward = 3.0
+    c1.draw_reward = 0.2
+    root.children.append(c1)
+
+    # Child with 1 visit — should be excluded (forced-explore noise)
+    c2 = Node(2, 0, 0.3)
+    c2.explore_count = 1
+    c2.total_reward = -999.0  # noise that would corrupt Q
+    c2.draw_reward = 0.0
+    root.children.append(c2)
+
+    # Child with 0 visits — should be excluded
+    c3 = Node(3, 0, 0.2)
+    c3.explore_count = 0
+    c3.total_reward = 0.0
+    root.children.append(c3)
+
+    q, dr = _stable_qdr(root)
+    # Only c1 contributes: q = 3.0/5 = 0.6, dr = 0.2/5 = 0.04
+    assert abs(q - 0.6) < 1e-9, f"expected q=0.6, got {q}"
+    assert abs(dr - 0.04) < 1e-9, f"expected dr=0.04, got {dr}"
+
+
+def test_stable_qdr_fallback():
+    """_stable_qdr falls back to root values when no child has >1 visit."""
+    root = Node(None, 0, 1.0)
+    root.explore_count = 5
+    root.total_reward = 2.0
+    root.draw_reward = 0.5
+
+    c1 = Node(1, 0, 0.5)
+    c1.explore_count = 1
+    c1.total_reward = 0.0
+    root.children.append(c1)
+
+    c2 = Node(2, 0, 0.5)
+    c2.explore_count = 0
+    root.children.append(c2)
+
+    q, dr = _stable_qdr(root)
+    # No valid child → fallback to root
+    assert q == root.q_value and dr == root.draw_rate, \
+        f"expected fallback to root Q/DR, got q={q} dr={dr}"
+
+
+def test_stable_qdr_no_children():
+    """_stable_qdr with empty children falls back to root."""
+    root = Node(None, 0, 1.0)
+    root.explore_count = 3
+    root.total_reward = 1.5
+    root.draw_reward = 0.1
+
+    q, dr = _stable_qdr(root)
+    assert q == root.q_value and dr == root.draw_rate
+
+
 def main():
     tests = [
         test_find_latest_empty, test_find_latest_single,
@@ -381,9 +473,13 @@ def main():
         test_load_base_config_missing_file,
         test_wstats_accum, test_wstats_reset, test_wstats_empty,
         test_backward_compat_imports,
+        test_stable_qdr,
+        test_stable_qdr_fallback,
+        test_stable_qdr_no_children,
         test_sqlite_basic_append_sample, test_sqlite_resume_full,
         test_sqlite_resume_partial, test_sqlite_rollback,
         test_sqlite_expand_buffer, test_sqlite_empty_start,
+        test_sqlite_recent_db,
         test_sqlite_in_memory_mode, test_sqlite_step_tagging,
         test_eval_refs_empty, test_eval_refs_one_ckpt,
         test_eval_refs_evenly_spaced, test_eval_refs_best_not_duplicated,

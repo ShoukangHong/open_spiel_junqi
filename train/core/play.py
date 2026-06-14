@@ -11,6 +11,23 @@ from train.core.policy import mix_advantage
 from train.core.weak_move import try_weak_move
 
 
+def _stable_qdr(root):
+    """Q and draw_rate from children with >1 visit, excluding forced-explore noise.
+
+    Root children that were visited only once (e.g. uniform-expand coverage)
+    add noise to the value target.  Filtering them out gives a stabler V.
+    """
+    valid = [c for c in root.children if c.explore_count > 1]
+    if valid:
+        total_n = sum(c.explore_count for c in valid)
+        q = sum(c.total_reward for c in valid) / total_n
+        dr = sum(c.draw_reward for c in valid) / total_n
+    else:
+        q = root.q_value
+        dr = root.draw_rate
+    return q, dr
+
+
 def _should_prune(pruned, root, cur_player, config, max_utility, dice):
     """Decide whether to prune (win) or truncate (draw) the current game.
 
@@ -123,8 +140,7 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
                 q = root.outcome[cur_player]
                 dr = 1.0 if q == 0 else 0.0
             else:
-                q = root.q_value
-                dr = root.draw_rate
+                q, dr = _stable_qdr(root)
             states_info.append((obs, mask, policy, cur_player, "", q, dr))
             break
 
@@ -175,8 +191,7 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
             q = root.outcome[cur_player]
             dr = 1.0 if q == 0 else 0.0
         else:
-            q = root.q_value
-            dr = root.draw_rate
+            q, dr = _stable_qdr(root)
         states_info.append((obs, mask, policy, cur_player, tag, q, dr))
 
         # Action selection with temperature

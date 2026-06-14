@@ -76,7 +76,10 @@ def compute_solved_policy(children, player, max_utility, alpha=5.0,
         weights = {}
         for c in children:
             c_eff = eff.get(c.action, 0.0)
-            diff = c_eff - best_val
+            if c.outcome is not None and c.outcome[player] == max_utility:
+                diff = 1/math.sqrt(c.explore_count)
+            else:
+                diff = c_eff - best_val
             conf = root_conf if c.outcome is not None else math.sqrt(max(c.explore_count, 1))
             weights[c.action] = math.exp(alpha * diff * conf)
         total_w = sum(weights.values())
@@ -663,11 +666,13 @@ class BatchMCTS:
         """Return the best action from the given state."""
         return self.step_with_policy(state)[1]
 
-    def step_with_policy(self, state):
+    def step_with_policy(self, state, temperature=0.0):
         """Return (policy, action) for the given state.
 
         Policy is visit-count proportional unless the solver has proven
         winning children, in which case all mass goes to those children.
+        If *temperature* > 0, the action is sampled from the policy
+        sharpened by τ (τ=0 → greedy, τ=1 → raw distribution).
         """
         if state.is_chance_node():
             return [(pyspiel.INVALID_ACTION, 1.0)], pyspiel.INVALID_ACTION
@@ -691,7 +696,14 @@ class BatchMCTS:
         policy = [(a, policy_dict.get(a, 0.0))
                   for a in state.legal_actions(state.current_player())]
 
-        action = best.action
+        if temperature > 0 and len(policy) > 1:
+            actions, probs = zip(*policy)
+            probs = np.array(probs, dtype=np.float64)
+            probs = probs ** (1.0 / temperature)
+            probs /= probs.sum()
+            action = actions[self._random_state.choice(len(actions), p=probs)]
+        else:
+            action = best.action
         return policy, action
 
     # ── Internal methods ───────────────────────────────────────────────
@@ -757,10 +769,13 @@ class BatchMCTS:
                         candidates = [c for c in node.children
                                       if c.outcome is not None
                                       and c.outcome[player] >= best_proven]
+            # Unvisited children of root get a large bonus so the first
+            # batches naturally cover every legal action — none skipped.
             best_child = max(
                 candidates,
                 key=lambda c: c.puct_with_virtual(
-                    node.visit_count, uct_c, vloss))
+                    node.visit_count, uct_c, vloss)
+                + (1e6 if node is root and c.explore_count == 0 else 0))
 
             # Apply virtual loss
             best_child.virtual_visits += 1

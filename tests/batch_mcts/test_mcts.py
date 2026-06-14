@@ -423,6 +423,35 @@ def test_search_scaling():
 #  Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
+def _make_tictactoe_bot(seed=42):
+    game = pyspiel.load_game("tic_tac_toe")
+    config = MCTSConfig(max_simulations=64, batch_size=8,
+                        uct_c=UCT_C, policy_epsilon=0)
+    return BatchMCTS(game, config, ZeroEvaluator(),
+                     random_state=np.random.RandomState(seed))
+
+
+def test_step_temperature():
+    """step_with_policy: τ=0 is greedy, τ>0 samples with variation."""
+    state = pyspiel.load_game("tic_tac_toe").new_initial_state()
+
+    # τ=0: deterministic — same seed → same action
+    action0 = _make_tictactoe_bot(42).step_with_policy(state, temperature=0.0)[1]
+    for _ in range(5):
+        m = _make_tictactoe_bot(42)
+        a = m.step_with_policy(state, temperature=0.0)[1]
+        assert a == action0, f"τ=0 should be deterministic, got {a} != {action0}"
+
+    # τ>0: should sample ≥2 different actions over many trials
+    actions_seen = set()
+    for _ in range(30):
+        m = _make_tictactoe_bot(_)
+        _, a = m.step_with_policy(state, temperature=0.5)
+        actions_seen.add(a)
+    assert len(actions_seen) >= 2, \
+        f"τ=0.5 should sample ≥2 actions, got {len(actions_seen)}"
+
+
 def main():
     print("=" * 60)
     print("  BatchMCTS Verification Suite")
@@ -434,6 +463,7 @@ def main():
         ("C", "TicTacToe optimal moves", test_tictactoe),
         ("D", "Batch-size stability", test_batch_stability),
         ("E", "Search scaling", test_search_scaling),
+        ("F", "Step temperature sampling", test_step_temperature),
     ]
 
     failed = 0

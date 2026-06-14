@@ -542,6 +542,8 @@ def main():
         test_best_model_routing,
         test_best_model_weight_update,
         test_best_model_prob_selection,
+        test_multi_server_isolation,
+        test_multi_server_weight_broadcast,
     ]
     failed = 0
     for fn in tests:
@@ -604,6 +606,104 @@ def test_shm():
             assert all(v >= 0 for v in val)
     finally:
         _stop_server(server)
+
+
+def test_multi_server_isolation():
+    """Two servers on different GPU IDs with different models → different results."""
+    import threading
+
+    game = pyspiel.load_game("tic_tac_toe")
+    mm0 = _MockModel("m0")
+    mm1 = _MockModel("m1")
+
+    s0 = InferenceServer(gpu_id=0)
+    s1 = InferenceServer(gpu_id=1)
+    try:
+        rq0 = s0.register_actor(0, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9)
+        rq1 = s1.register_actor(0, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9)
+
+        s0._thread = threading.Thread(
+            target=_run_server,
+            args=(s0.incoming_queue, s0._result_qs, {"main": {"model": mm0}},
+                  "tic_tac_toe", 128, None, s0._shm_bufs, 0))
+        s1._thread = threading.Thread(
+            target=_run_server,
+            args=(s1.incoming_queue, s1._result_qs, {"main": {"model": mm1}},
+                  "tic_tac_toe", 128, None, s1._shm_bufs, 1))
+        s0._thread.start()
+        s1._thread.start()
+        time.sleep(0.05)
+
+        ev0 = SharedEvaluator(game, s0.incoming_queue, rq0, actor_id=0, model_id="main")
+        ev1 = SharedEvaluator(game, s1.incoming_queue, rq1, actor_id=0, model_id="main")
+
+        s = _make_state([0, 4])
+        obs = np.asarray(s.observation_tensor(), dtype=np.float32)
+        v0, _ = ev0._inference(s)
+        v1, _ = ev1._inference(s)
+
+        # Different models produce different outputs
+        assert not np.allclose(np.asarray(v0), np.asarray(v1), atol=0.01)
+        # Each matches its own model
+        assert np.allclose(np.asarray(v0), _expected_wdl("m0", 0, obs), atol=0.01)
+        assert np.allclose(np.asarray(v1), _expected_wdl("m1", 0, obs), atol=0.01)
+    finally:
+        _stop_server(s0)
+        _stop_server(s1)
+
+
+def test_multi_server_weight_broadcast():
+    """Same model on two servers — weight update reaches both."""
+    import threading
+
+    game = pyspiel.load_game("tic_tac_toe")
+    mm = _MockModel("main")
+
+    s0 = InferenceServer(gpu_id=0)
+    s1 = InferenceServer(gpu_id=1)
+    try:
+        rq0 = s0.register_actor(0, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9)
+        rq1 = s1.register_actor(0, max_states=8, obs_flat=27, mask_flat=9, pol_flat=9)
+
+        specs = {"main": {"model": mm}}
+        s0._thread = threading.Thread(
+            target=_run_server,
+            args=(s0.incoming_queue, s0._result_qs, specs,
+                  "tic_tac_toe", 128, None, s0._shm_bufs, 0))
+        s1._thread = threading.Thread(
+            target=_run_server,
+            args=(s1.incoming_queue, s1._result_qs, specs,
+                  "tic_tac_toe", 128, None, s1._shm_bufs, 1))
+        s0._thread.start()
+        s1._thread.start()
+        time.sleep(0.05)
+
+        ev0 = SharedEvaluator(game, s0.incoming_queue, rq0, actor_id=0, model_id="main")
+        ev1 = SharedEvaluator(game, s1.incoming_queue, rq1, actor_id=0, model_id="main")
+
+        s = _make_state([0, 4])
+        obs = np.asarray(s.observation_tensor(), dtype=np.float32)
+
+        # Before update: both return step 0
+        v0_before, _ = ev0._inference(s)
+        v1_before, _ = ev1._inference(s)
+        assert np.allclose(np.asarray(v0_before), _expected_wdl("main", 0, obs), atol=0.01)
+        assert np.allclose(np.asarray(v1_before), _expected_wdl("main", 0, obs), atol=0.01)
+
+        # Advance model state + broadcast to both servers
+        mm.step_up()
+        s0.update_weights("main", {}, 128)
+        s1.update_weights("main", {}, 128)
+        time.sleep(0.1)
+
+        # After update: both return step 1
+        v0_after, _ = ev0._inference(s)
+        v1_after, _ = ev1._inference(s)
+        assert np.allclose(np.asarray(v0_after), _expected_wdl("main", 1, obs), atol=0.01)
+        assert np.allclose(np.asarray(v1_after), _expected_wdl("main", 1, obs), atol=0.01)
+    finally:
+        _stop_server(s0)
+        _stop_server(s1)
 
 
 def test_shared_eval():

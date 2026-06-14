@@ -118,12 +118,21 @@ _MAX_WAIT = 0.010
 
 
 def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
-               build_model_fn=None, actor_shms=None):
+               build_model_fn=None, actor_shms=None, gpu_id=0):
     """GPU inference process with multi-model support.
 
     *actor_shms*: dict actor_id → ActorShm (optional shared memory buffers).
     """
     import os as _os
+
+    # ── Bind to specific GPU ────────────────────────────────────────────────
+    import torch as _torch
+    if _torch.cuda.is_available():
+        try:
+            _torch.cuda.set_device(gpu_id)
+        except RuntimeError:
+            print(f"[inf-srv GPU{gpu_id}] set_device failed, using default GPU",
+                  flush=True)
 
     # ── Priority / CPU affinity ───────────────────────────────────────────────
     try:
@@ -139,13 +148,13 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
     try:
         allowed = sorted(_os.sched_getaffinity(0))
         if len(allowed) >= 4:
-            # Pin to different core based on process ID to avoid collisions
-            core = allowed[-(1 + (_os.getpid() % min(4, len(allowed) - 1)))]
+            # Pin to distinct core per GPU (high end; actors use the rest)
+            core = allowed[-(1 + gpu_id)]
             _os.sched_setaffinity(0, {core})
-            print(f"[inference-server] CPU affinity: core {core} "
+            print(f"[inf-srv GPU{gpu_id}] CPU affinity: core {core} "
                   f"(of {len(allowed)} available)", flush=True)
     except Exception as _e:
-        print(f"[inference-server] CPU affinity failed: {_e}", flush=True)
+        print(f"[inf-srv GPU{gpu_id}] CPU affinity failed: {_e}", flush=True)
 
     import pyspiel
     if build_model_fn is None:
@@ -155,13 +164,13 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
     try:
         import pynvml as _nvml_lib
         _nvml_lib.nvmlInit()
-        _nvml_handle = _nvml_lib.nvmlDeviceGetHandleByIndex(0)
+        _nvml_handle = _nvml_lib.nvmlDeviceGetHandleByIndex(gpu_id)
         _has_nvml = True
     except Exception:
         try:
             import nvidia_ml_py as _nvml_lib
             _nvml_lib.nvmlInit()
-            _nvml_handle = _nvml_lib.nvmlDeviceGetHandleByIndex(0)
+            _nvml_handle = _nvml_lib.nvmlDeviceGetHandleByIndex(gpu_id)
             _has_nvml = True
         except Exception:
             _has_nvml = False
@@ -415,7 +424,7 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
                 hw += (f"  cpu_srv={srv_cpu:.0f}%"
                        f"  cpu_act={act_cpu:.0f}%(@{act_count})"
                        f"  mem={psutil.virtual_memory().percent}%")
-            print(f"[inference-server] batches={int_batches}  "
+            print(f"[inf-srv GPU{gpu_id}] batches={int_batches}  "
                   f"states={int_states}  "
                   f"avg_batch={int_states/n:.1f}  "
                   f"avg_fwd={int_fwd_ms/n:.1f}ms  "
@@ -437,12 +446,13 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
 
 class InferenceServer:
 
-    def __init__(self, build_model_fn=None):
+    def __init__(self, build_model_fn=None, gpu_id=0):
         self._incoming = mp.Queue(maxsize=500)
         self._result_qs = {}
         self._model_specs = {}
         self._proc = None
         self._build_model_fn = build_model_fn
+        self._gpu_id = gpu_id
         self._shm_bufs = {}    # actor_id → ActorShm
         self._shm_names = {}   # actor_id → name (for actor to open)
 
@@ -458,7 +468,7 @@ class InferenceServer:
         if max_states > 0:
             from train.batch_mcts.shm import ActorShm
             import os as _os, time as _time
-            name = f"jq_{_os.getpid()}_{int(_time.monotonic()*1e6)}_{actor_id}"
+            name = f"jq_{_os.getpid()}_{int(_time.monotonic()*1e6)}_{self._gpu_id}_{actor_id}"
             shm = ActorShm(name, max_states, obs_flat, mask_flat, pol_flat,
                            create=True)
             self._shm_bufs[actor_id] = shm
@@ -485,7 +495,7 @@ class InferenceServer:
             target=_run_server,
             args=(self._incoming, self._result_qs, self._model_specs,
                   game_name, max_batch, self._build_model_fn,
-                  self._shm_bufs),
+                  self._shm_bufs, self._gpu_id),
             daemon=True,
         )
         self._proc.start()

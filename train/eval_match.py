@@ -494,9 +494,9 @@ PLAYER = {
 
 PLAYER = {
     0: {"strategy": "mcts",
-        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\fast",
+        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud",
         "checkpoint_step": 10,
-        "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+        "mcts_simulations": 400, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
     # 1: {"strategy": "mcts", # 早期的benchmark
     #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_argmax", # argmax 240 us benchmark
     #     "checkpoint_step": 240,
@@ -506,9 +506,9 @@ PLAYER = {
     #     "checkpoint_step": 990,
     #     "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
     1: {"strategy": "mcts",
-        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\fast",
-        "checkpoint_step": 30,
-        "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
+        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud",
+        "checkpoint_step": 50,
+        "mcts_simulations": 400, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
 }
 
 if __name__ == "__main__":

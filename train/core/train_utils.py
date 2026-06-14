@@ -78,7 +78,8 @@ def init_training(cfg, game_module, model_builder, ReplayBuffer_class,
                  f"  lr={cfg.learning_rate:.0e}")
 
     buffer = ReplayBuffer_class(max_size=cfg.replay_buffer_size,
-                                 db_path=os.path.join(cfg.path, "buffer.db"))
+                                 db_path=os.path.join(cfg.path, "buffer.db"),
+                                 recent_db_rows=10000)
     samples_per_step = max(
         int(cfg.replay_buffer_size * cfg.buffer_sampling_frac),
         cfg.train_batch_size)

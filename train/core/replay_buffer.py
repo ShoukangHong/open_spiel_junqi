@@ -43,10 +43,11 @@ class ReplayBuffer:
     """
 
     def __init__(self, max_size: int, db_path: str = None,
-                 max_db_rows: int = 1_000_000):
+                 max_db_rows: int = 1_000_000, recent_db_rows: int = 0):
         self._max_size = max_size
         self._db_path = db_path
         self._max_db_rows = max_db_rows
+        self._recent_db_rows = recent_db_rows
         self._obs = None
         self._masks = None
         self._policies = None
@@ -55,6 +56,7 @@ class ReplayBuffer:
         self._index = 0             # total states ever appended
         self._size = 0              # ring occupancy
         self._pending = 0           # unflushed DB inserts
+        self._recent_pending = 0
 
         if db_path:
             self._conn = sqlite3.connect(db_path, timeout=30)
@@ -74,8 +76,29 @@ class ReplayBuffer:
             self._conn.execute("CREATE INDEX IF NOT EXISTS idx_step ON states(step)")
             self._conn.commit()
             self._load_ring_from_db()
+            # Separate small DB for the most recent N rows (fast local download)
+            if recent_db_rows > 0:
+                rpath = db_path.replace(".db", "_recent.db")
+                self._recent_conn = sqlite3.connect(rpath, timeout=30)
+                for p in _WAL_PRAGMAS:
+                    self._recent_conn.execute(p)
+                self._recent_conn.execute(
+                    "CREATE TABLE IF NOT EXISTS states ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  step INTEGER NOT NULL,"
+                    "  obs BLOB NOT NULL,"
+                    "  mask BLOB NOT NULL,"
+                    "  policy BLOB NOT NULL,"
+                    "  value BLOB NOT NULL,"
+                    "  tag TEXT NOT NULL DEFAULT ''"
+                    ")"
+                )
+                self._recent_conn.commit()
+            else:
+                self._recent_conn = None
         else:
             self._conn = None
+            self._recent_conn = None
 
     # ── Public API ──────────────────────────────────────────────────────────
 
@@ -112,6 +135,21 @@ class ReplayBuffer:
                 self._conn.commit()
                 self._pending = 0
                 self._rotate_db()
+        # Recent-only DB (small, fast to download)
+        if self._recent_conn:
+            self._recent_conn.execute(
+                "INSERT INTO states (step, obs, mask, policy, value, tag) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (step, _pack(obs), _pack_bool(mask), _pack(policy),
+                 _pack(value), tag))
+            self._recent_pending += 1
+            if self._recent_pending >= 256:
+                self._recent_conn.execute(
+                    "DELETE FROM states WHERE id NOT IN ("
+                    "  SELECT id FROM states ORDER BY id DESC LIMIT ?)",
+                    (self._recent_db_rows,))
+                self._recent_conn.commit()
+                self._recent_pending = 0
 
     def sample(self, n: int) -> TrainInput:
         """Random sample from the in-memory ring buffer."""
@@ -140,6 +178,13 @@ class ReplayBuffer:
             self._pending = 0
         if self._conn:
             self._rotate_db()
+        if self._recent_conn and self._recent_pending > 0:
+            self._recent_conn.execute(
+                "DELETE FROM states WHERE id NOT IN ("
+                "  SELECT id FROM states ORDER BY id DESC LIMIT ?)",
+                (self._recent_db_rows,))
+            self._recent_conn.commit()
+            self._recent_pending = 0
 
     def _rotate_db(self, db_path=None):
         """If current DB exceeds max_db_rows, archive it and start a new one."""
@@ -244,6 +289,9 @@ class ReplayBuffer:
             conn.execute("DELETE FROM states WHERE step > ?", (target_step,))
             conn.commit()
             conn.close()
+        if self._recent_conn:
+            self._recent_conn.execute("DELETE FROM states")
+            self._recent_conn.commit()
         self._obs = None
         self._load_ring_from_db()
 
@@ -253,6 +301,9 @@ class ReplayBuffer:
         if self._conn:
             self._conn.close()
             self._conn = None
+        if self._recent_conn:
+            self._recent_conn.close()
+            self._recent_conn = None
 
     # ── Properties ──────────────────────────────────────────────────────────
 
