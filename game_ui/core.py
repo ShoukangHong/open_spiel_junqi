@@ -59,12 +59,14 @@ def load_model_for_ui(checkpoint_dir, checkpoint_step, build_model_fn):
 
 
 def create_bot(game, model, mcts_sims, batch_size, uct_c,
-               random_state=None):
+               draw_penalty=0.0, repeat_penalty=0.0, random_state=None):
     """Create a BatchMCTS bot backed by a PyTorch model."""
     evaluator = PyTorchEvaluator(game, model)
     mcts_cfg = MCTSConfig(
         max_simulations=mcts_sims, batch_size=batch_size,
-        uct_c=uct_c, policy_epsilon=0, verbose=False)
+        uct_c=uct_c, draw_penalty=draw_penalty,
+        repeat_penalty=repeat_penalty,
+        policy_epsilon=0, verbose=False)
     bot = BatchMCTS(game, mcts_cfg, evaluator,
                     random_state=random_state or np.random.RandomState())
     return bot, evaluator, mcts_cfg
@@ -81,12 +83,14 @@ class MCTSHintEngine:
     """
 
     def __init__(self, game, evaluator, max_sims=12800, batch_size=16,
-                 uct_c=1.41):
+                 uct_c=1.41, draw_penalty=0.0, repeat_penalty=0.0):
         self._game = game
         self._evaluator = evaluator
         self._max_sims = max_sims
         self._cfg = MCTSConfig(max_simulations=64, batch_size=batch_size,
-                               uct_c=uct_c, policy_epsilon=0, verbose=False)
+                               uct_c=uct_c, draw_penalty=draw_penalty,
+                               repeat_penalty=repeat_penalty,
+                               policy_epsilon=0, verbose=False)
         self._mcts = BatchMCTS(game, self._cfg, evaluator,
                               random_state=np.random.RandomState())
         self._root = None

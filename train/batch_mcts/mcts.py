@@ -30,6 +30,27 @@ import pyspiel
 from train.batch_mcts.node import Node
 from train.batch_mcts.config import MCTSConfig
 
+# Game name → number of static observation planes (skip dynamic ones like
+# move counters).  Games not listed here hash ALL planes.
+_STATIC_OBS_PLANES = {
+    "xiangqi": 15,  # planes 0-14: pieces + player; skip 15 (move#) + 16 (no-cap#)
+}
+
+
+def _position_hash(state):
+    """Hash of the position-relevant part of the observation tensor.
+
+    Skips dynamic planes (e.g. move counters) so that the same board
+    position hashes identically regardless of when it was reached.
+    """
+    obs_shape = state.get_game().observation_tensor_shape()
+    obs = np.asarray(state.observation_tensor(), dtype=np.float32)
+    n_planes = _STATIC_OBS_PLANES.get(state.get_game().get_type().short_name)
+    if n_planes is not None:
+        n = n_planes * obs_shape[1] * obs_shape[2]
+        obs = obs[:n]
+    return hash(obs.tobytes())
+
 
 def compute_solved_policy(children, player, max_utility, alpha=5.0,
                           root_visits=None):
@@ -57,10 +78,15 @@ def compute_solved_policy(children, player, max_utility, alpha=5.0,
 
     if all_solved:
         best_val = max(c.outcome[player] for c in children)
-        best_actions = {c.action for c in children
-                        if c.outcome[player] == best_val}
-        return {c.action: (1.0 / len(best_actions)
-                           if c.action in best_actions else 0.0)
+        best = [c for c in children if c.outcome[player] == best_val]
+        if best_val >= 0:
+            # Win or draw: prefer least-explored (cleanest path)
+            weights = {c.action: 1.0 / max(c.explore_count, 1) for c in best}
+        else:
+            # Losing: prefer most-explored (most tested)
+            weights = {c.action: float(c.explore_count) for c in best}
+        total = sum(weights.values()) or 1.0
+        return {c.action: (weights.get(c.action, 0.0) / total)
                 for c in children}
 
     # Case 2: some non-loss proven → reward/penalty model
@@ -585,6 +611,8 @@ class BatchMCTS:
         self.evaluator = evaluator
         self.max_utility = game.max_utility()
         self._random_state = random_state or np.random.RandomState()
+        self._rep_counts = {}
+        self._repeat_penalty = self.config.repeat_penalty
 
     # ── Public API ──────────────────────────────────────────────────────
 
@@ -597,6 +625,18 @@ class BatchMCTS:
         if root is None:
             root = Node(None, state.current_player(), 1)
             root.state = state.clone()
+
+        # ── Build repetition count from game history ─────────────────────
+        tmp = self._game.new_initial_state()
+        rep_counts = {}  # position_hash → occurrence count
+        rep_counts[_position_hash(tmp)] = 1
+        for a in state.history():
+            tmp.apply_action(a)
+            h = _position_hash(tmp)
+            rep_counts[h] = rep_counts.get(h, 0) + 1
+
+        self._rep_counts = rep_counts
+        self._repeat_penalty = self.config.repeat_penalty  # per-occurrence, capped
 
         max_sim = self.config.max_simulations
         batch_size = self.config.batch_size
@@ -771,11 +811,19 @@ class BatchMCTS:
                                       and c.outcome[player] >= best_proven]
             # Unvisited children of root get a large bonus so the first
             # batches naturally cover every legal action — none skipped.
+            # Repeated positions are penalised per occurrence.
+            # Helper: safe repeat penalty for a child at root.
+            def _repeat_pen(c):
+                if node is not root or c._pos_hash is None:
+                    return 0.0
+                count = self._rep_counts.get(c._pos_hash, 0)
+                return min(count * self._repeat_penalty, 0.8)
             best_child = max(
                 candidates,
                 key=lambda c: c.puct_with_virtual(
                     node.visit_count, uct_c, vloss)
-                + (1e6 if node is root and c.explore_count == 0 else 0))
+                + (1e6 if node is root and c.explore_count == 0 else 0)
+                - _repeat_pen(c))
 
             # Apply virtual loss
             best_child.virtual_visits += 1
@@ -798,9 +846,16 @@ class BatchMCTS:
         """
         player = state.current_player()
         self._random_state.shuffle(prior)
-        node.children = [
-            Node(action, player, prob) for action, prob in prior
-        ]
+        children = []
+        for action, prob in prior:
+            child = Node(action, player, prob)
+            if node.action is None:  # root: pre-compute position hash
+                s = state.clone()
+                s.apply_action(action)
+                if not s.is_terminal():
+                    child._pos_hash = _position_hash(s)
+            children.append(child)
+        node.children = children
 
     def _backprop(self, path, returns, draw_prob=0.0):
         """Backpropagate *returns* and *draw_prob* along *path*."""

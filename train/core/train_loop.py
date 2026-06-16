@@ -43,6 +43,7 @@ from train.core.replay_buffer import ReplayBuffer
 from train.core.train_utils import (
     init_training, maybe_trigger_eval, run_eval_background,
     setup_config_and_logging)
+from train.core.play import assign_players
 from train.core.types import Losses, TrainInput
 from train.core.weak_move import (
     accum_wstats, nn_raw_after_move, reset_wstats, try_weak_move,
@@ -106,6 +107,18 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
                               model_id="main", actor_shm=actor_shm)
     ev_best = SharedEvaluator(game, incoming_q, result_q, actor_id,
                               model_id="best", actor_shm=actor_shm)
+    if getattr(cfg, 'random_opponent_prob', 0) > 0:
+        ev_opp = SharedEvaluator(game, incoming_q, result_q, actor_id,
+                                 model_id="random_opp", actor_shm=actor_shm)
+        mcts_cfg_opp = MCTSConfig(
+            max_simulations=cfg.max_simulations, batch_size=cfg.mcts_batch_size,
+            uct_c=cfg.uct_c, policy_epsilon=cfg.policy_epsilon,
+            policy_alpha=cfg.policy_alpha,
+            draw_penalty=cfg.draw_penalty, verbose=False)
+        mcts_opp = BatchMCTS(game, mcts_cfg_opp, ev_opp,
+                             random_state=np.random.RandomState())
+    else:
+        ev_opp = None; mcts_opp = None
     mcts_cfg = MCTSConfig(
         max_simulations=cfg.max_simulations, batch_size=cfg.mcts_batch_size,
         uct_c=cfg.uct_c, policy_epsilon=cfg.policy_epsilon,
@@ -120,20 +133,21 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
     pending = []
     while True:
         if pending:
-            init_state, allow_weak, tag_override, use_best = pending.pop()
+            (init_state, allow_weak,
+             tag_override, use_best, use_opp) = pending.pop()
+            mcts_p0, mcts_p1, _, _ = assign_players(
+                rng, mcts_main, mcts_best, mcts_opp, use_best=use_best,
+                use_opp=use_opp)
         else:
-            init_state, allow_weak, tag_override, use_best = None, True, "", False
-            if cfg.best_model_prob > 0:
-                use_best = rng.random() < cfg.best_model_prob
-        mcts_p0 = mcts_main
-        mcts_p1 = (mcts_best if use_best else mcts_main)
-        if use_best and rng.random() < 0.5:
-            mcts_p0, mcts_p1 = mcts_p1, mcts_p0
+            init_state, allow_weak, tag_override = None, True, ""
+            mcts_p0, mcts_p1, use_best, use_opp = assign_players(
+                rng, mcts_main, mcts_best, mcts_opp,
+                cfg.best_model_prob, cfg.random_opponent_prob)
         states_info, returns, rare_games, wstats = play_game_fn(
             game, mcts_p0, mcts_p1, cfg, rng, logger=logger,
             init_state=init_state, allow_weak=allow_weak)
         for rs in rare_games:
-            pending.append((rs, False, "rare", use_best))
+            pending.append((rs, False, "rare", use_best, False))
         if (tag_override == "rare" and init_state is not None
                 and not init_state.is_terminal()):
             weak_player = 1 - init_state.current_player()
@@ -232,6 +246,8 @@ def run_training(
             server.register_model("main", model._model.state_dict(),
                                   cfg.nn_width, cfg.nn_depth)
             server.register_model("best", best_sd, cfg.nn_width, cfg.nn_depth)
+            server.register_model("random_opp", model._model.state_dict(),
+                                  cfg.nn_width, cfg.nn_depth)
             server.start(cfg.game, cfg.inference_batch_size)
             servers.append((server, a_start, a_end, gpu_id))
 
@@ -295,7 +311,7 @@ def run_training(
                 while total_states < samples_per_step:
                     if pending:
                         (init_state, allow_weak,
-                         tag_override, use_best) = pending.pop()
+                         tag_override, use_best, _) = pending.pop()
                     else:
                         init_state, allow_weak, tag_override = None, True, ""
                         use_best = (cfg.best_model_prob > 0
@@ -311,7 +327,7 @@ def run_training(
                         init_state=init_state, allow_weak=allow_weak)
 
                     for rs in rare_games:
-                        pending.append((rs, False, "rare", use_best))
+                        pending.append((rs, False, "rare", use_best, False))
 
                     if (tag_override == "rare" and init_state is not None
                             and not init_state.is_terminal()
@@ -482,6 +498,27 @@ def run_training(
                             run_training._last_best_step = cur_best
                     except Exception:
                         pass
+
+                # ── Random opponent: pick a random checkpoint with prob ─
+                if getattr(cfg, 'random_opponent_prob', 0) > 0:
+                    ckpts = [f for f in os.listdir(cfg.path)
+                             if f.startswith("checkpoint-") and f.endswith(".pt")
+                             and f != f"checkpoint-{_LATEST}.pt"
+                             and f != f"checkpoint-{step}.pt"]
+                    if ckpts:
+                        ckpt_file = global_rng.choice(ckpts)
+                        ckpt_path = os.path.join(cfg.path, ckpt_file)
+                        try:
+                            opp_sd = torch.load(
+                                ckpt_path, map_location="cpu",
+                                weights_only=False)["model_state_dict"]
+                            for server, _, _, _ in servers:
+                                server.update_weights(
+                                    "random_opp", opp_sd,
+                                    cfg.inference_batch_size)
+                            _log(f"  [rand opp] {ckpt_file}")
+                        except Exception:
+                            pass
 
             # ── Evaluation ─────────────────────────────────────────────
             _eval_thread, _last_eval_time = maybe_trigger_eval(

@@ -45,6 +45,7 @@ class BaseTrainConfig:
     evaluation_window: int = 50
     eval_reference_count: int = 5
     best_model_prob: float = 0.3       # probability of self-play vs best model
+    random_opponent_prob: float = 0.2  # probability of random ckpt opponent
     eval_min_interval: int = 1800
 
     # Early termination (pruning)

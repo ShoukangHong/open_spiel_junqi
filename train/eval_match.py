@@ -76,6 +76,8 @@ def _mcts_for(player_cfg):
             max_simulations=player_cfg.get("mcts_simulations", 128),
             batch_size=player_cfg.get("mcts_batch_size", 4),
             uct_c=player_cfg.get("mcts_uct_c", 1.41),
+            draw_penalty=tc.get("draw_penalty", 0.0),
+            repeat_penalty=tc.get("repeat_penalty", 0.0),
             policy_epsilon=0, verbose=False)
         _mcts_bots[key] = BatchMCTS(
             game, cfg, ev, random_state=np.random.RandomState(42))
@@ -382,6 +384,8 @@ def _act_parallel(player_cfg, state, move_num, temperature, temp_drop,
                 max_simulations=player_cfg.get("mcts_simulations", 128),
                 batch_size=player_cfg.get("mcts_batch_size", 4),
                 uct_c=player_cfg.get("mcts_uct_c", 1.41),
+                draw_penalty=tc.get("draw_penalty", 0.0),
+                repeat_penalty=tc.get("repeat_penalty", 0.0),
                 policy_epsilon=0, verbose=False)
             _act_parallel._mcts_cache[key] = BatchMCTS(
                 pyspiel.load_game(tc["game"]), cfg, shared_eval,
@@ -470,7 +474,7 @@ def _write_eval_games(f, sequences, score):
 
 
 DEFAULT_NUM_GAMES = 100
-DEFAULT_TEMPERATURE = 0.1
+DEFAULT_TEMPERATURE = 0.03
 DEFAULT_TEMP_DROP = 7
 
 PLAYER = {
@@ -493,9 +497,9 @@ PLAYER = {
 }
 
 PLAYER = {
-    0: {"strategy": "mcts",
+    0: {"strategy": "model",
         "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud",
-        "checkpoint_step": 10,
+        "checkpoint_step": 180,
         "mcts_simulations": 400, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
     # 1: {"strategy": "mcts", # 早期的benchmark
     #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_argmax", # argmax 240 us benchmark
@@ -505,9 +509,9 @@ PLAYER = {
     #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_b",
     #     "checkpoint_step": 990,
     #     "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
-    1: {"strategy": "mcts",
+    1: {"strategy": "model",
         "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud",
-        "checkpoint_step": 50,
+        "checkpoint_step": 230,
         "mcts_simulations": 400, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
 }
 

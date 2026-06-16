@@ -38,6 +38,7 @@ class Node:
         "children",
         "state",           # cached state clone (cheap for Othello)
         "noise_applied",   # whether Dirichlet noise has been applied
+        "_pos_hash",       # hash of static board position (repeat detection)
     )
 
     def __init__(self, action: Optional[int], player: int, prior: float):
@@ -52,6 +53,7 @@ class Node:
         self.children = []
         self.state = None
         self.noise_applied = False
+        self._pos_hash = None
 
     # ── Q / N / PUCT ──────────────────────────────────────────────────────
 

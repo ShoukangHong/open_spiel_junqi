@@ -21,7 +21,7 @@ from open_spiel.python.algorithms import mcts as orig_mcts
 
 from train.batch_mcts.config import MCTSConfig
 from train.batch_mcts.evaluator import BatchRandomRolloutEvaluator
-from train.batch_mcts.mcts import BatchMCTS
+from train.batch_mcts.mcts import BatchMCTS, _position_hash
 
 
 class ZeroEvaluator:
@@ -452,6 +452,51 @@ def test_step_temperature():
         f"τ=0.5 should sample ≥2 actions, got {len(actions_seen)}"
 
 
+def test_repeat_penalty():
+    """Repeat penalty: rep_counts tracks history, penalty applied at root."""
+    game = pyspiel.load_game("xiangqi")
+    rng = np.random.RandomState(42)
+    config = MCTSConfig(max_simulations=64, batch_size=8,
+                        uct_c=UCT_C, policy_epsilon=0,
+                        repeat_penalty=0.1)
+
+    class _XiangqiZeroEval:
+        def batch_inference_raw(self, states):
+            n = len(states)
+            vals = np.zeros((n, 3), dtype=np.float32)
+            vals[:, 1] = 1.0
+            priors = []
+            for s in states:
+                leg = s.legal_actions()
+                priors.append([(a, 1.0 / len(leg)) for a in leg])
+            return vals, priors
+
+    mcts = BatchMCTS(game, config, _XiangqiZeroEval(), random_state=rng)
+
+    # Play 4 alternating moves to build history
+    state = game.new_initial_state()
+    for _ in range(4):
+        state.apply_action(state.legal_actions()[0])
+
+    mcts.mcts_search(state)
+    # At least initial position + 4 intermediate positions = 5
+    assert len(mcts._rep_counts) >= 5, \
+        f"rep_counts should have ≥5 entries, got {len(mcts._rep_counts)}"
+
+
+def test_position_hash_static_planes():
+    """_position_hash returns int and filters dynamic planes for Xiangqi."""
+    game = pyspiel.load_game("xiangqi")
+    h = _position_hash(game.new_initial_state())
+    assert isinstance(h, int)
+
+    # Verify different positions produce different hashes
+    s1 = game.new_initial_state()
+    s2 = game.new_initial_state()
+    s2.apply_action(s2.legal_actions()[0])
+    assert _position_hash(s1) != _position_hash(s2)
+
+
 def main():
     print("=" * 60)
     print("  BatchMCTS Verification Suite")
@@ -464,6 +509,8 @@ def main():
         ("D", "Batch-size stability", test_batch_stability),
         ("E", "Search scaling", test_search_scaling),
         ("F", "Step temperature sampling", test_step_temperature),
+        ("G", "Repeat penalty", test_repeat_penalty),
+        ("H", "Position hash", test_position_hash_static_planes),
     ]
 
     failed = 0

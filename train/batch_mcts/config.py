@@ -28,6 +28,9 @@ class MCTSConfig:
     # Draw penalty — PUCT Q is discounted by draw_penalty * draw_rate
     draw_penalty: float = 0.0
 
+    # Repetition penalty — PUCT score reduced per occurrence (capped at 0.8)
+    repeat_penalty: float = 0.1
+
     # Solver
     solve: bool = True           # Whether to back up proven terminal values
 

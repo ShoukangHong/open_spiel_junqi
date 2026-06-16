@@ -9,7 +9,7 @@ import numpy as np
 from train.batch_mcts.node import Node
 from train.core.checkpoint import find_latest_checkpoint
 from train.core.base_config import BaseTrainConfig, load_base_config
-from train.core.play import _stable_qdr
+from train.core.play import _stable_qdr, assign_players
 from train.core.weak_move import accum_wstats, reset_wstats, wstats_summary
 
 
@@ -52,16 +52,20 @@ def test_load_base_config_defaults():
     cfg = BaseTrainConfig()
     assert cfg.learning_rate == 3e-4
     assert cfg.max_steps == 300
+    assert cfg.random_opponent_prob == 0.2
+    assert cfg.best_model_prob == 0.3
 
 
 def test_load_base_config_from_json():
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "cfg.json")
         with open(p, "w") as f:
-            json.dump({"learning_rate": 0.0005, "max_steps": 50}, f)
+            json.dump({"learning_rate": 0.0005, "max_steps": 50,
+                       "random_opponent_prob": 0.5}, f)
         cfg = load_base_config(p, BaseTrainConfig)
         assert cfg.learning_rate == 0.0005
         assert cfg.max_steps == 50
+        assert cfg.random_opponent_prob == 0.5
 
 
 def test_load_base_config_missing_file():
@@ -465,6 +469,75 @@ def test_stable_qdr_no_children():
     assert q == root.q_value and dr == root.draw_rate
 
 
+def test_assign_players_main_only():
+    """Without best/opp models, always main vs main."""
+    rng = np.random.RandomState(42)
+    main = object(); best = object(); opp = None
+    seen = set()
+    for _ in range(20):
+        p0, p1, ub, uo = assign_players(rng, main, best, opp,
+                                         best_model_prob=0, random_opponent_prob=0)
+        assert p0 is main and p1 is main
+        assert not ub and not uo
+        seen.add((p0, p1))
+    assert len(seen) == 1  # always the same
+
+
+def test_assign_players_best_prob_1():
+    """best_model_prob=1 → always main vs best."""
+    rng = np.random.RandomState(42)
+    main = object(); best = object(); opp = None
+    for _ in range(20):
+        p0, p1, ub, uo = assign_players(rng, main, best, opp,
+                                         best_model_prob=1.0, random_opponent_prob=0)
+        assert ub and not uo
+        assert (p0 is main and p1 is best) or (p0 is best and p1 is main)
+
+
+def test_assign_players_opp_prob_1():
+    """random_opponent_prob=1, best_prob=0 → always main vs opp."""
+    rng = np.random.RandomState(42)
+    main = object(); best = object(); opp = object()
+    for _ in range(20):
+        p0, p1, ub, uo = assign_players(rng, main, best, opp,
+                                         best_model_prob=0, random_opponent_prob=1.0)
+        assert not ub and uo
+        assert (p0 is main and p1 is opp) or (p0 is opp and p1 is main)
+
+
+def test_assign_players_colour_swap():
+    """When p1≠main, colours are sometimes swapped."""
+    rng = np.random.RandomState(42)
+    main = object(); best = object(); opp = None
+    black_best = 0  # p0 is main, p1 is best
+    white_best = 0  # p0 is best, p1 is main
+    for _ in range(200):
+        p0, p1, _, _ = assign_players(rng, main, best, opp,
+                                       best_model_prob=1.0, random_opponent_prob=0)
+        if p0 is main and p1 is best:
+            black_best += 1
+        else:
+            white_best += 1
+    # ~50% each, with some tolerance
+    assert 70 < black_best < 130 and 70 < white_best < 130, \
+        f"swap bias: black={black_best} white={white_best}"
+
+
+def test_assign_players_explicit_use():
+    """Explicit use_best/use_opp overrides random draw."""
+    rng = np.random.RandomState(42)
+    main = object(); best = object(); opp = object()
+    p0, p1, ub, uo = assign_players(rng, main, best, opp,
+                                     use_best=True, use_opp=False)
+    assert ub and not uo
+    assert (p0 is main and p1 is best) or (p0 is best and p1 is main)
+
+    p0, p1, ub, uo = assign_players(rng, main, best, opp,
+                                     use_best=False, use_opp=True)
+    assert not ub and uo
+    assert (p0 is main and p1 is opp) or (p0 is opp and p1 is main)
+
+
 def main():
     tests = [
         test_find_latest_empty, test_find_latest_single,
@@ -476,6 +549,11 @@ def main():
         test_stable_qdr,
         test_stable_qdr_fallback,
         test_stable_qdr_no_children,
+        test_assign_players_main_only,
+        test_assign_players_best_prob_1,
+        test_assign_players_opp_prob_1,
+        test_assign_players_colour_swap,
+        test_assign_players_explicit_use,
         test_sqlite_basic_append_sample, test_sqlite_resume_full,
         test_sqlite_resume_partial, test_sqlite_rollback,
         test_sqlite_expand_buffer, test_sqlite_empty_start,

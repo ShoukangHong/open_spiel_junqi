@@ -11,6 +11,39 @@ from train.core.policy import mix_advantage
 from train.core.weak_move import try_weak_move
 
 
+def assign_players(rng, mcts_main, mcts_best, mcts_opp=None,
+                   best_model_prob=0.3, random_opponent_prob=0.2,
+                   use_best=None, use_opp=None):
+    """Pick models for p0 and p1 in one self-play game.
+
+    p0 is always main.  p1 is best (prob best_model_prob), random_opp
+    (prob random_opponent_prob, best not selected), or main otherwise.
+    If p1 is not main, colours are swapped with 50% chance.
+
+    When *use_best* / *use_opp* are given (replaying a rare fork), those
+    values are used directly instead of rolling new random draws.
+
+    Returns:
+        (mcts_p0, mcts_p1, use_best, use_opp)
+    """
+    if use_best is None:
+        use_best = (best_model_prob > 0 and rng.random() < best_model_prob)
+    if use_opp is None:
+        use_opp = (not use_best and mcts_opp is not None
+                   and rng.random() < random_opponent_prob)
+
+    p0, p1 = mcts_main, mcts_main
+    if use_best:
+        p1 = mcts_best
+    elif use_opp:
+        p1 = mcts_opp
+
+    if (use_best or use_opp) and rng.random() < 0.5:
+        p0, p1 = p1, p0
+
+    return p0, p1, use_best, use_opp
+
+
 def _stable_qdr(root):
     """Q and draw_rate from children with >1 visit, excluding forced-explore noise.
 

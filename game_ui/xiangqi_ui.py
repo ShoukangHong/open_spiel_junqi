@@ -22,12 +22,22 @@ from train.core.model_builder import build_xiangqi_model
 
 # ── Config ──────────────────────────────────────────────────────────────────
 CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud"
-CHECKPOINT_STEP = 30
-MCTS_SIMULATIONS = 4096
-HINT_MAX_SIM = 16000
+CHECKPOINT_STEP = 350
+MCTS_SIMULATIONS = 2048
+HINT_MAX_SIM = 600
 MCTS_BATCH_SIZE = 32
 UCT_C = 1.41
-AI_TEMPERATURE = 0.1  # τ for AI move selection (0 = argmax)
+AI_TEMPERATURE = 0.03  # τ for AI move selection (0 = argmax)
+
+# Read MCTS params from training config (fall back to defaults)
+import json as _json, os as _os
+_config_path = _os.path.join(CHECKPOINT_DIR, "train_config.json")
+_tc = {}
+if _os.path.exists(_config_path):
+    with open(_config_path) as _f:
+        _tc = _json.load(_f)
+DRAW_PENALTY = _tc.get("draw_penalty", 0.0)
+REPEAT_PENALTY = _tc.get("repeat_penalty", 0.0)
 
 WIDTH = BOARD_W
 HEIGHT = BOARD_H
@@ -52,7 +62,7 @@ def draw_panel(screen, cur_player, message="", value=None, draw_rate=0.0):
         else:
             lines.append(f"Value (red): {bq:+.3f}")
     lines.append(message)
-    lines.append("H: hint   F: freeze   R: restart   Q: quit")
+    lines.append("H: hint   U: undo   F: freeze   R: restart   Q: quit")
 
     for t in lines:
         surf = font_sm.render(t, True, BLACK)
@@ -74,9 +84,11 @@ def main():
                                            "device": "cpu", "path": "."})
 
     bot, evaluator, _ = create_bot(game, model, MCTS_SIMULATIONS,
-                                   MCTS_BATCH_SIZE, UCT_C)
+                                   MCTS_BATCH_SIZE, UCT_C,
+                                   DRAW_PENALTY, REPEAT_PENALTY)
     hint_engine = MCTSHintEngine(game, evaluator, HINT_MAX_SIM,
-                                 MCTS_BATCH_SIZE, UCT_C)
+                                 MCTS_BATCH_SIZE, UCT_C,
+                                 DRAW_PENALTY, REPEAT_PENALTY)
 
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, SCREEN_HEIGHT))
@@ -89,6 +101,7 @@ def main():
             break
 
         state = game.new_initial_state()
+        undo_stack = []  # state clones before each action
         selector = ActionSelector()
         hints = None
         ai_value = None
@@ -113,6 +126,7 @@ def main():
                     if event.type == pygame.MOUSEBUTTONDOWN:
                         action, src, tgt = selector.handle_click(event.pos, state)
                         if action is not None:
+                            undo_stack.append(state.clone())
                             state.apply_action(action)
                             evaluator.clear_cache()
                             hint_engine.subtree_inherit(action)
@@ -125,7 +139,21 @@ def main():
                             selector.reset()
                             message = f"Played: {action_label(action)}"
                     if event.type == pygame.KEYDOWN:
-                        if event.key == pygame.K_h:
+                        if event.key == pygame.K_u and undo_stack:
+                            steps = 2 if not hvh else 1
+                            for _ in range(min(steps, len(undo_stack))):
+                                state = undo_stack.pop()
+                            evaluator.clear_cache()
+                            hint_engine = MCTSHintEngine(
+                                game, evaluator, HINT_MAX_SIM,
+                                MCTS_BATCH_SIZE, UCT_C,
+                                DRAW_PENALTY, REPEAT_PENALTY)
+                            hints = None; ai_value = None
+                            hint_src_probs = None; _hint_arrows = None
+                            hint_draw_rate = 0.0
+                            selector.reset()
+                            message = "Move undone"
+                        elif event.key == pygame.K_h:
                             hint_frozen = False
                             hint_engine.unfreeze()
                             show_hints = not show_hints
@@ -169,6 +197,7 @@ def main():
 
                 policy, action = bot.step_with_policy(state, AI_TEMPERATURE)
                 print_mcts_info(bot._last_root, state, evaluator, action_label)
+                undo_stack.append(state.clone())
                 state.apply_action(action)
                 evaluator.clear_cache()
                 hint_engine.subtree_inherit(action)

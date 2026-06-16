@@ -47,8 +47,8 @@ def run_tests():
         make_child(7, 40,  -40.0, OUT_LOSS),
     ]
     p = compute_solved_policy(c1a, PLAYER, MAX_UTIL)
-    print_policy("O: 1a: 2 DRAW + 2 LOSS", c1a, p)
-    assert abs(p[2] - 0.5) < 1e-9 and abs(p[6] - 0.5) < 1e-9
+    print_policy("O: 1a: 2 DRAW + 2 LOSS (less explored favoured)", c1a, p)
+    assert p[6] > p[2], f"DRAW: less explored (80v) > more (100v), got {p}"
     assert p[1] == 0.0 and p[7] == 0.0
     print("  PASSED")
 
@@ -68,8 +68,8 @@ def run_tests():
         make_child(3, 40, -40.0, OUT_LOSS),
     ]
     p = compute_solved_policy(c1c, PLAYER, MAX_UTIL)
-    print_policy("O: 1c: all LOSS", c1c, p)
-    assert abs(p[1] - 0.5) < 1e-9 and abs(p[3] - 0.5) < 1e-9
+    print_policy("O: 1c: all LOSS (more explored favoured)", c1c, p)
+    assert p[1] > p[3], f"LOSS: more explored (50v) > less (40v), got {p}"
     print("  PASSED")
 
     # ═══════════════════════════════════════════════════════════════════
@@ -207,9 +207,8 @@ def run_tests():
         make_child(5, 150, -150.0, OUT_LOSS),
     ]
     p = compute_solved_policy(c3c, PLAYER, MAX_UTIL)
-    print_policy("O: 3c: all proven LOSS (uniform)", c3c, p)
-    for a in [1, 3, 5]:
-        assert abs(p[a] - 1/3) < 0.01
+    print_policy("O: 3c: all proven LOSS (more explored favoured)", c3c, p)
+    assert p[5] > p[1] > p[3], f"LOSS: expect 150v>100v>50v, got {p}"
     print("  PASSED")
 
     # ═══════════════════════════════════════════════════════════════════
@@ -236,9 +235,8 @@ def run_tests():
         make_x(8, 40, -40.0,  OUT_X_LOSS),
     ]
     p = compute_solved_policy(cx1, 0, MAX_UTIL)
-    print_policy("X: 2 WIN + 1 LOSS", cx1, p, player=0)
-    assert abs(p[0] - 0.5) < 1e-9
-    assert abs(p[4] - 0.5) < 1e-9
+    print_policy("X: 2 WIN + 1 LOSS (less explored favoured)", cx1, p, player=0)
+    assert p[4] > p[0], f"WIN: less explored (80v) > more (100v), got {p}"
     assert p[8] == 0.0
     print("  PASSED")
 
