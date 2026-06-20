@@ -1,5 +1,7 @@
 """Test solved-aware policy on manually constructed nodes."""
 
+import pyspiel
+
 from train.batch_mcts.node import Node
 from train.batch_mcts.mcts import compute_solved_policy
 
@@ -267,6 +269,43 @@ def run_tests():
     print(f"\n{'=' * 60}")
     print("ALL TESTS PASSED")
     print(f"{'=' * 60}")
+
+
+def test_select_action_with_adv():
+    """select_action_with_adv returns legal action, favours high-Q moves."""
+    game = pyspiel.load_game("tic_tac_toe")
+    state = game.new_initial_state()
+    root = Node(None, state.current_player(), 1)
+    root.explore_count = 10
+    root.total_reward = 5.0        # Q = 0.5
+
+    # Two children: one high Q, one low Q
+    c_high = Node(0, root.player, 0.5)
+    c_high.explore_count = 5
+    c_high.total_reward = 5.0       # Q = 1.0 (win)
+    root.children = [c_high]
+
+    c_low = Node(1, root.player, 0.5)
+    c_low.explore_count = 5
+    c_low.total_reward = -5.0       # Q = -1.0 (loss)
+    root.children.append(c_low)
+
+    # With mixing: high-Q should be picked more often
+    from train.core.policy import select_action_with_adv
+    counts = {0: 0, 1: 0}
+    for _ in range(200):
+        a, _ = select_action_with_adv(root, state, alpha=0.5, adv_t=0.25)
+        counts[a] += 1
+    assert counts[0] > counts[1], \
+        f"high Q should be preferred, got {counts}"
+
+    # Without mixing (alpha=0): both should be picked roughly equally
+    counts2 = {0: 0, 1: 0}
+    for _ in range(200):
+        a, _ = select_action_with_adv(root, state, alpha=0.0)
+        counts2[a] += 1
+    assert 60 < counts2[0] < 140, \
+        f"no mixing should be ~50/50, got {counts2}"
 
 
 def test_policy():

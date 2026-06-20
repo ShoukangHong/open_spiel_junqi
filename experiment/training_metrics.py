@@ -59,6 +59,14 @@ class StepRecord:
     v_kl: float = 0.0
     top1: float = 0.0
     p_kl: float = 0.0
+    grad_rel: float = 0.0
+    update_rel: float = 0.0
+    p_kl_head: float = 0.0
+    p_kl_mid: float = 0.0
+    p_kl_tail: float = 0.0
+    v_kl_head: float = 0.0
+    v_kl_mid: float = 0.0
+    v_kl_tail: float = 0.0
     entropy: float = 0.0
     p0_pct: float = 0.0
     p1_pct: float = 0.0
@@ -96,8 +104,16 @@ _LINE2_RE = re.compile(
     r"(?:,\s*V-KL:\s*(?P<vkl>[\d.]+))?"
     r"(?:,\s*Top1:\s*(?P<top1>[\d.]+)%)?"
     r"(?:,\s*P-KL:\s*(?P<pkl>[\d.]+))?"
+    r"(?:,\s*GradRel:\s*(?P<grad_rel>[\d.]+))?"
+    r"(?:,\s*UpdRel:\s*(?P<update_rel>[\d.]+))?"
     r"\)\s+"
     r"entropy=(?P<entropy>[\d.]+)\s+\|\s+"
+    r"(?:pkl_h=(?P<pkl_h>[\d.]+)\s+)?"
+    r"(?:pkl_m=(?P<pkl_m>[\d.]+)\s+)?"
+    r"(?:pkl_t=(?P<pkl_t>[\d.]+)\s+)?"
+    r"(?:vkl_h=(?P<vkl_h>[\d.]+)\s+)?"
+    r"(?:vkl_m=(?P<vkl_m>[\d.]+)\s+)?"
+    r"(?:vkl_t=(?P<vkl_t>[\d.]+)\s+)?"
     r"p0=(?P<p0>[\d.]+)%\s+"
     r"p1=(?P<p1>[\d.]+)%\s+"
     r"draw=(?P<draw>[\d.]+)%"
@@ -170,6 +186,14 @@ def parse_training_log(log_path: str) -> List[StepRecord]:
                     v_kl=float(d2.get("vkl") or 0),
                     top1=float(d2.get("top1") or 0) / 100,
                     p_kl=float(d2.get("pkl") or 0),
+                    grad_rel=float(d2.get("grad_rel") or 0),
+                    update_rel=float(d2.get("update_rel") or 0),
+                    p_kl_head=float(d2.get("pkl_h") or 0),
+                    p_kl_mid=float(d2.get("pkl_m") or 0),
+                    p_kl_tail=float(d2.get("pkl_t") or 0),
+                    v_kl_head=float(d2.get("vkl_h") or 0),
+                    v_kl_mid=float(d2.get("vkl_m") or 0),
+                    v_kl_tail=float(d2.get("vkl_t") or 0),
                     entropy=float(d2["entropy"]),
                     p0_pct=float(d2["p0"]),
                     p1_pct=float(d2["p1"]),
@@ -204,7 +228,7 @@ def moving_average(values: np.ndarray, window: int) -> np.ndarray:
 def plot_metrics(records: List[StepRecord], smooth: int = 1,
                  output_path: Optional[str] = None,
                  elo_pairs: Optional[list] = None):
-    """Produce a 3x3 multi-panel dashboard of training metrics."""
+    """Produce a 3x4 multi-panel dashboard of training metrics."""
     steps = np.array([r.step for r in records])
     if len(steps) < 2:
         print("[metrics] Not enough data to plot.")
@@ -215,26 +239,44 @@ def plot_metrics(records: List[StepRecord], smooth: int = 1,
 
     ckpt_mask = np.array([r.step % 5 == 0 for r in records])
 
-    fig, axes = plt.subplots(3, 3, figsize=(12, 9))
+    fig, axes = plt.subplots(3, 4, figsize=(16, 9))
     fig.suptitle("Training Metrics Dashboard", fontsize=14, fontweight="bold")
 
-    # ── (0,0) Loss curves ──────────────────────────────────────────────
+    # ── (0,0) Total loss + L2 ───────────────────────────────────────────
     ax = axes[0, 0]
-    for key, label, color in [
-        ("loss_total", "total", "#333333"),
-        ("loss_policy", "policy", "#2196F3"),
-        ("loss_value", "value", "#FF5722"),
-    ]:
-        v = arr(key)
-        if smooth > 1:
-            v = moving_average(v, smooth)
-        ax.plot(steps, v, label=label, color=color, linewidth=1.2, alpha=0.85)
-    ax.set_title("Loss")
-    ax.legend(fontsize=7, ncol=3)
+    t = arr("loss_total")
+    l2 = arr("loss_l2")
+    if smooth > 1:
+        t = moving_average(t, smooth)
+        l2 = moving_average(l2, smooth)
+    ax.plot(steps, t, color="#333333", linewidth=1.2, label="total")
+    ax.set_ylabel("total", color="#333333")
+    ax.tick_params(axis="y", colors="#333333")
+    ax2 = ax.twinx()
+    ax2.plot(steps, l2, color="#9E9E9E", linewidth=1.0, alpha=0.7, label="L2")
+    ax2.set_ylabel("L2", color="#9E9E9E")
+    ax2.tick_params(axis="y", colors="#9E9E9E")
+    ax.set_title("Total Loss + L2")
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper left")
     ax.grid(True, alpha=0.25)
 
-    # ── (0,1) Entropy ──────────────────────────────────────────────────
+    # ── (0,1) Policy + Value loss ───────────────────────────────────────
     ax = axes[0, 1]
+    pl = arr("loss_policy")
+    vl = arr("loss_value")
+    if smooth > 1:
+        pl = moving_average(pl, smooth)
+        vl = moving_average(vl, smooth)
+    ax.plot(steps, pl, color="#2196F3", linewidth=1.2, label="policy")
+    ax.plot(steps, vl, color="#FF5722", linewidth=1.2, label="value")
+    ax.set_title("Policy / Value Loss")
+    ax.legend(fontsize=7, ncol=2)
+    ax.grid(True, alpha=0.25)
+
+    # ── (0,2) Entropy ──────────────────────────────────────────────────
+    ax = axes[0, 2]
     ent = arr("entropy")
     if smooth > 1:
         ent = moving_average(ent, smooth)
@@ -244,8 +286,8 @@ def plot_metrics(records: List[StepRecord], smooth: int = 1,
     ax.grid(True, alpha=0.25)
     ax.axhline(y=np.log(65), color="gray", linestyle="--", alpha=0.4, linewidth=0.8)
 
-    # ── (0,2) Throughput ───────────────────────────────────────────────
-    ax = axes[0, 2]
+    # ── (0,3) Throughput ───────────────────────────────────────────────
+    ax = axes[0, 3]
     sps = arr("states_per_s")
     if smooth > 1:
         sps = moving_average(sps, smooth)
@@ -273,18 +315,23 @@ def plot_metrics(records: List[StepRecord], smooth: int = 1,
     # ── (1,1) Policy quality ───────────────────────────────────────────
     ax = axes[1, 1]
     t1 = arr("top1")
-    pk = arr("p_kl")
+    pkh = arr("p_kl_head")
+    pkm = arr("p_kl_mid")
+    pkt = arr("p_kl_tail")
     if smooth > 1:
         t1 = moving_average(t1, smooth)
-        pk = moving_average(pk, smooth)
+        pkh = moving_average(pkh, smooth)
+        pkm = moving_average(pkm, smooth)
+        pkt = moving_average(pkt, smooth)
     ax.plot(steps, t1 * 100, color="#2196F3", linewidth=1.2, label="Top1%")
     ax.set_ylabel("Top1 %", color="#2196F3")
     ax.tick_params(axis="y", colors="#2196F3")
     ax2 = ax.twinx()
-    ax2.plot(steps, pk, color="#FF5722", linewidth=1.0, alpha=0.7,
-             label="P-KL")
-    ax2.set_ylabel("P-KL", color="#FF5722")
-    ax2.tick_params(axis="y", colors="#FF5722")
+    ax2.plot(steps, pkh, color="#4CAF50", linewidth=1.0, alpha=0.8, label="P-KL h")
+    ax2.plot(steps, pkm, color="#FF9800", linewidth=1.0, alpha=0.8, label="P-KL m")
+    ax2.plot(steps, pkt, color="#F44336", linewidth=1.0, alpha=0.8, label="P-KL t")
+    ax2.set_ylabel("P-KL", color="#333333")
+    ax2.tick_params(axis="y", colors="#333333")
     ax.set_title("Policy Quality")
     lines1, labels1 = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
@@ -307,6 +354,19 @@ def plot_metrics(records: List[StepRecord], smooth: int = 1,
     ax.legend(fontsize=7, ncol=2)
     ax.grid(True, alpha=0.25)
 
+    # ── (1,3) Weight update health ─────────────────────────────────────
+    ax = axes[1, 3]
+    gr = arr("grad_rel")
+    ur = arr("update_rel")
+    if smooth > 1:
+        gr = moving_average(gr, smooth)
+        ur = moving_average(ur, smooth)
+    ax.plot(steps, gr, color="#2196F3", linewidth=1.2, label="||∇W||/||W||")
+    ax.plot(steps, ur, color="#FF5722", linewidth=1.2, label="||ΔW||/||W||")
+    ax.set_title("Weight Update")
+    ax.legend(fontsize=7)
+    ax.grid(True, alpha=0.25)
+
     # ── (2,0) Buffer health ────────────────────────────────────────────
     ax = axes[2, 0]
     buf_cur = arr("buffer_current")
@@ -326,18 +386,23 @@ def plot_metrics(records: List[StepRecord], smooth: int = 1,
     # ── (2,1) Value quality ────────────────────────────────────────────
     ax = axes[2, 1]
     vl = arr("loss_value")
-    vk = arr("v_kl")
+    vkh = arr("v_kl_head")
+    vkm = arr("v_kl_mid")
+    vkt = arr("v_kl_tail")
     if smooth > 1:
         vl = moving_average(vl, smooth)
-        vk = moving_average(vk, smooth)
+        vkh = moving_average(vkh, smooth)
+        vkm = moving_average(vkm, smooth)
+        vkt = moving_average(vkt, smooth)
     ax.plot(steps, vl, color="#FF5722", linewidth=1.2, label="CE loss")
     ax.set_ylabel("Value CE", color="#FF5722")
     ax.tick_params(axis="y", colors="#FF5722")
     ax2 = ax.twinx()
-    ax2.plot(steps, vk, color="#9C27B0", linewidth=1.0, alpha=0.7,
-             label="V-KL")
-    ax2.set_ylabel("V-KL", color="#9C27B0")
-    ax2.tick_params(axis="y", colors="#9C27B0")
+    ax2.plot(steps, vkh, color="#4CAF50", linewidth=1.0, alpha=0.8, label="V-KL h")
+    ax2.plot(steps, vkm, color="#FF9800", linewidth=1.0, alpha=0.8, label="V-KL m")
+    ax2.plot(steps, vkt, color="#F44336", linewidth=1.0, alpha=0.8, label="V-KL t")
+    ax2.set_ylabel("V-KL", color="#333333")
+    ax2.tick_params(axis="y", colors="#333333")
     ax.set_title("Value Quality")
     lines1, labels1 = ax.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
@@ -400,6 +465,8 @@ def print_summary(records: List[StepRecord]):
         ("unique_states", "Unique states", "{:.0f} → {:.0f}"),
         ("rare_per_game", "Rare/g", "{:.2f} → {:.2f}"),
         ("weak_per_game", "Weak/g", "{:.2f} → {:.2f}"),
+        ("grad_rel", "||∂W||/||W||", "{:.6f} → {:.6f}"),
+        ("update_rel", "||ΔW||/||W||", "{:.6f} → {:.6f}"),
     ]
 
     # Use first/last 5% to reduce noise
@@ -490,7 +557,7 @@ def main():
         plot_metrics(records, smooth=args.smooth, output_path=output_path,
                      elo_pairs=elo_pairs)
 
-DEFAULT_LOG = r"C:\Users\shouk\xiangqi_train\cloud\train.log"
+DEFAULT_LOG = r"C:\Users\shouk\xiangqi_train\cloud_b\train.log"
 DEFAULT_SMOOTH = 1
 DEFAULT_NO_PLOT = False
 

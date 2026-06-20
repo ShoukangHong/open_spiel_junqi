@@ -114,7 +114,9 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
             max_simulations=cfg.max_simulations, batch_size=cfg.mcts_batch_size,
             uct_c=cfg.uct_c, policy_epsilon=cfg.policy_epsilon,
             policy_alpha=cfg.policy_alpha,
-            draw_penalty=cfg.draw_penalty, verbose=False)
+            draw_penalty=cfg.draw_penalty,
+            repeat_penalty=getattr(cfg, 'repeat_penalty', 0.1),
+            verbose=False)
         mcts_opp = BatchMCTS(game, mcts_cfg_opp, ev_opp,
                              random_state=np.random.RandomState())
     else:
@@ -123,7 +125,9 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
         max_simulations=cfg.max_simulations, batch_size=cfg.mcts_batch_size,
         uct_c=cfg.uct_c, policy_epsilon=cfg.policy_epsilon,
         policy_alpha=cfg.policy_alpha,
-        draw_penalty=cfg.draw_penalty, verbose=False)
+        draw_penalty=cfg.draw_penalty,
+        repeat_penalty=getattr(cfg, 'repeat_penalty', 0.1),
+        verbose=False)
     mcts_main = BatchMCTS(game, mcts_cfg, ev_main,
                           random_state=np.random.RandomState())
     mcts_best = BatchMCTS(game, mcts_cfg, ev_best,
@@ -197,7 +201,7 @@ def run_training(
     cfg = setup_config_and_logging(config_path, config_class, fresh,
                                    output_dir=output_path)
 
-    game, model, buffer, sym, n_updates, start_step, mcts_config = \
+    game, model, buffer, sym, start_step, mcts_config = \
         init_training(cfg, None, build_model_fn, ReplayBuffer, SymmetryClass)
     _log = logging.info
     samples_per_step = max(
@@ -407,6 +411,10 @@ def run_training(
 
             # ── Training ───────────────────────────────────────────────
             train_t0 = time.time()
+            eff_size = min(len(buffer), cfg.replay_buffer_size)
+            samples = max(int(eff_size * cfg.buffer_sampling_frac),
+                          cfg.train_batch_size)
+            n_updates = samples * cfg.symmetry // cfg.train_batch_size
             losses_list = []
             entropies = []
 
@@ -435,10 +443,22 @@ def run_training(
                     v_kl=sum(l.v_kl for l in losses_list) / n,
                     top1=sum(l.top1 for l in losses_list) / n,
                     p_kl=sum(l.p_kl for l in losses_list) / n,
+                    grad_rel=sum(l.grad_rel for l in losses_list) / n,
+                    update_rel=sum(l.update_rel for l in losses_list) / n,
                 )
+                h = min(4, n)
+                p_kl_head = sum(l.p_kl for l in losses_list[:h]) / h
+                mid = max(0, n // 2 - 2)
+                p_kl_mid = sum(l.p_kl for l in losses_list[mid:mid + h]) / max(1, min(h, n - mid))
+                p_kl_tail = sum(l.p_kl for l in losses_list[-h:]) / h
+                v_kl_head = sum(l.v_kl for l in losses_list[:h]) / h
+                v_kl_mid = sum(l.v_kl for l in losses_list[mid:mid + h]) / max(1, min(h, n - mid))
+                v_kl_tail = sum(l.v_kl for l in losses_list[-h:]) / h
                 avg_entropy = sum(entropies) / len(entropies)
             else:
                 avg_loss = None
+                p_kl_head = p_kl_mid = p_kl_tail = 0.0
+                v_kl_head = v_kl_mid = v_kl_tail = 0.0
                 avg_entropy = 0.0
             train_time = time.time() - train_t0
 
@@ -458,7 +478,11 @@ def run_training(
             )
             if avg_loss is not None:
                 log_line += (f"\n               loss={avg_loss}"
-                             f"  entropy={avg_entropy:.3f}  |")
+                             f"  entropy={avg_entropy:.3f}  |"
+                             f"  pkl_h={p_kl_head:.4f} pkl_m={p_kl_mid:.4f}"
+                             f"  pkl_t={p_kl_tail:.4f}"
+                             f"  vkl_h={v_kl_head:.4f} vkl_m={v_kl_mid:.4f}"
+                             f"  vkl_t={v_kl_tail:.4f}")
             g = total_games or 1
             log_line += (f"  p0={outcomes['p0']/g:.1%}"
                          f"  p1={outcomes['p1']/g:.1%}"
@@ -501,10 +525,14 @@ def run_training(
 
                 # ── Random opponent: pick a random checkpoint with prob ─
                 if getattr(cfg, 'random_opponent_prob', 0) > 0:
-                    ckpts = [f for f in os.listdir(cfg.path)
-                             if f.startswith("checkpoint-") and f.endswith(".pt")
-                             and f != f"checkpoint-{_LATEST}.pt"
-                             and f != f"checkpoint-{step}.pt"]
+                    ckpts = sorted(
+                        [f for f in os.listdir(cfg.path)
+                         if f.startswith("checkpoint-") and f.endswith(".pt")
+                         and f != f"checkpoint-{_LATEST}.pt"
+                         and f != f"checkpoint-{step}.pt"],
+                        key=lambda f: int(f.split("-")[1].split(".")[0]))
+                    # Exclude the first 5 — too weak to be useful opponents
+                    ckpts = ckpts[5:]
                     if ckpts:
                         ckpt_file = global_rng.choice(ckpts)
                         ckpt_path = os.path.join(cfg.path, ckpt_file)

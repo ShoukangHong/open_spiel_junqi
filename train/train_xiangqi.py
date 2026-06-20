@@ -21,7 +21,7 @@ from train.model.xiangqi_symmetry import XiangqiSymmetry
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Xiangqi AlphaZero training (BatchMCTS + PyTorch)")t
+        description="Xiangqi AlphaZero training (BatchMCTS + PyTorch)")
     parser.add_argument("--config",
                         default=os.path.join(_project_root, "train", "games",
                                             "xiangqi", "config.json"))

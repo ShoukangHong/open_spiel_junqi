@@ -6,10 +6,12 @@ _sys_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _sys_root not in sys.path:
     sys.path.insert(0, _sys_root)
 
+import numpy as np
 import pygame
 
-from game_ui.core import (load_model_for_ui, create_bot, MCTSHintEngine,
-                          choose_color_menu, game_over_screen, print_mcts_info,
+from game_ui.core import (load_model_for_ui, create_bot, create_ab_bot,
+                          MCTSHintEngine, AlphaBetaHintEngine,
+                          choose_color_menu, game_over_screen, print_search_info,
                           BLACK, WHITE, RED, BLUE, GREEN, YELLOW, get_font)
 from game_ui.xiangqi_render import (
     ROWS, COLS, SQ_SIZE, LABEL_MARGIN, BOARD_W, BOARD_H, PANEL_W,
@@ -21,13 +23,21 @@ from game_ui.xiangqi_render import (
 from train.core.model_builder import build_xiangqi_model
 
 # ── Config ──────────────────────────────────────────────────────────────────
-CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud"
-CHECKPOINT_STEP = 350
-MCTS_SIMULATIONS = 2048
-HINT_MAX_SIM = 600
-MCTS_BATCH_SIZE = 32
-UCT_C = 1.41
-AI_TEMPERATURE = 0.03  # τ for AI move selection (0 = argmax)
+CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_b"
+CHECKPOINT_STEP = 65
+MCTS_SIMULATIONS = 1024
+HINT_MAX_SIM = 32000
+MCTS_BATCH_SIZE = 8
+UCT_C = 2.0
+AI_TEMPERATURE = 0.01  # τ for AI move selection (0 = argmax)
+TEMP_DROP = 5         # use τ=0.5 + advantage mixing before this move
+SAVE_DIR = os.path.join(CHECKPOINT_DIR, "saved_positions")
+POLICY_EPSILON = 0.0  # Dirichlet noise weight for AI/hint search
+POLICY_ALPHA = 0.0     # Dirichlet concentration parameter
+AB_DEPTH = 3           # alpha-beta search depth
+AB_POLICY_TEMP = 0.03   # temperature for value→policy softmax in AB
+_AB_FLAG = [True]      # toggle with 'A' key — list to allow mutation from nested scope
+MAX_PRINT_MOVES = 20   # top N moves printed to console
 
 # Read MCTS params from training config (fall back to defaults)
 import json as _json, os as _os
@@ -36,8 +46,8 @@ _tc = {}
 if _os.path.exists(_config_path):
     with open(_config_path) as _f:
         _tc = _json.load(_f)
-DRAW_PENALTY = _tc.get("draw_penalty", 0.0)
-REPEAT_PENALTY = _tc.get("repeat_penalty", 0.0)
+DRAW_PENALTY = _tc.get("draw_penalty", 0.3)
+REPEAT_PENALTY = _tc.get("repeat_penalty", 0.1)
 
 WIDTH = BOARD_W
 HEIGHT = BOARD_H
@@ -47,12 +57,14 @@ SCREEN_HEIGHT = HEIGHT + PANEL_HEIGHT
 
 # ── Panel ───────────────────────────────────────────────────────────────────
 
-def draw_panel(screen, cur_player, message="", value=None, draw_rate=0.0):
+def draw_panel(screen, cur_player, message="", value=None, draw_rate=0.0,
+               move_num=0, no_cap=0):
     font_sm = get_font(22)
     y = HEIGHT + 8
 
     turn = "Red" if cur_player == 0 else "Black"
     lines = [f"Turn: {turn}"]
+    lines.append(f"Move: {move_num}  No-cap: {no_cap}/40")
     if value is not None:
         bq = value if cur_player == 0 else -value
         if draw_rate > 0.001:
@@ -62,11 +74,13 @@ def draw_panel(screen, cur_player, message="", value=None, draw_rate=0.0):
         else:
             lines.append(f"Value (red): {bq:+.3f}")
     lines.append(message)
-    lines.append("H: hint   U: undo   F: freeze   R: restart   Q: quit")
+    lines.append("H: hint  U: undo  F: freeze  A: AB/MCTS  S: save  L: load  R: restart  Q: quit")
 
     for t in lines:
         surf = font_sm.render(t, True, BLACK)
         screen.blit(surf, (10, y))
+
+        
         y += 26
 
 
@@ -83,12 +97,23 @@ def main():
         model = build_xiangqi_model(game, {"nn_width": 32, "nn_depth": 5,
                                            "device": "cpu", "path": "."})
 
-    bot, evaluator, _ = create_bot(game, model, MCTS_SIMULATIONS,
-                                   MCTS_BATCH_SIZE, UCT_C,
-                                   DRAW_PENALTY, REPEAT_PENALTY)
-    hint_engine = MCTSHintEngine(game, evaluator, HINT_MAX_SIM,
-                                 MCTS_BATCH_SIZE, UCT_C,
-                                 DRAW_PENALTY, REPEAT_PENALTY)
+    def _make_bot_and_hint():
+        if _AB_FLAG[0]:
+            bot, evaluator = create_ab_bot(game, model, depth=AB_DEPTH,
+                                            policy_temp=AB_POLICY_TEMP)
+            hint_engine = AlphaBetaHintEngine(game, evaluator, depth=AB_DEPTH,
+                                              policy_temp=AB_POLICY_TEMP)
+        else:
+            bot, evaluator, _ = create_bot(game, model, MCTS_SIMULATIONS,
+                                           MCTS_BATCH_SIZE, UCT_C,
+                                           DRAW_PENALTY, REPEAT_PENALTY,
+                                           POLICY_EPSILON, POLICY_ALPHA)
+            hint_engine = MCTSHintEngine(game, evaluator, HINT_MAX_SIM,
+                                         MCTS_BATCH_SIZE, UCT_C,
+                                         DRAW_PENALTY, REPEAT_PENALTY)
+        return bot, evaluator, hint_engine
+
+    bot, evaluator, hint_engine = _make_bot_and_hint()
 
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, SCREEN_HEIGHT))
@@ -103,8 +128,7 @@ def main():
         state = game.new_initial_state()
         undo_stack = []  # state clones before each action
         selector = ActionSelector()
-        hints = None
-        ai_value = None
+        hints = None; ai_value = None; _hint_printed = False
         hint_draw_rate = 0.0
         hint_src_probs = None
         _hint_arrows = None
@@ -126,16 +150,24 @@ def main():
                     if event.type == pygame.MOUSEBUTTONDOWN:
                         action, src, tgt = selector.handle_click(event.pos, state)
                         if action is not None:
+                            if show_hints and hint_engine._root is not None:
+                                hint_pol = hint_engine.compute_root_policy(
+                                    hint_engine._root, state)
+                                print_search_info(hint_engine._root, state, hint_pol,
+                                               evaluator=evaluator, action_label_fn=action_label,
+                                               max_moves=MAX_PRINT_MOVES,
+                                               engine_label="AB" if _AB_FLAG[0] else "MCTS")
                             undo_stack.append(state.clone())
                             state.apply_action(action)
                             evaluator.clear_cache()
                             hint_engine.subtree_inherit(action)
                             if not show_hints:
-                                hints = None; ai_value = None
+                                hints = None; ai_value = None; _hint_printed = False
                                 hint_src_probs = None; _hint_arrows = None
                                 hint_draw_rate = 0.0
+                                _hint_printed = False
                             else:
-                                hints = None  # force re-search in hint update section
+                                hints = None  # force re-search; _hint_printed = False
                             selector.reset()
                             message = f"Played: {action_label(action)}"
                     if event.type == pygame.KEYDOWN:
@@ -144,11 +176,8 @@ def main():
                             for _ in range(min(steps, len(undo_stack))):
                                 state = undo_stack.pop()
                             evaluator.clear_cache()
-                            hint_engine = MCTSHintEngine(
-                                game, evaluator, HINT_MAX_SIM,
-                                MCTS_BATCH_SIZE, UCT_C,
-                                DRAW_PENALTY, REPEAT_PENALTY)
-                            hints = None; ai_value = None
+                            _, evaluator, hint_engine = _make_bot_and_hint()
+                            hints = None; ai_value = None; _hint_printed = False
                             hint_src_probs = None; _hint_arrows = None
                             hint_draw_rate = 0.0
                             selector.reset()
@@ -158,16 +187,66 @@ def main():
                             hint_engine.unfreeze()
                             show_hints = not show_hints
                             if not show_hints:
-                                hints = None; ai_value = None
+                                hints = None; ai_value = None; _hint_printed = False
                                 hint_src_probs = None; _hint_arrows = None
                                 hint_draw_rate = 0.0
+                                _hint_printed = False
                         elif event.key == pygame.K_f and hints is not None:
                             hint_engine.freeze()
                             hint_frozen = True
                             if hint_engine._root is not None:
-                                print_mcts_info(hint_engine._root, state,
-                                               evaluator, action_label)
+                                hint_pol = hint_engine.compute_root_policy(
+                                    hint_engine._root, state)
+                                print_search_info(hint_engine._root, state, hint_pol,
+                                               evaluator=evaluator, action_label_fn=action_label,
+                                               max_moves=MAX_PRINT_MOVES,
+                                               engine_label="AB" if _AB_FLAG[0] else "MCTS")
                             message = "Hint FROZEN"
+                        elif event.key == pygame.K_s:
+                            from tkinter import Tk; from tkinter.filedialog import asksaveasfilename
+                            Tk().withdraw()
+                            os.makedirs(SAVE_DIR, exist_ok=True)
+                            import time as _time
+                            defname = _time.strftime("xiangqi_%Y%m%d_%H%M%S.txt")
+                            fpath = asksaveasfilename(
+                                initialdir=SAVE_DIR, initialfile=defname,
+                                defaultextension=".txt",
+                                filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+                            if fpath:
+                                with open(fpath, "w") as _f:
+                                    _f.write(state.serialize())
+                                message = f"Saved: {os.path.basename(fpath)}"
+                            else:
+                                message = "Save cancelled"
+                        elif event.key == pygame.K_l:
+                            from tkinter import Tk; from tkinter.filedialog import askopenfilename
+                            Tk().withdraw()
+                            os.makedirs(SAVE_DIR, exist_ok=True)
+                            fpath = askopenfilename(
+                                initialdir=SAVE_DIR,
+                                filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
+                            if fpath:
+                                with open(fpath) as _f:
+                                    state = game.deserialize_state(_f.read().strip())
+                                undo_stack.clear()
+                                evaluator.clear_cache()
+                                _, evaluator, hint_engine = _make_bot_and_hint()
+                                hints = None; ai_value = None; _hint_printed = False
+                                hint_src_probs = None; _hint_arrows = None
+                                hint_draw_rate = 0.0
+                                selector.reset()
+                                message = f"Loaded: {os.path.basename(fpath)}"
+                            else:
+                                message = "Load cancelled"
+                        elif event.key == pygame.K_a:
+                            _AB_FLAG[0] = not _AB_FLAG[0]
+                            bot, evaluator, hint_engine = _make_bot_and_hint()
+                            hints = None; ai_value = None; _hint_printed = False
+                            hint_src_probs = None; _hint_arrows = None
+                            hint_draw_rate = 0.0
+                            selector.reset()
+                            mode = "Alpha-Beta" if _AB_FLAG[0] else "MCTS"
+                            message = f"Switched to {mode}"
                         elif event.key == pygame.K_r:
                             restart = True
                         elif event.key == pygame.K_q:
@@ -177,13 +256,29 @@ def main():
                     act, vst, qv, ai_val, dr = hint_engine.search(state)
                     hints = (act, vst, qv)
                     ai_value = ai_val; hint_draw_rate = dr
-                    src_visits = {}
-                    for a, v in zip(act, vst):
-                        sq = a // 90
-                        src_visits[sq] = src_visits.get(sq, 0) + v
-                    total = sum(src_visits.values()) or 1
-                    hint_src_probs = {k: v/total for k, v in src_visits.items()}
-                    _hint_arrows = hint_arrows(act, vst, hint_engine._root)
+                    if hint_engine._root is not None:
+                        hint_pol = hint_engine.compute_root_policy(
+                            hint_engine._root, state)
+                        if not _hint_printed:
+                            print_search_info(hint_engine._root, state, hint_pol,
+                                             evaluator=evaluator, action_label_fn=action_label,
+                                             max_moves=MAX_PRINT_MOVES,
+                                             engine_label="AB" if _AB_FLAG[0] else "MCTS")
+                            _hint_printed = True
+                        # Source heatmap from policy (not uniform visits)
+                        src_visits = {}
+                        for a in act:
+                            sq = a // 90
+                            src_visits[sq] = src_visits.get(sq, 0) + hint_pol.get(a, 0)
+                        total = sum(src_visits.values()) or 1
+                        hint_src_probs = {k: v/total for k, v in src_visits.items()}
+                        # Arrows from policy
+                        pol_list = [(a // 90, a % 90, hint_pol.get(a, 0)) for a in act]
+                        pol_list.sort(key=lambda x: -x[2])
+                        _hint_arrows = pol_list[:5]
+                    else:
+                        _hint_arrows = None
+                        hint_src_probs = None
             else:
                 message = "AI thinking..."
                 screen.fill(BG_COLOR)
@@ -191,12 +286,38 @@ def main():
                              selected_src=selector.selected_src,
                              hint_data=hints, hint_heatmap=hint_src_probs,
                              move_arrows=_hint_arrows)
+                obs_a = np.asarray(state.observation_tensor(), dtype=np.float32)
+                mn = state.move_number()
+                nc = int(obs_a[16 * 10 * 9] * 40 + 0.5)
                 draw_panel(screen, cur, message, value=ai_value,
-                          draw_rate=hint_draw_rate)
+                          draw_rate=hint_draw_rate, move_num=mn, no_cap=nc)
                 pygame.display.flip()
 
-                policy, action = bot.step_with_policy(state, AI_TEMPERATURE)
-                print_mcts_info(bot._last_root, state, evaluator, action_label)
+                mn = state.move_number()
+                if mn < TEMP_DROP:
+                    from train.core.policy import select_action_with_adv
+                    root = bot.mcts_search(state)
+                    policy = bot.compute_root_policy(root, state)
+                    action, probs = select_action_with_adv(
+                        root, state, temperature=2/3, alpha=0.3, adv_t=0.2,
+                        base_policy=policy)
+                    bot._last_root = root
+                    print_search_info(root, state, policy,
+                                    evaluator=evaluator, action_label_fn=action_label,
+                                    max_moves=MAX_PRINT_MOVES,
+                                    engine_label="AB" if _AB_FLAG[0] else "MCTS")
+                else:
+                    from train.core.policy import select_action_with_adv
+                    root = bot.mcts_search(state)
+                    policy = bot.compute_root_policy(root, state)
+                    action, probs = select_action_with_adv(
+                        root, state, temperature=AI_TEMPERATURE, alpha=0.0,
+                        base_policy=policy)
+                    bot._last_root = root
+                    print_search_info(root, state, policy,
+                               evaluator=evaluator, action_label_fn=action_label,
+                               max_moves=MAX_PRINT_MOVES,
+                               engine_label="AB" if _AB_FLAG[0] else "MCTS")
                 undo_stack.append(state.clone())
                 state.apply_action(action)
                 evaluator.clear_cache()
@@ -204,7 +325,7 @@ def main():
 
                 hint_engine.subtree_inherit(action)
                 if not show_hints:
-                    hints = None; ai_value = None
+                    hints = None; ai_value = None; _hint_printed = False
                     hint_src_probs = None; _hint_arrows = None
                     hint_draw_rate = 0.0
                 else:
@@ -218,8 +339,12 @@ def main():
                              selected_src=selector.selected_src,
                              hint_data=hints, hint_heatmap=hint_src_probs,
                              move_arrows=_hint_arrows)
+                obs_p = np.asarray(state.observation_tensor(), dtype=np.float32)
+                mn = state.move_number()
+                nc = int(obs_p[16 * 10 * 9] * 40 + 0.5)
                 draw_panel(screen, state.current_player(), message,
-                          value=ai_value, draw_rate=hint_draw_rate)
+                          value=ai_value, draw_rate=hint_draw_rate,
+                          move_num=mn, no_cap=nc)
 
             clock.tick(30)
             pygame.display.flip()

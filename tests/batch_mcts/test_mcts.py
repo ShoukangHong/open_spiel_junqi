@@ -21,7 +21,8 @@ from open_spiel.python.algorithms import mcts as orig_mcts
 
 from train.batch_mcts.config import MCTSConfig
 from train.batch_mcts.evaluator import BatchRandomRolloutEvaluator
-from train.batch_mcts.mcts import BatchMCTS, _position_hash
+from train.batch_mcts.mcts import BatchMCTS
+from train.core.position_hash import hash_state, hash_obs
 
 
 class ZeroEvaluator:
@@ -174,9 +175,10 @@ def test_virtual_loss_invariant():
         state = game.new_initial_state()
         root = mcts.mcts_search(state)
 
-        # 1. Root visit count must equal max_simulations
-        assert root.explore_count == config.max_simulations, \
-            f"batch={batch_size}: root visits {root.explore_count} != {config.max_simulations}"
+        # 1. Root visit count >= max_simulations (sims_done counts unique
+        #    inferences, each batch may produce more backprops than inferences)
+        assert root.explore_count >= config.max_simulations, \
+            f"batch={batch_size}: root visits {root.explore_count} < {config.max_simulations}"
 
         # 2. All virtual_visits must be zero
         vl_nodes = []
@@ -198,7 +200,6 @@ def test_virtual_loss_invariant():
               f"  child_visits={child_total}  vl_nodes={len(vl_nodes)}  OK")
 
     print("  Test B PASSED")
-    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -312,7 +313,6 @@ def test_tictactoe():
         print("  Test C PASSED")
     else:
         print("  Test C FAILED")
-    return all_ok
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -356,7 +356,6 @@ def test_batch_stability():
               f"  {elapsed:.3f}s")
 
     print("  Test D PASSED")
-    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -416,7 +415,6 @@ def test_search_scaling():
             f"MCTS({strong_s}) score={score} < 0 — stronger search loses"
 
     print("  Test E PASSED")
-    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -487,14 +485,83 @@ def test_repeat_penalty():
 def test_position_hash_static_planes():
     """_position_hash returns int and filters dynamic planes for Xiangqi."""
     game = pyspiel.load_game("xiangqi")
-    h = _position_hash(game.new_initial_state())
+    h = hash_state(game.new_initial_state())
     assert isinstance(h, int)
 
     # Verify different positions produce different hashes
     s1 = game.new_initial_state()
     s2 = game.new_initial_state()
     s2.apply_action(s2.legal_actions()[0])
-    assert _position_hash(s1) != _position_hash(s2)
+    assert hash_state(s1) != hash_state(s2)
+
+
+def _build_ttt_state(moves):
+    """Build a TicTacToe state from action sequence."""
+    game = pyspiel.load_game("tic_tac_toe")
+    s = game.new_initial_state()
+    for a in moves:
+        s.apply_action(a)
+    return s
+
+
+def test_early_stop_all_children_proven():
+    """When all root children are proven (by solver), search stops early.
+
+    Board xxo/.o./xox (O to move): two legal moves, both lead to draw
+    after X fills the last cell.  Solver propagates the draw outcome up,
+    all children become proven, early stop kicks in.
+    """
+    game = pyspiel.load_game("tic_tac_toe")
+    # xxo / .o. / xox  — moves: X(0,0) O(0,2) X(2,0) O(1,1) X(0,1) O(2,1) X(2,2)
+    state = _build_ttt_state([0, 2, 6, 4, 1, 7, 8])
+
+    # Use batch_size=1 for exact visit counts
+    config = MCTSConfig(max_simulations=200, batch_size=1,
+                        uct_c=UCT_C, policy_epsilon=0, solve=True)
+
+    mcts = BatchMCTS(game, config, ZeroEvaluator(),
+                     random_state=np.random.RandomState(42))
+    root = mcts.mcts_search(state)
+
+    # All children proven by solver
+    for c in root.children:
+        assert c.outcome is not None, \
+            f"child {c.action} should be proven by solver"
+
+    # Each child visited twice (once as leaf, once via grandchild terminal)
+    for c in root.children:
+        assert c.explore_count == 2, \
+            f"child {c.action} visits should be 2, got {c.explore_count}"
+
+    # No virtual_visits leaked after prove+skip
+    vl_nodes = []
+    _walk_tree(root, lambda n: vl_nodes.append(n)
+               if n.virtual_visits != 0 else None)
+    assert len(vl_nodes) == 0, \
+        f"{len(vl_nodes)} nodes with vl≠0 after prove+skip"
+
+    # Persistent search: 0 extra sims
+    sims_before = root.explore_count
+    root2 = mcts.mcts_search(state, root=root)
+    assert root2.explore_count == sims_before, \
+        f"persistent search ran {root2.explore_count - sims_before} extra sims"
+
+
+def test_vl_zero_large_batch():
+    """Virtual_visits always zero after search, even with large batches."""
+    game = pyspiel.load_game("tic_tac_toe")
+    # Use a position with terminal children to exercise prove+skip
+    state = _build_ttt_state([0, 2, 6, 4, 1, 7, 8])
+    for bs in [1, 4, 8, 16, 32]:
+        config = MCTSConfig(max_simulations=64, batch_size=bs,
+                            uct_c=UCT_C, policy_epsilon=0, solve=True)
+        mcts = BatchMCTS(game, config, ZeroEvaluator(),
+                         random_state=np.random.RandomState(42))
+        root = mcts.mcts_search(state)
+        vl = []
+        _walk_tree(root, lambda n: vl.append(n)
+                   if n.virtual_visits != 0 else None)
+        assert len(vl) == 0, f"batch={bs}: {len(vl)} nodes with vl≠0"
 
 
 def main():
@@ -511,6 +578,7 @@ def main():
         ("F", "Step temperature sampling", test_step_temperature),
         ("G", "Repeat penalty", test_repeat_penalty),
         ("H", "Position hash", test_position_hash_static_planes),
+        ("I", "VL zero large batch", test_vl_zero_large_batch),
     ]
 
     failed = 0

@@ -239,3 +239,33 @@ Python 3.11 Windows 上，`SharedMemory.buf` 返回的 `memoryview` 不支持 `b
 # 激活 venv 后
 python -m pytest tests/ -v
 ```
+
+未解决报错：
+[06-17 22:48:43]     [eval] dir=/hy-tmp/cloud_b  ckpts_found=17  refs=[160, 60, 120]
+  [eval] loaded cloud_b:180  params=3032895
+[inf-srv GPU0] CPU affinity: core 127 (of 128 available)
+Process actor-gpu0-48:
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.11/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/root/open_spiel_junqi/train/core/train_loop.py", line 146, in actor_process
+    states_info, returns, rare_games, wstats = play_game_fn(
+                                               ^^^^^^^^^^^^^
+  File "/root/open_spiel_junqi/train/core/play.py", line 148, in play_game
+    root = mcts.mcts_search(state)
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/open_spiel_junqi/train/batch_mcts/mcts.py", line 681, in mcts_search
+    values_arr, priors_list = self.evaluator.batch_inference_raw(
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/open_spiel_junqi/train/batch_mcts/shared_evaluator.py", line 71, in batch_inference_raw
+    return self._process_batch(data, mask_b)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/open_spiel_junqi/train/batch_mcts/shared_evaluator.py", line 105, in _process_batch
+    pl = np.exp(pl - pl.max())
+                     ^^^^^^^^
+  File "/usr/local/lib/python3.11/dist-packages/numpy/_core/_methods.py", line 45, in _amax
+    return umr_maximum(a, axis, None, out, keepdims, initial, where)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: zero-size array to reduction operation maximum which has no identity

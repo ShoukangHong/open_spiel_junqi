@@ -47,8 +47,8 @@ class _MockModel:
         return values, policies
 
     def _scalar(self, o):
-        h = abs(hash((self.mid, self._step, o.tobytes()))) % 1000
-        return float(h) / 1000.0
+        h = abs(hash((self.mid, self._step, o.tobytes())))
+        return float(h % 9973) / 9973.0
 
     def _wdl(self, o):
         v = self._scalar(o)
@@ -62,8 +62,8 @@ class _MockModel:
 
 def _expected_wdl(model_id, step, obs):
     """Recompute the expected WDL for a given state."""
-    h = abs(hash((model_id, step, obs.tobytes()))) % 1000
-    v = float(h) / 1000.0
+    h = abs(hash((model_id, step, obs.tobytes())))
+    v = float(h % 9973) / 9973.0
     q = (v - 0.5) * 2
     d = 1.0 - abs(q)
     w = np.array([max(q, 0), d, max(-q, 0)], dtype=np.float32)

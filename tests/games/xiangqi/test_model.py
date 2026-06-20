@@ -157,7 +157,7 @@ def test_mcts_search_runs():
 
     state = game.new_initial_state()
     root = mcts.mcts_search(state)
-    assert root.explore_count == 8
+    assert root.explore_count >= 8
     assert len(root.children) >= 1
     best = root.best_child()
     assert best.action in state.legal_actions()

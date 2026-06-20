@@ -59,17 +59,103 @@ def load_model_for_ui(checkpoint_dir, checkpoint_step, build_model_fn):
 
 
 def create_bot(game, model, mcts_sims, batch_size, uct_c,
-               draw_penalty=0.0, repeat_penalty=0.0, random_state=None):
+               draw_penalty=0.0, repeat_penalty=0.0, random_state=None,
+               policy_epsilon=0.0, policy_alpha=1.0):
     """Create a BatchMCTS bot backed by a PyTorch model."""
     evaluator = PyTorchEvaluator(game, model)
     mcts_cfg = MCTSConfig(
         max_simulations=mcts_sims, batch_size=batch_size,
         uct_c=uct_c, draw_penalty=draw_penalty,
         repeat_penalty=repeat_penalty,
-        policy_epsilon=0, verbose=False)
+        policy_epsilon=policy_epsilon, policy_alpha=policy_alpha,
+        verbose=False)
     bot = BatchMCTS(game, mcts_cfg, evaluator,
                     random_state=random_state or np.random.RandomState())
     return bot, evaluator, mcts_cfg
+
+
+# ── Alpha-Beta Bot ─────────────────────────────────────────────────────────
+
+def create_ab_bot(game, model, depth=4, random_state=None, policy_temp=0.2):
+    """Create a BatchAlphaBeta bot backed by a PyTorch model."""
+    from train.batch_alpha_beta.alpha_beta import BatchAlphaBeta
+    evaluator = PyTorchEvaluator(game, model)
+    bot = BatchAlphaBeta(game, evaluator, depth=depth,
+                         random_state=random_state or np.random.RandomState(),
+                         policy_temp=policy_temp)
+    return bot, evaluator
+
+
+# ── Alpha-Beta Hint Engine ──────────────────────────────────────────────────
+
+class AlphaBetaHintEngine:
+    """Alpha-beta search engine for UI hints — evals once, caches result."""
+
+    def __init__(self, game, evaluator, depth=4, policy_temp=0.2):
+        from train.batch_alpha_beta.alpha_beta import BatchAlphaBeta
+        self._game = game
+        self._evaluator = evaluator
+        self._depth = depth
+        self._policy_temp = policy_temp
+        self._ab = BatchAlphaBeta(game, evaluator, depth=depth,
+                                  random_state=np.random.RandomState(),
+                                  policy_temp=policy_temp)
+        self._root = None
+        self._state_key = None
+        self._frozen = False
+        self._frozen_root = None
+
+    def search(self, state):
+        if self._frozen and self._frozen_root is not None:
+            return self._extract_hints(self._frozen_root)
+
+        key = str(state)
+        if self._root is not None and self._state_key == key:
+            return self._extract_hints(self._root)
+
+        self._root = self._ab.search(state)
+        self._state_key = key
+        return self._extract_hints(self._root)
+
+    def compute_root_policy(self, root, state=None):
+        return self._ab.compute_root_policy(root, state)
+
+    def freeze(self):
+        self._frozen = True
+        self._frozen_root = self._root
+
+    def unfreeze(self):
+        self._frozen = False
+
+    @property
+    def is_frozen(self):
+        return self._frozen
+
+    def subtree_inherit(self, action):
+        if self._root is None:
+            return
+        for c in self._root.children:
+            if c.action == action:
+                self._root = c
+                return
+        self._root = None
+
+    def _extract_hints(self, root):
+        if root is None or not root.children:
+            return [], [], [], 0.0, 0.0
+        actions = [c.action for c in root.children]
+        visits = [c.explore_count for c in root.children]
+        q_values = []
+        for c in root.children:
+            if c.outcome is not None:
+                q_values.append(c.outcome[c.player])
+            else:
+                q_values.append(c.q_value)
+        if root.outcome is not None:
+            root_val = root.outcome[root.player]
+        else:
+            root_val = root.q_value
+        return actions, visits, q_values, root_val, root.draw_rate
 
 
 # ── MCTS Hint Engine ────────────────────────────────────────────────────────
@@ -83,14 +169,17 @@ class MCTSHintEngine:
     """
 
     def __init__(self, game, evaluator, max_sims=12800, batch_size=16,
-                 uct_c=1.41, draw_penalty=0.0, repeat_penalty=0.0):
+                 uct_c=1.41, draw_penalty=0.0, repeat_penalty=0.0,
+                 policy_epsilon=0.0, policy_alpha=1.0):
         self._game = game
         self._evaluator = evaluator
         self._max_sims = max_sims
         self._cfg = MCTSConfig(max_simulations=64, batch_size=batch_size,
                                uct_c=uct_c, draw_penalty=draw_penalty,
                                repeat_penalty=repeat_penalty,
-                               policy_epsilon=0, verbose=False)
+                               policy_epsilon=policy_epsilon,
+                               policy_alpha=policy_alpha,
+                               verbose=False)
         self._mcts = BatchMCTS(game, self._cfg, evaluator,
                               random_state=np.random.RandomState())
         self._root = None
@@ -133,6 +222,13 @@ class MCTSHintEngine:
     @property
     def is_frozen(self):
         return self._frozen
+
+    def compute_root_policy(self, root, state=None):
+        from train.batch_mcts.mcts import compute_solved_policy
+        player = root.children[0].player if root.children else 0
+        return compute_solved_policy(
+            root.children, player, self._game.max_utility(),
+            root_visits=root.explore_count)
 
     def subtree_inherit(self, action):
         """After a move, try to reuse the child subtree."""
@@ -225,13 +321,19 @@ def game_over_screen(screen, width, height, result_text, board_draw_fn,
         pygame.display.flip()
 
 
-# ── Console MCTS info ───────────────────────────────────────────────────────
+# ── Console search info ───────────────────────────────────────────────────────
 
-def print_mcts_info(root, state, evaluator=None, action_label_fn=None):
-    """Print MCTS root policy, NN prior, and value to console."""
+def print_search_info(root, state, policy_override, *,
+                      evaluator=None, action_label_fn=None,
+                      max_moves=20, engine_label="search"):
+    """Print root policy, NN prior, and value to console.
+
+    *policy_override* is a dict {action: probability} — the caller is
+    responsible for computing it via bot.compute_root_policy().
+    """
     player = state.current_player()
     pname = "RED(p0)" if player == 0 else "BLACK(p1)"
-    print(f"  -- MCTS  {pname} --")
+    print(f"  -- {engine_label}  {pname} --")
 
     if root.outcome is not None:
         root_val = root.outcome[player]
@@ -242,47 +344,54 @@ def print_mcts_info(root, state, evaluator=None, action_label_fn=None):
           f"{'  (solved)' if root.outcome is not None else ''}")
 
     # NN raw
+    nn_policy = None
     if evaluator is not None:
         nn_value, nn_policy = evaluator._inference(state)
         if hasattr(nn_value, '__len__') and not isinstance(nn_value, float):
             w, d, l = float(nn_value[0]), float(nn_value[1]), float(nn_value[2])
-            nn_val = (w - l)
             nn_str = f"w={w:.3f} d={d:.3f} l={l:.3f}"
         else:
-            nn_val = float(nn_value)
-            nn_str = f"{nn_val:+.4f}"
+            nn_str = f"{float(nn_value):+.4f}"
         print(f"  -- NN raw {nn_str}    "
-              f"MCTS value={root_val:+.4f}{draw_info}    "
+              f"{engine_label} value={root_val:+.4f}{draw_info}    "
               f"sims={root.explore_count} --")
 
-    # Top moves
-    legal = state.legal_actions()
+    # Per-child rows
+    solved = policy_override
+    max_n = max((c.explore_count for c in root.children), default=0)
+    show_n = (max_n > 1)  # hide N for alpha-beta (all == 1)
     rows = []
-    for a in legal:
-        mcts_n = 0
-        mcts_v = 0.0
-        mcts_solved = " "
+    for a in state.legal_actions():
+        n, v, is_solved = 0, 0.0, " "
         for c in root.children:
             if c.action == a:
-                mcts_n = c.explore_count
-                mcts_v = c.outcome[player] if c.outcome is not None else c.q_value
-                mcts_solved = "✓" if c.outcome is not None else " "
+                n = c.explore_count
+                v = c.outcome[player] if c.outcome is not None else c.q_value
+                is_solved = "✓" if c.outcome is not None else " "
                 break
         nn_p = float(nn_policy[a]) if nn_policy is not None else 0.0
-        rows.append((a, mcts_n, mcts_v, mcts_solved, nn_p))
+        sp = float(solved.get(a, 0.0)) if isinstance(solved, dict) else float(solved[a])
+        rows.append((a, n, v, is_solved, nn_p, sp))
 
-    rows.sort(key=lambda r: (-r[1], -r[4]))
-    total_visits = sum(c.explore_count for c in root.children)
-
+    rows.sort(key=lambda r: (-r[5], -r[4]))  # sort by policy, then NN prior
     BAR_W = 30
-    for a, mcts_n, mcts_v, mcts_solved, nn_p in rows:
-        mcts_p = mcts_n / max(total_visits, 1)
+    for a, n, v, is_solved, nn_p, sp in rows[:max_moves]:
         nn_bar = "█" * int(nn_p * BAR_W) if nn_p > 0.001 else ""
-        mcts_bar = "█" * int(mcts_p * BAR_W) if mcts_n > 0 else ""
+        solved_bar = "█" * int(sp * BAR_W) if sp > 0.001 else ""
         label = action_label_fn(a) if action_label_fn else str(a)
-        print(f"  {label:>10s}  NN={nn_p:.3f} {nn_bar:<{BAR_W}s}  "
-              f"MCTS={mcts_p:.3f} {mcts_bar:<{BAR_W}s} V={mcts_v:+.3f}{mcts_solved} N={mcts_n:>4d}")
+        line = (f"  {label:>10s}  NN={nn_p:.3f} {nn_bar:<{BAR_W}s}  "
+                f"P={sp:.3f} {solved_bar:<{BAR_W}s} V={v:+.3f}{is_solved}")
+        if show_n:
+            line += f" N={n:>4d}"
+        print(line)
     print()
+
+# Backward-compatible alias
+def print_mcts_info(root, state, evaluator=None, action_label_fn=None,
+                    max_moves=20, policy_override=None):
+    print_search_info(root, state, policy_override or {},
+                      evaluator=evaluator, action_label_fn=action_label_fn,
+                      max_moves=max_moves, engine_label="MCTS")
 
 
 # ── Buffer loading ──────────────────────────────────────────────────────────

@@ -100,10 +100,14 @@ class SharedEvaluator:
         prior_list = []
         for i in range(n):
             legal = mask_b[i].nonzero()[0]
+            if len(legal) == 0:
+                print(f"[WARN] empty legal mask at idx {i}/{n}", flush=True)
+                prior_list.append([])
+                continue
             pl = policy_logits[i, legal]
-            pl = np.clip(pl, -30, 30)
+            pl = np.clip(np.nan_to_num(pl, nan=0.0, posinf=30.0, neginf=-30.0), -30, 30)
             pl = np.exp(pl - pl.max())
-            probs = (pl / pl.sum()).astype(np.float32)
+            probs = np.clip(pl / pl.sum(), 0, 1).astype(np.float32)
             prior_list.append(
                 list(zip(legal.astype(int).tolist(), probs.astype(float).tolist())))
             vl = value_logits[i]

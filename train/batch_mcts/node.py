@@ -88,23 +88,24 @@ class Node:
             parent_explore_count) / (self.explore_count + 1)
 
     def puct_with_virtual(self, parent_explore_count: int, uct_c: float,
-                          virtual_loss: float) -> float:
-        """PUCT with virtual loss that penalises in-flight nodes.
+                          virtual_loss: float, repeat_penalty: float = 0.0
+                          ) -> float:
+        """PUCT with virtual loss and optional repeat-position penalty.
 
-        When virtual_visits > 0 the exploration bonus shrinks (larger N)
-        and the penalty term pushes sibling threads elsewhere.
-
-        ``max(parent, 1)`` ensures prior information guides selection even
-        when the parent has zero real visits (first batch at root).
+        *repeat_penalty* is the accumulated penalty factor (0..0.8).
+        Q is transformed as  (1+Q)*(1-repeat_penalty)-1  so the penalty
+        scales with Q — a strong position is penalised more, which gives
+        the passive player a better chance to escape repetition.
         """
         if self.outcome is not None:
             return self.outcome[self.player]
 
         n = self.visit_count
         u = uct_c * self.prior * math.sqrt(max(parent_explore_count, 1)) / (n + 1)
-        vloss = -virtual_loss * self.virtual_visits / max(n, 1)
         q = self.q_value - Node.draw_penalty * self.draw_rate
-        return q + u + vloss
+        if repeat_penalty > 0:
+            q = (1.0 + q) * (1.0 - repeat_penalty) - 1.0
+        return q + u
 
     # ── Best child ────────────────────────────────────────────────────────
 

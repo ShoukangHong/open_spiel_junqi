@@ -17,6 +17,9 @@ from train.core.types import TrainInput
 _WAL_PRAGMAS = ("PRAGMA journal_mode=WAL;", "PRAGMA synchronous=NORMAL;")
 
 
+from train.core.position_hash import hash_obs
+
+
 def _pack(arr):
     return zlib.compress(np.asarray(arr, dtype=np.float32).tobytes())
 
@@ -43,7 +46,8 @@ class ReplayBuffer:
     """
 
     def __init__(self, max_size: int, db_path: str = None,
-                 max_db_rows: int = 1_000_000, recent_db_rows: int = 0):
+                 max_db_rows: int = 1_000_000, recent_db_rows: int = 0,
+                 game_name: str = ""):
         self._max_size = max_size
         self._db_path = db_path
         self._max_db_rows = max_db_rows
@@ -56,6 +60,7 @@ class ReplayBuffer:
         self._index = 0             # total states ever appended
         self._size = 0              # ring occupancy
         self._pending = 0           # unflushed DB inserts
+        self._game_name = game_name
         self._recent_pending = 0
 
         if db_path:
@@ -320,7 +325,7 @@ class ReplayBuffer:
             return 0
         seen = set()
         for i in range(self._size):
-            seen.add(self._obs[i].tobytes())
+            seen.add(hash_obs(self._obs[i], self._game_name))
         return len(seen)
 
 

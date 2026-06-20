@@ -136,10 +136,10 @@ def wstats_summary(cfg):
     return (f"rare={total['rare']:d} rf={flip:d}"
             f" wf={total['weak_final']:d}"
             f" weak={total['weak']:d}  ({games}d games)"
-            f"  |  rare/g={total['rare']/games:.1f}"
-            f" rf/g={flip/games:.1f}"
-            f" wf/g={total['weak_final']/games:.1f}"
-            f" weak/g={total['weak']/games:.1f}")
+            f"  |  rare/g={total['rare']/games:.3f}"
+            f" rf/g={flip/games:.3f}"
+            f" wf/g={total['weak_final']/games:.3f}"
+            f" weak/g={total['weak']/games:.3f}")
 
 
 def reset_wstats(cfg):

@@ -82,7 +82,7 @@ class Model:
         dev = self._device if self._device != "cpu" else self._model.device
         obs = obs.to(dev)
         mask = mask.to(dev)
-        target_policy = target_policy.to(dev)
+        target_policy = target_policy.to(dev) * mask  # zero out illegal actions
         target_value = target_value.to(dev)
 
         # Reshape flat observations to (batch, C, H, W) using model's spatial dims
@@ -104,8 +104,7 @@ class Model:
 
         with torch.no_grad():
             p_weights = torch.ones(target_value.shape[0], device=dev)
-            p_weights[target_value[:, 0] > 0.99999] = 0.2
-            p_weights[target_value[:, 2] > 0.99999] = 0.0
+            p_weights[target_value[:, 2] > 0.99999] = 0.2
         per_sample = -(target_policy * log_probs).sum(dim=-1)
         policy_loss = (p_weights * per_sample).sum() / p_weights.sum().clamp(min=1)
 
@@ -142,11 +141,50 @@ class Model:
 
         self._optimizer.zero_grad()
         total_loss.backward()
+
+        # ── Relative gradient / update norms (pre-clip) ───────────────────
+        with torch.no_grad():
+            w_sq = 0.0
+            g_sq = 0.0
+            for p in self._model.parameters():
+                w_sq += (p.detach() ** 2).sum().item()
+                if p.grad is not None:
+                    g_sq += (p.grad.detach() ** 2).sum().item()
+            w_norm = w_sq ** 0.5
+            g_norm = g_sq ** 0.5
+            grad_rel = g_norm / max(w_norm, 1e-12)
+            w_old = torch.cat([p.detach().flatten()
+                               for p in self._model.parameters()])
+
         torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
         self._optimizer.step()
 
+        with torch.no_grad():
+            w_new = torch.cat([p.detach().flatten()
+                               for p in self._model.parameters()])
+            delta_norm = (w_new - w_old).norm().item()
+            update_rel = delta_norm / max(w_norm, 1e-12)
+
+        # Catch corrupted BN running stats immediately (not just at checkpoint)
+        for name, b in self._model.named_buffers():
+            if not torch.isfinite(b).all():
+                # Dump the offending batch for offline investigation
+                import time as _time
+                dump = f"nan_batch_{_time.strftime('%Y%m%d_%H%M%S')}.npz"
+                obs_np = (batch.observation[:1].cpu().numpy()
+                          if isinstance(batch.observation, torch.Tensor)
+                          else batch.observation[:1])
+                np.savez_compressed(dump, obs=obs_np,
+                                    mask=batch.legals_mask[:1],
+                                    policy=batch.policy[:1],
+                                    value=batch.value[:1])
+                raise RuntimeError(
+                    f"training step: buffer '{name}' became NaN/Inf — "
+                    f"dumped first sample to {dump}")
+
         return Losses(policy=policy_loss.item(), value=value_loss.item(),
-                      l2=l2_reg, v_kl=v_kl, top1=top1, p_kl=p_kl)
+                      l2=l2_reg, v_kl=v_kl, top1=top1, p_kl=p_kl,
+                      grad_rel=grad_rel, update_rel=update_rel)
 
     def save_checkpoint(self, step: int) -> str:
         if not self._checkpoint_path:
@@ -156,6 +194,11 @@ class Model:
             if not torch.isfinite(p).all():
                 raise RuntimeError(
                     f"save_checkpoint: parameter '{name}' contains NaN/Inf "
+                    f"at step {step} — training diverged")
+        for name, b in self._model.named_buffers():
+            if not torch.isfinite(b).all():
+                raise RuntimeError(
+                    f"save_checkpoint: buffer '{name}' contains NaN/Inf "
                     f"at step {step} — training diverged")
         filepath = os.path.join(self._checkpoint_path, f"checkpoint-{step}.pt")
         tmp = filepath + ".tmp"

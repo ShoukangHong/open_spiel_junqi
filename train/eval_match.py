@@ -77,7 +77,7 @@ def _mcts_for(player_cfg):
             batch_size=player_cfg.get("mcts_batch_size", 4),
             uct_c=player_cfg.get("mcts_uct_c", 1.41),
             draw_penalty=tc.get("draw_penalty", 0.0),
-            repeat_penalty=tc.get("repeat_penalty", 0.0),
+            repeat_penalty=tc.get("repeat_penalty", 0.1),
             policy_epsilon=0, verbose=False)
         _mcts_bots[key] = BatchMCTS(
             game, cfg, ev, random_state=np.random.RandomState(42))
@@ -103,7 +103,7 @@ def _act(player_cfg, state, move_num, temperature, temp_drop):
         mask = np.asarray(state.legal_actions_mask(), dtype=bool)
         _, policy = _model_for(player_cfg).inference(obs, mask)
         probs = np.array([policy[a] for a in legal])
-        tau = 0.5 if move_num < temp_drop else temperature
+        tau = 2/3 if move_num < temp_drop else temperature
         if tau > 0:
             probs = probs ** (1.0 / max(tau, 0.01))
             probs /= probs.sum()
@@ -111,14 +111,16 @@ def _act(player_cfg, state, move_num, temperature, temp_drop):
         return legal[int(np.argmax(probs))]
 
     if strategy == "mcts":
+        from train.core.policy import select_action_with_adv
         root = _mcts_for(player_cfg).mcts_search(state)
-        visits = np.array([c.explore_count for c in root.children])
-        probs = visits / visits.sum()
-        tau = 1.0 if move_num < temp_drop else temperature
-        probs = probs ** (1.0 / max(tau, 0.01))
-        probs /= probs.sum()
-        actions = [c.action for c in root.children]
-        return np.random.choice(actions, p=probs)
+        tau = 2/3 if move_num < temp_drop else temperature
+        if move_num < temp_drop:
+            a, _ = select_action_with_adv(root, state, alpha=0.3, adv_t=0.2,
+                                          temperature=tau)
+        else:
+            a, _ = select_action_with_adv(root, state, alpha=0.0,
+                                          temperature=tau)
+        return a
 
     raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -361,12 +363,16 @@ def _act_parallel(player_cfg, state, move_num, temperature, temp_drop,
 
     if strategy == "model":
         _, policy = shared_eval._inference(state)
-        probs = np.array([policy[a] for a in legal])
+        probs = np.array([policy[a] for a in legal], dtype=np.float64)
+        probs = np.nan_to_num(probs, nan=0.0).clip(min=0)
+        s = probs.sum()
+        if s <= 0:
+            return np.random.choice(legal)
         if temperature > 0:
-            probs = probs ** (1.0 / temperature)
+            probs = probs ** (1.0 / max(temperature, 0.01))
             probs /= probs.sum()
             return np.random.choice(legal, p=probs)
-        return legal[int(np.argmax(probs))]
+        return np.random.choice(legal, p=probs / s)
 
     if strategy == "mcts":
         if not hasattr(_act_parallel, '_mcts_cache'):
@@ -385,20 +391,22 @@ def _act_parallel(player_cfg, state, move_num, temperature, temp_drop,
                 batch_size=player_cfg.get("mcts_batch_size", 4),
                 uct_c=player_cfg.get("mcts_uct_c", 1.41),
                 draw_penalty=tc.get("draw_penalty", 0.0),
-                repeat_penalty=tc.get("repeat_penalty", 0.0),
+                repeat_penalty=tc.get("repeat_penalty", 0.1),
                 policy_epsilon=0, verbose=False)
             _act_parallel._mcts_cache[key] = BatchMCTS(
                 pyspiel.load_game(tc["game"]), cfg, shared_eval,
                 random_state=np.random.RandomState(worker_id * 1000))
         mcts = _act_parallel._mcts_cache[key]
+        from train.core.policy import select_action_with_adv
         root = mcts.mcts_search(state)
-        visits = np.array([c.explore_count for c in root.children])
-        probs = visits / visits.sum()
-        tau = 0.5 if move_num < temp_drop else temperature
-        probs = probs ** (1.0 / max(tau, 0.01))
-        probs /= probs.sum()
-        actions = [c.action for c in root.children]
-        return np.random.choice(actions, p=probs)
+        tau = 2/3 if move_num < temp_drop else temperature
+        if move_num < temp_drop:
+            a, _ = select_action_with_adv(root, state, alpha=0.3, adv_t=0.2,
+                                          temperature=tau)
+        else:
+            a, _ = select_action_with_adv(root, state, alpha=0.0,
+                                          temperature=tau)
+        return a
 
     raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -475,7 +483,7 @@ def _write_eval_games(f, sequences, score):
 
 DEFAULT_NUM_GAMES = 100
 DEFAULT_TEMPERATURE = 0.03
-DEFAULT_TEMP_DROP = 7
+DEFAULT_TEMP_DROP = 15
 
 PLAYER = {
     0: {"strategy": "mcts",
@@ -497,9 +505,9 @@ PLAYER = {
 }
 
 PLAYER = {
-    0: {"strategy": "model",
-        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud",
-        "checkpoint_step": 180,
+    0: {"strategy": "mcts",
+        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud_b",
+        "checkpoint_step": 170,
         "mcts_simulations": 400, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
     # 1: {"strategy": "mcts", # 早期的benchmark
     #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_argmax", # argmax 240 us benchmark
@@ -509,10 +517,10 @@ PLAYER = {
     #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_b",
     #     "checkpoint_step": 990,
     #     "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
-    1: {"strategy": "model",
-        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud",
-        "checkpoint_step": 230,
-        "mcts_simulations": 400, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
+    1: {"strategy": "mcts",
+        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud_b",
+        "checkpoint_step": 170,
+        "mcts_simulations": 401, "mcts_batch_size": 1, "mcts_uct_c": 1.41},
 }
 
 if __name__ == "__main__":

@@ -10,6 +10,19 @@ from train.batch_mcts.mcts import compute_solved_policy
 from train.core.policy import mix_advantage
 from train.core.weak_move import try_weak_move
 
+_EPS = 1e-6  # label smoothing — prevents float32 underflow from CE with p=0
+
+
+def _smooth_policy(policy, legal):
+    """Blend uniform noise so no action has zero probability."""
+    n = len(legal)
+    if n == 0:
+        return policy
+    u = _EPS / n
+    policy = policy * (1.0 - _EPS)
+    policy[legal] += u
+    return policy
+
 
 def assign_players(rng, mcts_main, mcts_best, mcts_opp=None,
                    best_model_prob=0.3, random_opponent_prob=0.2,
@@ -169,6 +182,7 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
                 policy /= policy_sum
             else:
                 policy[...] = 1.0 / policy.size
+            policy = _smooth_policy(policy, state.legal_actions())
             if root.outcome is not None:
                 q = root.outcome[cur_player]
                 dr = 1.0 if q == 0 else 0.0
@@ -208,6 +222,7 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
             for a in state.legal_actions():
                 policy[a] = 1.0
             policy /= policy.sum()
+        policy = _smooth_policy(policy, state.legal_actions())
 
         # Advantage mixing for unsolved states
         if (config.policy_mix_alpha > 0

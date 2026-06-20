@@ -29,27 +29,7 @@ import pyspiel
 
 from train.batch_mcts.node import Node
 from train.batch_mcts.config import MCTSConfig
-
-# Game name → number of static observation planes (skip dynamic ones like
-# move counters).  Games not listed here hash ALL planes.
-_STATIC_OBS_PLANES = {
-    "xiangqi": 15,  # planes 0-14: pieces + player; skip 15 (move#) + 16 (no-cap#)
-}
-
-
-def _position_hash(state):
-    """Hash of the position-relevant part of the observation tensor.
-
-    Skips dynamic planes (e.g. move counters) so that the same board
-    position hashes identically regardless of when it was reached.
-    """
-    obs_shape = state.get_game().observation_tensor_shape()
-    obs = np.asarray(state.observation_tensor(), dtype=np.float32)
-    n_planes = _STATIC_OBS_PLANES.get(state.get_game().get_type().short_name)
-    if n_planes is not None:
-        n = n_planes * obs_shape[1] * obs_shape[2]
-        obs = obs[:n]
-    return hash(obs.tobytes())
+from train.core.position_hash import hash_state, hash_obs as _hash_obs
 
 
 def compute_solved_policy(children, player, max_utility, alpha=5.0,
@@ -103,7 +83,7 @@ def compute_solved_policy(children, player, max_utility, alpha=5.0,
         for c in children:
             c_eff = eff.get(c.action, 0.0)
             if c.outcome is not None and c.outcome[player] == max_utility:
-                diff = 1/math.sqrt(c.explore_count)
+                diff = 1/math.sqrt(max(c.explore_count, 1))
             else:
                 diff = c_eff - best_val
             conf = root_conf if c.outcome is not None else math.sqrt(max(c.explore_count, 1))
@@ -119,6 +99,12 @@ def compute_solved_policy(children, player, max_utility, alpha=5.0,
                        if c.action not in loss_actions)
     if total_visits > 0:
         return {c.action: (c.explore_count / total_visits
+                           if c.action not in loss_actions else 0.0)
+                for c in children}
+    # No visits at all — use NN priors
+    total_prior = sum(c.prior for c in children if c.action not in loss_actions)
+    if total_prior > 0:
+        return {c.action: (c.prior / total_prior
                            if c.action not in loss_actions else 0.0)
                 for c in children}
     return {c.action: 1.0 / len(children) for c in children}
@@ -626,81 +612,142 @@ class BatchMCTS:
             root = Node(None, state.current_player(), 1)
             root.state = state.clone()
 
+        # Already fully solved (persistent search) — nothing to do
+        if root.children and all(c.outcome is not None
+                                 for c in root.children):
+            return root
+
         # ── Build repetition count from game history ─────────────────────
         tmp = self._game.new_initial_state()
         rep_counts = {}  # position_hash → occurrence count
-        rep_counts[_position_hash(tmp)] = 1
+        if not tmp.is_terminal():
+            rep_counts[hash_state(tmp)] = 1
         for a in state.history():
             tmp.apply_action(a)
-            h = _position_hash(tmp)
-            rep_counts[h] = rep_counts.get(h, 0) + 1
+            if not tmp.is_terminal():
+                h = hash_state(tmp)
+                rep_counts[h] = rep_counts.get(h, 0) + 1
 
         self._rep_counts = rep_counts
         self._repeat_penalty = self.config.repeat_penalty  # per-occurrence, capped
 
         max_sim = self.config.max_simulations
         batch_size = self.config.batch_size
-        num_batches = (max_sim + batch_size - 1) // batch_size
 
-        for batch_idx in range(num_batches):
-            current_batch = min(batch_size,
-                                max_sim - batch_idx * batch_size)
+        sims_done = 0
+        while sims_done < max_sim:
+            remaining = max_sim - sims_done
+            batch_limit = min(batch_size, remaining)
 
-            # ── Phase 1: Selection with virtual loss ─────────────────
-            paths = []  # (path_nodes, leaf_node, leaf_state)
-            for _ in range(current_batch):
-                path_nodes, leaf_node, leaf_state = self._select(root, state)
-                paths.append((path_nodes, leaf_node, leaf_state))
+            paths, early_flush = self._collect_paths_plain(
+                root, state, batch_limit)
 
-            # ── Phase 2: Deduplicate & batch evaluate ─────────────────
-            unique_nodes = []
-            node_to_idx = {}
-            for _, leaf_node, leaf_state in paths:
-                if leaf_node not in node_to_idx and not leaf_state.is_terminal():
-                    node_to_idx[leaf_node] = len(unique_nodes)
-                    unique_nodes.append(leaf_node)
+            if paths:
+                sims_done += self._flush_paths(root, paths)
 
-            values_map = {}
-            if unique_nodes:
-                states_to_eval = [n.state for n in unique_nodes]
-                values_arr, priors_list = self.evaluator.batch_inference_raw(
-                    states_to_eval)
-                for node, out, prior in zip(unique_nodes, values_arr,
-                                            priors_list):
-                    w, d, l = float(out[0]), float(out[1]), float(out[2])
-                    value = (w - l) * self.max_utility
-                    values_map[node] = (value, prior, d)
-
-            # ── Phase 3: Expand + Backprop ────────────────────────────
-            expanded_this_batch = set()
-
-            for path_nodes, leaf_node, leaf_state in paths:
-                if leaf_state.is_terminal():
-                    returns = np.array(leaf_state.returns())
-                    leaf_node.outcome = returns
-                    draw_prob = 1.0 if all(r == 0 for r in returns) else 0.0
-                else:
-                    value, prior, draw_prob = values_map[leaf_node]
-                    if leaf_node not in expanded_this_batch:
-                        self._expand(leaf_node, leaf_state, prior)
-                        expanded_this_batch.add(leaf_node)
-                    lp = leaf_state.current_player()
-                    returns = np.zeros(2)
-                    returns[lp] = value
-                    returns[1 - lp] = -value
-
-                self._backprop(path_nodes, returns, draw_prob)
-
-                for node in reversed(path_nodes):
-                    if self._check_solved(node):
-                        if node is root:
-                            break
-
-            # Early stop if game tree is proven from root
             if root.outcome is not None:
                 break
+            if root.children and all(c.outcome is not None
+                                     for c in root.children):
+                break
+            if not early_flush and len(paths) < batch_limit:
+                break  # all leaves already explored, can't progress
 
         return root
+
+    def _flush_paths(self, root, paths):
+        """Run Phase 2+3 on *paths*, return number of paths processed."""
+        # ── Phase 2: Batch evaluate ──────────────────────────────────
+        unique_nodes = []
+        node_to_idx = {}
+        for _, leaf_node, leaf_state in paths:
+            if leaf_node not in node_to_idx and not leaf_state.is_terminal():
+                node_to_idx[leaf_node] = len(unique_nodes)
+                unique_nodes.append(leaf_node)
+
+        values_map = {}
+        if unique_nodes:
+            states_to_eval = [n.state for n in unique_nodes]
+            values_arr, priors_list = self.evaluator.batch_inference_raw(
+                states_to_eval)
+            for node, out, prior in zip(unique_nodes, values_arr,
+                                        priors_list):
+                w, d, l = float(out[0]), float(out[1]), float(out[2])
+                value = (w - l) * self.max_utility
+                values_map[node] = (value, prior, d)
+
+        # ── Phase 3: Expand + Backprop ───────────────────────────────
+        expanded_this_batch = set()
+        for path_nodes, leaf_node, leaf_state in paths:
+            if leaf_state.is_terminal():
+                returns = np.array(leaf_state.returns())
+                draw_prob = 1.0 if all(r == 0 for r in returns) else 0.0
+            else:
+                value, prior, draw_prob = values_map[leaf_node]
+                if leaf_node not in expanded_this_batch:
+                    self._expand(leaf_node, leaf_state, prior)
+                    expanded_this_batch.add(leaf_node)
+                lp = leaf_state.current_player()
+                returns = np.zeros(2)
+                returns[lp] = value
+                returns[1 - lp] = -value
+
+            self._backprop(path_nodes, returns, draw_prob)
+
+            if leaf_state.is_terminal():
+                leaf_node.outcome = returns
+
+            for node in reversed(path_nodes):
+                if self._check_solved(node):
+                    if node is root:
+                        break
+
+        return len(unique_nodes)
+
+    def _collect_paths_plain(self, root, state, batch_limit):
+        """Collect *batch_limit* paths without dedup filtering.
+
+        Returns (paths, early_flush).  early_flush is always False — all
+        paths are kept, so len(paths) < batch_limit never happens.
+        """
+        paths = []
+        for _ in range(batch_limit):
+            pn, ln, ls = self._select(root, state)
+            paths.append((pn, ln, ls))
+        return paths, False
+
+    def _collect_paths_dedup(self, root, state, batch_limit):
+        """Collect unique-leaf paths (no internal flush).
+
+        Duplicate leaves are skipped and their virtual loss rolled back.
+        No flush is performed inside this method — the caller is
+        responsible for flushing the returned paths.
+
+        Returns (paths, early_flush).  early_flush is True when duplicates
+        were skipped, signalling the caller that len(paths) < batch_limit
+        is NOT due to tree exhaustion.
+        """
+        paths = []
+        seen = set()
+        early_flush = False
+        for _ in range(batch_limit):
+            pn, ln, ls = self._select(root, state)
+            if ln in seen:
+                for n in pn:
+                    if n.virtual_visits > 0:
+                        n.virtual_visits -= 1
+                early_flush = True
+                continue
+            seen.add(ln)
+            paths.append((pn, ln, ls))
+        return paths, early_flush
+
+    def compute_root_policy(self, root, state=None):
+        """Return {action: probability} from MCTS visit distribution."""
+        player = root.children[0].player if root.children else 0
+        return compute_solved_policy(
+            root.children, player, self.max_utility,
+            root_visits=root.explore_count)
 
     def step(self, state):
         """Return the best action from the given state."""
@@ -811,8 +858,10 @@ class BatchMCTS:
                                       and c.outcome[player] >= best_proven]
             # Unvisited children of root get a large bonus so the first
             # batches naturally cover every legal action — none skipped.
-            # Repeated positions are penalised per occurrence.
-            # Helper: safe repeat penalty for a child at root.
+            # Repeated positions get a multiplicative Q penalty:
+            #   Q' = (1+Q)*(1-penalty)-1
+            # This scales the penalty with Q — strong positions are
+            # penalised more, favouring the passive player.
             def _repeat_pen(c):
                 if node is not root or c._pos_hash is None:
                     return 0.0
@@ -821,9 +870,8 @@ class BatchMCTS:
             best_child = max(
                 candidates,
                 key=lambda c: c.puct_with_virtual(
-                    node.visit_count, uct_c, vloss)
-                + (1e6 if node is root and c.explore_count == 0 else 0)
-                - _repeat_pen(c))
+                    node.visit_count, uct_c, vloss, _repeat_pen(c))
+                + (1e6 if node is root and c.explore_count == 0 else 0))
 
             # Apply virtual loss
             best_child.virtual_visits += 1
@@ -849,25 +897,33 @@ class BatchMCTS:
         children = []
         for action, prob in prior:
             child = Node(action, player, prob)
-            if node.action is None:  # root: pre-compute position hash
+            if node.action is None:  # root: pre-compute position hash + cache state
                 s = state.clone()
                 s.apply_action(action)
                 if not s.is_terminal():
-                    child._pos_hash = _position_hash(s)
+                    child._pos_hash = hash_state(s)
+                child.state = s
             children.append(child)
         node.children = children
 
     def _backprop(self, path, returns, draw_prob=0.0):
-        """Backpropagate *returns* and *draw_prob* along *path*."""
+        """Backpropagate *returns* and *draw_prob* along *path*.
+
+        Skips nodes that already have a proven outcome — their value is
+        settled and extra visits only inflate counts.
+        """
         for i in range(len(path) - 1, -1, -1):
             node = path[i]
+            # Always clean up virtual loss, even for proven nodes
+            if node.virtual_visits > 0:
+                node.virtual_visits -= 1
+            if node.outcome is not None:
+                continue
             decision_idx = i
             while path[decision_idx].player == pyspiel.PlayerId.CHANCE:
                 decision_idx -= 1
             target = returns[path[decision_idx].player]
 
-            if node.virtual_visits > 0:
-                node.virtual_visits -= 1
             node.total_reward += target
             node.draw_reward += draw_prob
             node.explore_count += 1

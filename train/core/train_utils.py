@@ -79,14 +79,11 @@ def init_training(cfg, game_module, model_builder, ReplayBuffer_class,
 
     buffer = ReplayBuffer_class(max_size=cfg.replay_buffer_size,
                                  db_path=os.path.join(cfg.path, "buffer.db"),
-                                 recent_db_rows=10000)
-    samples_per_step = max(
-        int(cfg.replay_buffer_size * cfg.buffer_sampling_frac),
-        cfg.train_batch_size)
-    n_updates = samples_per_step * cfg.symmetry // cfg.train_batch_size
+                                 recent_db_rows=10000,
+                                 game_name=getattr(cfg, 'game', ''))
     sym = Symmetry_class() if cfg.symmetry > 1 else None
     logging.info(f"[train] buffer_sampling_frac={cfg.buffer_sampling_frac}"
-                 f"  symmetry={cfg.symmetry}  n_updates={n_updates}")
+                 f"  symmetry={cfg.symmetry}")
 
     mcts_config = MCTSConfig(
         max_simulations=cfg.max_simulations,
@@ -95,6 +92,7 @@ def init_training(cfg, game_module, model_builder, ReplayBuffer_class,
         policy_epsilon=cfg.policy_epsilon,
         policy_alpha=cfg.policy_alpha,
         draw_penalty=cfg.draw_penalty,
+        repeat_penalty=cfg.repeat_penalty,
         verbose=False,
     )
 
@@ -108,7 +106,7 @@ def init_training(cfg, game_module, model_builder, ReplayBuffer_class,
     else:
         logging.info("[train] No checkpoint found, starting fresh")
 
-    return (game, model, buffer, sym, n_updates, start_step, mcts_config)
+    return (game, model, buffer, sym, start_step, mcts_config)
 
 
 def select_eval_references(ckpts, step, output_dir, ref_count):
@@ -207,7 +205,8 @@ def maybe_trigger_eval(step, cfg, _eval_thread, _last_eval_time,
 
     _eval_thread = threading.Thread(
         target=eval_func,
-        args=(cfg.path, step, refs, cfg.evaluation_window, 10,
+        args=(cfg.path, step, refs, cfg.evaluation_window,
+              getattr(cfg, 'eval_num_actors', 10),
               cfg.temperature, cfg.temperature_drop),
         daemon=True)
     _eval_thread.start()
@@ -215,7 +214,7 @@ def maybe_trigger_eval(step, cfg, _eval_thread, _last_eval_time,
 
 
 def run_eval_background(cfg_path, current_step, ref_steps, num_games,
-                        num_actors=10, temperature=0.1, temp_drop=4):
+                        num_actors=10, temperature=None, temp_drop=None):
     """Run model-vs-model eval against multiple references (background)."""
     import platform
     if platform.system() == "Windows":
@@ -232,6 +231,10 @@ def run_eval_background(cfg_path, current_step, ref_steps, num_games,
     if os.path.exists(train_cfg_path):
         with open(train_cfg_path) as f:
             tc = json.load(f)
+    if temperature is None:
+        temperature = tc.get("temperature", 0.1)
+    if temp_drop is None:
+        temp_drop = tc.get("temperature_drop", 25)
     mcts_cfg = {"strategy": "mcts",
                 "checkpoint_dir": cfg_path,
                 "mcts_simulations": tc.get("max_simulations", 128),
@@ -273,7 +276,7 @@ def run_eval_background(cfg_path, current_step, ref_steps, num_games,
             try:
                 with open(best_file) as f:
                     old_best = int(f.read().strip())
-                if ref_step == old_best and wr > 0.55:
+                if ref_step == old_best and wr >= 0.55:
                     with open(best_file, "w") as f:
                         f.write(str(current_step))
                     logging.info(f"    [eval] → new best model: step{current_step} "

@@ -25,6 +25,7 @@ class BaseTrainConfig:
     inference_batch_size: int = 128  # server-side max batch for shared eval
     uct_c: float = 1.41
     draw_penalty: float = 0.0   # penalise draw-heavy branches in PUCT selection
+    repeat_penalty: float = 0.1  # penalise repeating positions in PUCT
     policy_epsilon: float = 0.25
     policy_alpha: float = 1.0
     temperature: float = 0.01
@@ -46,6 +47,7 @@ class BaseTrainConfig:
     eval_reference_count: int = 5
     best_model_prob: float = 0.3       # probability of self-play vs best model
     random_opponent_prob: float = 0.2  # probability of random ckpt opponent
+    eval_num_actors: int = 10          # parallel actors for eval matches
     eval_min_interval: int = 1800
 
     # Early termination (pruning)
