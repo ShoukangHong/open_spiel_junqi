@@ -60,7 +60,7 @@ def load_model_for_ui(checkpoint_dir, checkpoint_step, build_model_fn):
 
 def create_bot(game, model, mcts_sims, batch_size, uct_c,
                draw_penalty=0.0, repeat_penalty=0.0, random_state=None,
-               policy_epsilon=0.0, policy_alpha=1.0):
+               policy_epsilon=0.0, policy_alpha=1.0, fpu_lambda=0.0):
     """Create a BatchMCTS bot backed by a PyTorch model."""
     evaluator = PyTorchEvaluator(game, model)
     mcts_cfg = MCTSConfig(
@@ -68,6 +68,7 @@ def create_bot(game, model, mcts_sims, batch_size, uct_c,
         uct_c=uct_c, draw_penalty=draw_penalty,
         repeat_penalty=repeat_penalty,
         policy_epsilon=policy_epsilon, policy_alpha=policy_alpha,
+        fpu_lambda=fpu_lambda,
         verbose=False)
     bot = BatchMCTS(game, mcts_cfg, evaluator,
                     random_state=random_state or np.random.RandomState())
@@ -76,11 +77,12 @@ def create_bot(game, model, mcts_sims, batch_size, uct_c,
 
 # ── Alpha-Beta Bot ─────────────────────────────────────────────────────────
 
-def create_ab_bot(game, model, depth=4, random_state=None, policy_temp=0.2):
+def create_ab_bot(game, model, depth=4, batch_size=8,
+                  random_state=None, policy_temp=0.2):
     """Create a BatchAlphaBeta bot backed by a PyTorch model."""
     from train.batch_alpha_beta.alpha_beta import BatchAlphaBeta
     evaluator = PyTorchEvaluator(game, model)
-    bot = BatchAlphaBeta(game, evaluator, depth=depth,
+    bot = BatchAlphaBeta(game, evaluator, depth=depth, batch_size=batch_size,
                          random_state=random_state or np.random.RandomState(),
                          policy_temp=policy_temp)
     return bot, evaluator
@@ -91,13 +93,15 @@ def create_ab_bot(game, model, depth=4, random_state=None, policy_temp=0.2):
 class AlphaBetaHintEngine:
     """Alpha-beta search engine for UI hints — evals once, caches result."""
 
-    def __init__(self, game, evaluator, depth=4, policy_temp=0.2):
+    def __init__(self, game, evaluator, depth=4, batch_size=8, policy_temp=0.2):
         from train.batch_alpha_beta.alpha_beta import BatchAlphaBeta
         self._game = game
         self._evaluator = evaluator
         self._depth = depth
+        self._batch_size = batch_size
         self._policy_temp = policy_temp
         self._ab = BatchAlphaBeta(game, evaluator, depth=depth,
+                                  batch_size=batch_size,
                                   random_state=np.random.RandomState(),
                                   policy_temp=policy_temp)
         self._root = None
@@ -170,7 +174,7 @@ class MCTSHintEngine:
 
     def __init__(self, game, evaluator, max_sims=12800, batch_size=16,
                  uct_c=1.41, draw_penalty=0.0, repeat_penalty=0.0,
-                 policy_epsilon=0.0, policy_alpha=1.0):
+                 policy_epsilon=0.0, policy_alpha=1.0, fpu_lambda=0.0):
         self._game = game
         self._evaluator = evaluator
         self._max_sims = max_sims
@@ -179,6 +183,7 @@ class MCTSHintEngine:
                                repeat_penalty=repeat_penalty,
                                policy_epsilon=policy_epsilon,
                                policy_alpha=policy_alpha,
+                               fpu_lambda=fpu_lambda,
                                verbose=False)
         self._mcts = BatchMCTS(game, self._cfg, evaluator,
                               random_state=np.random.RandomState())

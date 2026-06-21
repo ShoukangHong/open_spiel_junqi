@@ -41,7 +41,6 @@ class XiangqiResNet(nn.Module):
 
         # Policy head — plane encoding: 1 plane per source square
         self.policy_conv = nn.Conv2d(nn_width, num_src, 1, bias=False)
-        self.policy_bn = nn.BatchNorm2d(num_src)
 
         # Value head — WDL 3-class
         self.value_conv = nn.Conv2d(nn_width, 4, 1, bias=False)
@@ -80,8 +79,7 @@ class XiangqiResNet(nn.Module):
         x = self.res_blocks(x)
 
         # Policy head: 90 planes × (10, 9) → flat 8100
-        p = F.relu(self.policy_bn(self.policy_conv(x)))   # (batch, 90, 10, 9)
-        policy_logits = p.reshape(batch, -1)                # (batch, 8100)
+        policy_logits = self.policy_conv(x).reshape(batch, -1)  # (batch, 8100)
 
         # Value head
         v = F.relu(self.value_bn(self.value_conv(x)))       # (batch, 4, 10, 9)

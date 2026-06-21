@@ -231,6 +231,35 @@ Python 3.11 Windows 上，`SharedMemory.buf` 返回的 `memoryview` 不支持 `b
 
 **修复**：空闲时 `get(timeout=0.1)` 阻塞等待，有消息才唤醒；凑 batch 时 `get(timeout=0.002)` 短暂阻塞。提取 `_handle_msg()` 内部函数消除 drain / 等待 / 处理三处重复代码。预分配 `obs_buf = np.empty((max_batch, obs_dim))` 消除每次 batch 的 `np.concatenate` malloc/memcpy。
 
+### 33. Policy head 的 BN + ReLU 破坏 NN prior（致命）
+
+Xiangqi / Othello ResNet 的 policy head 原为 `Conv1x1 → BN → ReLU`。OpenSpiel AlphaZero 的标准做法是 `Conv1x1 → Flatten → FC(relu) → FC(None)`——policy logits 的**最后一层无 BN 无激活**。
+
+BN + ReLU 会带来三个问题：
+1. **训练时 batch statistics 耦合**：同一 batch 内样本的 logit 相互依赖，policy CE loss 的梯度被 batch statistics 的噪声污染，policy head 学不懂（pkl tail 长期不降）
+2. **ReLU 限制 logits ≥ 0**：模型无法表达"这步绝不该走"，劣着和优着的 logit 差被压缩在 [0, ~2] 的窄区间，softmax 区分力差
+3. **推理时 BN 用 running stats**：去掉 BN 后加载旧 checkpoint 的 `policy_conv` 权重是在 BN 存在时训练的，输出尺度完全失控——`policy_conv` 训练时输出 σ≈1 供 BN 归一化，去掉 BN 后 raw conv 输出可达 ±几十到几百，softmax 后 44 个走法中一个 NN=0.988 其他全 0，MCTS 完全丧失探索引导
+
+**修复**：删 `self.policy_bn` 和 `F.relu`，改 `forward` 为 `policy_logits = self.policy_conv(x).reshape(batch, -1)`（Xiangqi）和 `p = self.policy_conv(x).reshape(batch, -1); policy_logits = self.policy_fc(p)`（Othello）。旧 checkpoint 用 `strict=False` 加载，optimizer state 因参数不匹配被重置。
+
+**教训**：Policy head 的最后一层必须保留线性输出（可正可负）。BN 在 head 中的应用违背 DeepMind/Leela 的架构惯例——这些网络都在 trunk 用 BN，head 的最后一层不归一化不激活。
+
+### 34. MCTS 失势时未访问节点 Q=0 导致访问分散（严重）
+
+MCTS 的 PUCT 公式对未访问节点（`explore_count==0`）使用 `Q=0`，配合 PUCT 的探索项一起参与 max 选择。在失势局面下，已访问节点的 Q 收敛为负数（如 -0.5），而未访问节点 Q=0 相对更有吸引力——即使其 prior 极低，PUCT 探索项仍会让它被选中。结果是**访问在众多低 prior 动作间均匀分散**，每个动作的 Q 统计噪声极大，MCTS 策略变为近均匀分布，质量不如 NN prior。
+
+**修复**：FPU（First Play Urgency）。未访问节点的 Q 不再固定为 0，改为继承父节点 Q 并依 prior 惩罚：
+
+```
+Q_unvisited = Q_parent - λ × (p_max - p) / p_max
+```
+
+- 最高 prior 节点继承 Q_parent，不受罚
+- 低 prior 节点受 λ 权重惩罚，在失势时 Q 更负，自然被 PUCT 避开
+- λ=0.2 时效果显著：搜索聚焦于高 prior 动作
+
+**影响范围**：`Node.puct_with_virtual` 新增 `q_parent`/`fpu_lambda`/`prior_max` 参数，`MCTSConfig` 新增 `fpu_lambda` 字段，`_select` 在每节点计算 `p_max` 和 `q_parent` 传入。
+
 ---
 
 ## 测试运行

@@ -77,7 +77,7 @@ class StepRecord:
 # 2. Parsing
 # ---------------------------------------------------------------------------
 
-# First line: step header + throughput
+# First line: step header + throughput (online training)
 _LINE1_RE = re.compile(
     r"\[step\s+(?P<step>\d+)/\d+\]\s+"
     r"games=\s*(?P<games>\d+)\s+"
@@ -92,6 +92,15 @@ _LINE1_RE = re.compile(
     r"wf/g=(?P<wf_g>[\d.]+)\s+weak/g=(?P<weak_g>[\d.]+)\s+"
     r"states/s=(?P<sps>[\d.]+)\s+"
     r"selfplay=(?P<selfplay>[\d.]+)s\s+"
+    r"train=(?P<train>[\d.]+)s"
+)
+
+# First line: buffer replay training
+_LINE1_BUF_RE = re.compile(
+    r"\[step\s+(?P<step>\d+)/\d+\]\s+"
+    r"updates=\s*(?P<updates>\d+)\s+"
+    r"mem=\s*(?P<mem>\d+)/\s*(?P<mem_max>\d+)\s+"
+    r"db=\s*(?P<db_idx>\d+)/\s*(?P<db_total>\d+)\s+"
     r"train=(?P<train>[\d.]+)s"
 )
 
@@ -130,9 +139,32 @@ def parse_training_log(log_path: str) -> List[StepRecord]:
 
     with open(log_path, encoding="utf-8", errors="replace") as f:
         for line in f:
+            # Try online-training pattern first, then buffer-training
             m1 = _LINE1_RE.search(line)
+            is_buf = False
+            if not m1:
+                m1 = _LINE1_BUF_RE.search(line)
+                is_buf = True
             if m1:
                 d = m1.groupdict()
+                if is_buf:
+                    pending = {
+                        "step": int(d["step"]),
+                        "games": 0, "states": 0,
+                        "buffer_current": int(d["mem"]),
+                        "buffer_total": int(d["mem_max"]),
+                        "unique_states": 0,
+                        "tags_normal": 0, "tags_rare": 0,
+                        "rare_count": 0, "rf_count": 0,
+                        "wf_count": 0, "weak_count": 0,
+                        "rare_per_game": 0.0, "rf_per_game": 0.0,
+                        "wf_per_game": 0.0, "weak_per_game": 0.0,
+                        "states_per_s": 0.0,
+                        "selfplay_s": 0.0,
+                        "train_s": float(d["train"]),
+                    }
+                    continue
+
                 # Parse tags dict:  {'': 1495, 'rare': 129}
                 tags_normal = 0
                 tags_rare = 0
@@ -250,16 +282,12 @@ def plot_metrics(records: List[StepRecord], smooth: int = 1,
         t = moving_average(t, smooth)
         l2 = moving_average(l2, smooth)
     ax.plot(steps, t, color="#333333", linewidth=1.2, label="total")
-    ax.set_ylabel("total", color="#333333")
+    ax.set_ylabel("loss", color="#333333")
     ax.tick_params(axis="y", colors="#333333")
-    ax2 = ax.twinx()
-    ax2.plot(steps, l2, color="#9E9E9E", linewidth=1.0, alpha=0.7, label="L2")
-    ax2.set_ylabel("L2", color="#9E9E9E")
-    ax2.tick_params(axis="y", colors="#9E9E9E")
+    ax.plot(steps, l2, color="#9E9E9E", linewidth=1.0, alpha=0.7, label="L2")
     ax.set_title("Total Loss + L2")
     lines1, labels1 = ax.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax.legend(lines1 + lines2, labels1 + labels2, fontsize=7, loc="upper left")
+    ax.legend(fontsize=7, loc="upper left")
     ax.grid(True, alpha=0.25)
 
     # ── (0,1) Policy + Value loss ───────────────────────────────────────
@@ -557,7 +585,7 @@ def main():
         plot_metrics(records, smooth=args.smooth, output_path=output_path,
                      elo_pairs=elo_pairs)
 
-DEFAULT_LOG = r"C:\Users\shouk\xiangqi_train\cloud_b\train.log"
+DEFAULT_LOG = r"C:\Users\shouk\xiangqi_train\cloud_fpu\train.log"
 DEFAULT_SMOOTH = 1
 DEFAULT_NO_PLOT = False
 

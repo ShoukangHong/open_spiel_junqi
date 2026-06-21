@@ -27,16 +27,17 @@ CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_b"
 CHECKPOINT_STEP = 65
 MCTS_SIMULATIONS = 1024
 HINT_MAX_SIM = 32000
-MCTS_BATCH_SIZE = 8
+INFERENCE_BATCH_SIZE = 8  # shared by MCTS and AlphaBeta
 UCT_C = 2.0
+FPU_LAMBDA = 0.2  # FPU penalty for unvisited nodes in MCTS (0 = disabled)
 AI_TEMPERATURE = 0.01  # τ for AI move selection (0 = argmax)
 TEMP_DROP = 5         # use τ=0.5 + advantage mixing before this move
 SAVE_DIR = os.path.join(CHECKPOINT_DIR, "saved_positions")
 POLICY_EPSILON = 0.0  # Dirichlet noise weight for AI/hint search
 POLICY_ALPHA = 0.0     # Dirichlet concentration parameter
 AB_DEPTH = 3           # alpha-beta search depth
-AB_POLICY_TEMP = 0.03   # temperature for value→policy softmax in AB
-_AB_FLAG = [True]      # toggle with 'A' key — list to allow mutation from nested scope
+AB_POLICY_TEMP = 0.003   # temperature for value→policy softmax in AB
+_AB_FLAG = [False]      # toggle with 'A' key — list to allow mutation from nested scope
 MAX_PRINT_MOVES = 20   # top N moves printed to console
 
 # Read MCTS params from training config (fall back to defaults)
@@ -100,17 +101,21 @@ def main():
     def _make_bot_and_hint():
         if _AB_FLAG[0]:
             bot, evaluator = create_ab_bot(game, model, depth=AB_DEPTH,
+                                            batch_size=INFERENCE_BATCH_SIZE,
                                             policy_temp=AB_POLICY_TEMP)
             hint_engine = AlphaBetaHintEngine(game, evaluator, depth=AB_DEPTH,
+                                              batch_size=INFERENCE_BATCH_SIZE,
                                               policy_temp=AB_POLICY_TEMP)
         else:
             bot, evaluator, _ = create_bot(game, model, MCTS_SIMULATIONS,
-                                           MCTS_BATCH_SIZE, UCT_C,
+                                           INFERENCE_BATCH_SIZE, UCT_C,
                                            DRAW_PENALTY, REPEAT_PENALTY,
-                                           POLICY_EPSILON, POLICY_ALPHA)
+                                           POLICY_EPSILON, POLICY_ALPHA,
+                                           fpu_lambda=FPU_LAMBDA)
             hint_engine = MCTSHintEngine(game, evaluator, HINT_MAX_SIM,
-                                         MCTS_BATCH_SIZE, UCT_C,
-                                         DRAW_PENALTY, REPEAT_PENALTY)
+                                         INFERENCE_BATCH_SIZE, UCT_C,
+                                         DRAW_PENALTY, REPEAT_PENALTY,
+                                         fpu_lambda=FPU_LAMBDA)
         return bot, evaluator, hint_engine
 
     bot, evaluator, hint_engine = _make_bot_and_hint()
@@ -302,7 +307,10 @@ def main():
                         root, state, temperature=2/3, alpha=0.3, adv_t=0.2,
                         base_policy=policy)
                     bot._last_root = root
-                    print_search_info(root, state, policy,
+                    # Display sharpened policy, not raw
+                    display_pol = {c.action: float(probs[c.action])
+                                   for c in root.children}
+                    print_search_info(root, state, display_pol,
                                     evaluator=evaluator, action_label_fn=action_label,
                                     max_moves=MAX_PRINT_MOVES,
                                     engine_label="AB" if _AB_FLAG[0] else "MCTS")
@@ -314,7 +322,9 @@ def main():
                         root, state, temperature=AI_TEMPERATURE, alpha=0.0,
                         base_policy=policy)
                     bot._last_root = root
-                    print_search_info(root, state, policy,
+                    display_pol = {c.action: float(probs[c.action])
+                                   for c in root.children}
+                    print_search_info(root, state, display_pol,
                                evaluator=evaluator, action_label_fn=action_label,
                                max_moves=MAX_PRINT_MOVES,
                                engine_label="AB" if _AB_FLAG[0] else "MCTS")

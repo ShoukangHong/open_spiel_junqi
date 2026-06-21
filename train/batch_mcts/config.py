@@ -31,6 +31,9 @@ class MCTSConfig:
     # Repetition penalty — PUCT score reduced per occurrence (capped at 0.8)
     repeat_penalty: float = 0.1
 
+    # FPU (First Play Urgency) — unvisited-node Q = Q_parent - λ·(p_max-p)/p_max
+    fpu_lambda: float = 0.0
+
     # Solver
     solve: bool = True           # Whether to back up proven terminal values
 

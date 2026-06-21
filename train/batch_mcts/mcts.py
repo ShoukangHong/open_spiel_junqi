@@ -867,10 +867,16 @@ class BatchMCTS:
                     return 0.0
                 count = self._rep_counts.get(c._pos_hash, 0)
                 return min(count * self._repeat_penalty, 0.8)
+            # FPU: unvisited nodes inherit parent Q minus prior-based penalty
+            _fpu_lambda = self.config.fpu_lambda
+            _q_parent = node.q_value
+            _p_max = max((c.prior for c in candidates), default=1.0)
             best_child = max(
                 candidates,
                 key=lambda c: c.puct_with_virtual(
-                    node.visit_count, uct_c, vloss, _repeat_pen(c))
+                    node.visit_count, uct_c, vloss, _repeat_pen(c),
+                    q_parent=_q_parent, fpu_lambda=_fpu_lambda,
+                    prior_max=_p_max)
                 + (1e6 if node is root and c.explore_count == 0 else 0))
 
             # Apply virtual loss

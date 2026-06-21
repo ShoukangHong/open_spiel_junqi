@@ -217,7 +217,11 @@ class Model:
         if os.path.exists(filepath):
             ckpt = torch.load(filepath, map_location=self._device, weights_only=False)
             self._model.load_state_dict(ckpt["model_state_dict"], strict=False)
-            self._optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            try:
+                self._optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            except ValueError:
+                print(f"[model] Warning: optimizer state mismatch — "
+                      f"architecture changed. Starting with fresh optimizer.")
             for pg in self._optimizer.param_groups:
                 pg["lr"] = self._lr
         else:
