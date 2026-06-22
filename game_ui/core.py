@@ -60,7 +60,8 @@ def load_model_for_ui(checkpoint_dir, checkpoint_step, build_model_fn):
 
 def create_bot(game, model, mcts_sims, batch_size, uct_c,
                draw_penalty=0.0, repeat_penalty=0.0, random_state=None,
-               policy_epsilon=0.0, policy_alpha=1.0, fpu_lambda=0.0):
+               policy_epsilon=0.0, policy_alpha=1.0, fpu_lambda=0.0,
+               probe_depth=0, probe_surprise=0.3):
     """Create a BatchMCTS bot backed by a PyTorch model."""
     evaluator = PyTorchEvaluator(game, model)
     mcts_cfg = MCTSConfig(
@@ -69,6 +70,7 @@ def create_bot(game, model, mcts_sims, batch_size, uct_c,
         repeat_penalty=repeat_penalty,
         policy_epsilon=policy_epsilon, policy_alpha=policy_alpha,
         fpu_lambda=fpu_lambda,
+        probe_depth=probe_depth, probe_surprise=probe_surprise,
         verbose=False)
     bot = BatchMCTS(game, mcts_cfg, evaluator,
                     random_state=random_state or np.random.RandomState())
@@ -174,7 +176,8 @@ class MCTSHintEngine:
 
     def __init__(self, game, evaluator, max_sims=12800, batch_size=16,
                  uct_c=1.41, draw_penalty=0.0, repeat_penalty=0.0,
-                 policy_epsilon=0.0, policy_alpha=1.0, fpu_lambda=0.0):
+                 policy_epsilon=0.0, policy_alpha=1.0, fpu_lambda=0.0,
+                 probe_depth=0, probe_surprise=0.3):
         self._game = game
         self._evaluator = evaluator
         self._max_sims = max_sims
@@ -184,6 +187,8 @@ class MCTSHintEngine:
                                policy_epsilon=policy_epsilon,
                                policy_alpha=policy_alpha,
                                fpu_lambda=fpu_lambda,
+                               probe_depth=probe_depth,
+                               probe_surprise=probe_surprise,
                                verbose=False)
         self._mcts = BatchMCTS(game, self._cfg, evaluator,
                               random_state=np.random.RandomState())
@@ -350,6 +355,7 @@ def print_search_info(root, state, policy_override, *,
 
     # NN raw
     nn_policy = None
+    child_nn_q = {}  # action → NN w-l for child state
     if evaluator is not None:
         nn_value, nn_policy = evaluator._inference(state)
         if hasattr(nn_value, '__len__') and not isinstance(nn_value, float):
@@ -360,6 +366,35 @@ def print_search_info(root, state, policy_override, *,
         print(f"  -- NN raw {nn_str}    "
               f"{engine_label} value={root_val:+.4f}{draw_info}    "
               f"sims={root.explore_count} --")
+
+        # Batch-eval root child states for NN value per action
+        child_states = []
+        child_acts = []
+        for c in root.children:
+            if c.state is not None:
+                child_states.append(c.state)
+                child_acts.append(c.action)
+        if child_states:
+            nt_idx = [j for j, cs in enumerate(child_states)
+                      if not cs.is_terminal()]
+            if nt_idx:
+                nt_states = [child_states[j] for j in nt_idx]
+                vals, _ = evaluator.batch_inference_raw(nt_states)
+                for k, j in enumerate(nt_idx):
+                    a = child_acts[j]
+                    q_nn = float(vals[k][0] - vals[k][2])
+                    cs = child_states[j]
+                    if cs.current_player() != player:
+                        q_nn = -q_nn
+                    child_nn_q[a] = q_nn
+            # Terminal children: use game returns
+            for j, cs in enumerate(child_states):
+                if cs.is_terminal():
+                    a = child_acts[j]
+                    ret = cs.returns()
+                    child_nn_q[a] = float(ret[0])  # p0 perspective
+                    if player != 0:
+                        child_nn_q[a] = -child_nn_q[a]
 
     # Per-child rows
     solved = policy_override
@@ -376,16 +411,17 @@ def print_search_info(root, state, policy_override, *,
                 break
         nn_p = float(nn_policy[a]) if nn_policy is not None else 0.0
         sp = float(solved.get(a, 0.0)) if isinstance(solved, dict) else float(solved[a])
-        rows.append((a, n, v, is_solved, nn_p, sp))
+        rows.append((a, n, v, is_solved, nn_p, sp, child_nn_q.get(a, 0.0)))
 
     rows.sort(key=lambda r: (-r[5], -r[4]))  # sort by policy, then NN prior
-    BAR_W = 30
-    for a, n, v, is_solved, nn_p, sp in rows[:max_moves]:
+    BAR_W = 20
+    for a, n, v, is_solved, nn_p, sp, nn_v in rows[:max_moves]:
         nn_bar = "█" * int(nn_p * BAR_W) if nn_p > 0.001 else ""
         solved_bar = "█" * int(sp * BAR_W) if sp > 0.001 else ""
         label = action_label_fn(a) if action_label_fn else str(a)
         line = (f"  {label:>10s}  NN={nn_p:.3f} {nn_bar:<{BAR_W}s}  "
-                f"P={sp:.3f} {solved_bar:<{BAR_W}s} V={v:+.3f}{is_solved}")
+                f"P={sp:.3f} {solved_bar:<{BAR_W}s}  "
+                f"Vnn={nn_v:+.3f}  V={v:+.3f}{is_solved}")
         if show_n:
             line += f" N={n:>4d}"
         print(line)

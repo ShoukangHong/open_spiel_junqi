@@ -631,6 +631,10 @@ class BatchMCTS:
         self._rep_counts = rep_counts
         self._repeat_penalty = self.config.repeat_penalty  # per-occurrence, capped
 
+        # ── Speculative probe: pre-expand along NN-prior-best path ──────
+        if self.config.probe_depth > 0 and not root.children:
+            self._speculative_probe(root, state)
+
         max_sim = self.config.max_simulations
         batch_size = self.config.batch_size
 
@@ -716,11 +720,173 @@ class BatchMCTS:
             paths.append((pn, ln, ls))
         return paths, False
 
+    def _speculative_probe(self, root, state):
+        """Pre-expand along each root action's NN-prior-best line.
+
+        For each root action, follows the max-prior child for up to
+        *probe_depth* layers.  If the NN value drops by more than
+        *probe_surprise* relative to the parent, the line is terminated
+        early (value trap detected).  All evaluated nodes are backpropped
+        into the tree so subsequent MCTS search benefits.
+        """
+        config = self.config
+        max_depth = config.probe_depth
+        threshold = config.probe_surprise
+        if max_depth <= 0 or self.evaluator is None:
+            return
+
+        legal = state.legal_actions()
+        if not legal:
+            return
+        player = state.current_player()
+        max_u = self.max_utility
+
+        def _max_prior_action(s, prior_list):
+            """Pick the legal action with highest prior."""
+            best_a = None
+            best_p = -1.0
+            for a, p in prior_list:
+                if p > best_p:
+                    best_p = p
+                    best_a = a
+            if best_a is None:
+                best_a = s.legal_actions()[0]
+            return best_a
+
+        # ── Level 0: eval root+children, expand root children ──────────
+        root_states = []
+        for a in legal:
+            cs = state.clone()
+            cs.apply_action(a)
+            root_states.append(cs)
+        to_eval = [state] + root_states
+        vals0, priors0 = self.evaluator.batch_inference_raw(to_eval)
+        root_priors = priors0[0]
+        child_priors0 = priors0[1:]
+
+        # action → (state, wdl, priors)
+        _act_map = {}
+        for i, a in enumerate(legal):
+            _act_map[a] = (root_states[i], vals0[1 + i], child_priors0[i])
+
+        self._expand(root, state, root_priors)
+        for c in root.children:
+            if c.action in _act_map:
+                c.state = _act_map[c.action][0]
+
+        # Paths: (node_list, state, prior_list, root_child_Q).  No backprop yet.
+        paths = []
+        for c in root.children:
+            a = c.action
+            if a not in _act_map or c.state.is_terminal():
+                continue
+            wdl_root_c = _act_map[a][1]
+            q0 = float(wdl_root_c[0] - wdl_root_c[2]) * max_u
+            eval_p0 = c.state.current_player()
+            q0_root = -q0 if eval_p0 != player else q0
+            paths.append(([root, c], c.state, _act_map[a][2], q0_root))
+
+        # ── Walk deeper ───────────────────────────────────────────────
+        for d in range(1, max_depth):
+            if not paths:
+                break
+
+            next_states = []
+            next_info = []   # (path_idx, next_state, action)
+            next_term = []
+            for p_idx, (bp_path, cs, pr, q0) in enumerate(paths):
+                if cs.is_terminal():
+                    continue
+                best_a = _max_prior_action(cs, pr)
+                ns = cs.clone()
+                ns.apply_action(best_a)
+                if ns.is_terminal():
+                    next_term.append((p_idx, ns, best_a))
+                else:
+                    next_states.append(ns)
+                    next_info.append((p_idx, ns, best_a))
+
+            if next_states:
+                vals_d, priors_d = self.evaluator.batch_inference_raw(next_states)
+
+            new_paths = []
+            for j, (p_idx, ns, best_a) in enumerate(next_info):
+                wdl = vals_d[j]
+                q_nn = float(wdl[0] - wdl[2]) * max_u
+                eval_p = ns.current_player()
+                q = -q_nn if eval_p != player else q_nn
+                bp_path = paths[p_idx][0]
+                _, _, _, q0 = paths[p_idx]  # root child Q for surprise
+                parent = bp_path[-1]
+                child_node = Node(best_a, 1 - parent.player,
+                                  dict(paths[p_idx][2]).get(best_a, 0.01))
+                child_node.state = ns
+                # Check surprise
+                if abs(q0 - q) > threshold * max_u:
+                    # Surprise — backprop NOW and terminate this path
+                    ret2 = np.zeros(2)
+                    ret2[player] = q
+                    ret2[1 - player] = -q
+                    for _ in range(max_depth):
+                        self._backprop(bp_path + [child_node], ret2)
+                    continue  # don't add to new_paths
+                new_paths.append((bp_path + [child_node], ns, priors_d[j], q0))
+            # Terminal — backprop NOW (only backprop once at leaf/term)
+            for (p_idx, ns, best_a) in next_term:
+                bp_path = paths[p_idx][0]
+                parent = bp_path[-1]
+                child_node = Node(best_a, 1 - parent.player,
+                                  dict(paths[p_idx][2]).get(best_a, 0.01))
+                child_node.state = ns
+                child_node.outcome = np.array(ns.returns(), dtype=np.float64)
+                ret = ns.returns()
+                # Convert returns to root perspective
+                q = ret[0] * max_u  # p0 perspective
+                if player != 0:
+                    q = -q
+                ret2 = np.zeros(2)
+                ret2[player] = q
+                ret2[1 - player] = -q
+                for _ in range(max_depth):
+                    self._backprop(bp_path + [child_node], ret2)
+            paths = new_paths
+
+        # ── At final depth: batch-eval leaves, backprop once per path ─
+        if paths:
+            leaf_states = []
+            leaf_info = []
+            for bp_path, ns, pr, q0 in paths:
+                if ns.is_terminal():
+                    leaf_info.append((True, ns.returns()))
+                else:
+                    leaf_states.append(ns)
+                    leaf_info.append((False, len(leaf_states) - 1))
+
+            if leaf_states:
+                leaf_vals, _ = self.evaluator.batch_inference_raw(leaf_states)
+
+            leaf_idx = 0
+            for p_idx, (bp_path, ns, pr, q0) in enumerate(paths):
+                is_term, info = leaf_info[p_idx]
+                if is_term:
+                    q = info[0] * max_u  # p0 perspective
+                    if player != 0:
+                        q = -q
+                else:
+                    wdl = leaf_vals[info]
+                    q = float(wdl[0] - wdl[2]) * max_u
+                    eval_p = ns.current_player()
+                    if eval_p != player:
+                        q = -q
+                ret2 = np.zeros(2)
+                ret2[player] = q
+                ret2[1 - player] = -q
+                for _ in range(max_depth):
+                    self._backprop(bp_path, ret2)
+
+
     def _collect_paths_dedup(self, root, state, batch_limit):
         """Collect unique-leaf paths (no internal flush).
-
-        Duplicate leaves are skipped and their virtual loss rolled back.
-        No flush is performed inside this method — the caller is
         responsible for flushing the returned paths.
 
         Returns (paths, early_flush).  early_flush is True when duplicates

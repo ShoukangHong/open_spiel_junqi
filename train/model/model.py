@@ -83,6 +83,7 @@ class Model:
         obs = obs.to(dev)
         mask = mask.to(dev)
         target_policy = target_policy.to(dev) * mask  # zero out illegal actions
+        target_policy = target_policy / target_policy.sum(dim=-1, keepdims=True).clamp(min=1e-9)
         target_value = target_value.to(dev)
 
         # Reshape flat observations to (batch, C, H, W) using model's spatial dims

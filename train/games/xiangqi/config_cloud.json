@@ -13,6 +13,7 @@
   "uct_c": 1.75,
   "draw_penalty": 0.1,
   "repeat_penalty": 0.2,
+  "fpu_lambda": 0.2,
   "policy_epsilon": 0.25,
   "policy_alpha": 0.25,
   "temperature": 0.02,

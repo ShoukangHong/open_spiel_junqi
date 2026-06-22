@@ -93,6 +93,7 @@ def init_training(cfg, game_module, model_builder, ReplayBuffer_class,
         policy_alpha=cfg.policy_alpha,
         draw_penalty=cfg.draw_penalty,
         repeat_penalty=cfg.repeat_penalty,
+        fpu_lambda=getattr(cfg, 'fpu_lambda', 0.2),
         verbose=False,
     )
 

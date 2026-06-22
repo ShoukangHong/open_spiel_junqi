@@ -32,7 +32,11 @@ class MCTSConfig:
     repeat_penalty: float = 0.1
 
     # FPU (First Play Urgency) — unvisited-node Q = Q_parent - λ·(p_max-p)/p_max
-    fpu_lambda: float = 0.0
+    fpu_lambda: float = 0.2
+
+    # Speculative probe — pre-expand along NN-prior-best path to detect traps
+    probe_depth: int = 0          # layers to probe (0 = disabled)
+    probe_surprise: float = 0.3   # Q-drop threshold for early termination
 
     # Solver
     solve: bool = True           # Whether to back up proven terminal values

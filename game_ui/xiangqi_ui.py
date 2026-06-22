@@ -23,18 +23,20 @@ from game_ui.xiangqi_render import (
 from train.core.model_builder import build_xiangqi_model
 
 # ── Config ──────────────────────────────────────────────────────────────────
-CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_b"
-CHECKPOINT_STEP = 65
+CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_fpu"
+CHECKPOINT_STEP = 60
 MCTS_SIMULATIONS = 1024
-HINT_MAX_SIM = 32000
-INFERENCE_BATCH_SIZE = 8  # shared by MCTS and AlphaBeta
-UCT_C = 2.0
+HINT_MAX_SIM = 500
+INFERENCE_BATCH_SIZE = 10  # shared by MCTS and AlphaBeta
+UCT_C = 4.0
 FPU_LAMBDA = 0.2  # FPU penalty for unvisited nodes in MCTS (0 = disabled)
+PROBE_DEPTH = 0   # speculative probe layers (0 = disabled)
+PROBE_SURPRISE = 1.0  # Q-drop threshold for probe early termination
 AI_TEMPERATURE = 0.01  # τ for AI move selection (0 = argmax)
 TEMP_DROP = 5         # use τ=0.5 + advantage mixing before this move
 SAVE_DIR = os.path.join(CHECKPOINT_DIR, "saved_positions")
-POLICY_EPSILON = 0.0  # Dirichlet noise weight for AI/hint search
-POLICY_ALPHA = 0.0     # Dirichlet concentration parameter
+POLICY_EPSILON = 0.25  # Dirichlet noise weight for AI/hint search
+POLICY_ALPHA = 0.25     # Dirichlet concentration parameter
 AB_DEPTH = 3           # alpha-beta search depth
 AB_POLICY_TEMP = 0.003   # temperature for value→policy softmax in AB
 _AB_FLAG = [False]      # toggle with 'A' key — list to allow mutation from nested scope
@@ -111,11 +113,16 @@ def main():
                                            INFERENCE_BATCH_SIZE, UCT_C,
                                            DRAW_PENALTY, REPEAT_PENALTY,
                                            POLICY_EPSILON, POLICY_ALPHA,
-                                           fpu_lambda=FPU_LAMBDA)
+                                           fpu_lambda=FPU_LAMBDA,
+                                           probe_depth=PROBE_DEPTH,
+                                           probe_surprise=PROBE_SURPRISE)
             hint_engine = MCTSHintEngine(game, evaluator, HINT_MAX_SIM,
                                          INFERENCE_BATCH_SIZE, UCT_C,
                                          DRAW_PENALTY, REPEAT_PENALTY,
-                                         fpu_lambda=FPU_LAMBDA)
+                                         POLICY_EPSILON, POLICY_ALPHA,
+                                         fpu_lambda=FPU_LAMBDA,
+                                         probe_depth=PROBE_DEPTH,
+                                         probe_surprise=PROBE_SURPRISE)
         return bot, evaluator, hint_engine
 
     bot, evaluator, hint_engine = _make_bot_and_hint()

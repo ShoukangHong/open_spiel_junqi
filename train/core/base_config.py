@@ -26,6 +26,7 @@ class BaseTrainConfig:
     uct_c: float = 1.41
     draw_penalty: float = 0.0   # penalise draw-heavy branches in PUCT selection
     repeat_penalty: float = 0.1  # penalise repeating positions in PUCT
+    fpu_lambda: float = 0.2       # FPU: unvisited Q = Q_parent - λ·(p_max-p)/p_max
     policy_epsilon: float = 0.25
     policy_alpha: float = 1.0
     temperature: float = 0.01
