@@ -298,3 +298,13 @@ Traceback (most recent call last):
     return umr_maximum(a, axis, None, out, keepdims, initial, where)
            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 ValueError: zero-size array to reduction operation maximum which has no identity
+
+
+在10万数据，1e-3学习率下3000个256的batch的学习结果，实际训练会用80万数据，更难拟合： 
+Done. 3000 batches in 342s (0.1s/batch) 
+P-KL: 0.2553 → 0.2319 (-9.2%) 
+V-KL: 0.1498 → 0.1006 (-32.8%)
+这个是整体3e-4学习率下的效果： 
+Done. 3000 batches in 341s (0.1s/batch) 
+P-KL: 0.2562 → 0.2321 (-9.4%) 
+V-KL: 0.1497 → 0.1011 (-32.5%)

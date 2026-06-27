@@ -17,7 +17,8 @@ class GameLogger:
 
     def log_game_start(self, weak_side=None):
         self._game_count += 1
-        self._verbose_game = (self._game_count % self._sample_rate == 1)
+        self._verbose_game = (self._sample_rate > 0
+                              and self._game_count % self._sample_rate == 1)
         self._summary = []
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         if self._verbose_game:

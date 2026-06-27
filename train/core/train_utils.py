@@ -94,6 +94,8 @@ def init_training(cfg, game_module, model_builder, ReplayBuffer_class,
         draw_penalty=cfg.draw_penalty,
         repeat_penalty=cfg.repeat_penalty,
         fpu_lambda=getattr(cfg, 'fpu_lambda', 0.2),
+        probe_depth=getattr(cfg, 'probe_depth', 0),
+        probe_surprise=getattr(cfg, 'probe_surprise', 0.3),
         verbose=False,
     )
 

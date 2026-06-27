@@ -25,6 +25,8 @@ _game = None
 _models = {}
 _mcts_bots = {}
 _mcts_evaluators = {}
+_opening_book = None
+_opening_prob = 0.0
 
 
 def _get_build_fn(game_name):
@@ -78,6 +80,9 @@ def _mcts_for(player_cfg):
             uct_c=player_cfg.get("mcts_uct_c", 1.41),
             draw_penalty=tc.get("draw_penalty", 0.0),
             repeat_penalty=tc.get("repeat_penalty", 0.1),
+            fpu_lambda=tc.get("fpu_lambda", 0.2),
+            probe_depth=tc.get("probe_depth", 0),
+            probe_surprise=tc.get("probe_surprise", 0.3),
             policy_epsilon=0, verbose=False)
         _mcts_bots[key] = BatchMCTS(
             game, cfg, ev, random_state=np.random.RandomState(42))
@@ -169,6 +174,21 @@ def run_match(cfg0, cfg1, num_games=100, temperature=0.1, temp_drop=4,
     score = {name0: 0, name1: 0, "draw": 0}
     sequences = []
 
+    # Load opening book once
+    global _opening_book, _opening_prob
+    if _opening_book is None:
+        tc_path = os.path.join(cfg0.get("checkpoint_dir", ""), "train_config.json")
+        if os.path.exists(tc_path):
+            with open(tc_path) as f:
+                tc = json.load(f)
+        else:
+            tc = {}
+        _opening_prob = tc.get("opening_book_prob", 0.0)
+        opening_dir = tc.get("opening_book_dir", "")
+        if opening_dir and _opening_prob > 0:
+            from train.games.opening_book import OpeningBook
+            _opening_book = OpeningBook(game, opening_dir)
+
     for i in range(num_games):
         if i % 2 == 0:
             cfg_b, cfg_w = cfg0, cfg1
@@ -177,7 +197,10 @@ def run_match(cfg0, cfg1, num_games=100, temperature=0.1, temp_drop=4,
             cfg_b, cfg_w = cfg1, cfg0
             label_b, label_w = name1, name0
 
-        state = game.new_initial_state()
+        if _opening_book and np.random.random() < _opening_prob:
+            state = _opening_book.sample(np.random)
+        else:
+            state = game.new_initial_state()
         move_num = 0
         moves = []
         while not state.is_terminal():
@@ -307,6 +330,19 @@ def _eval_actor_process(worker_id, g_start, g_end, cfg0, cfg1,
         else:
             evals[mid] = None
 
+    # Opening book (load once per actor)
+    obook = None
+    obook_prob = 0.0
+    tc_path = os.path.join(cfg0.get("checkpoint_dir", ""), "train_config.json")
+    if os.path.exists(tc_path):
+        with open(tc_path) as f:
+            _tc = json.load(f)
+        obook_prob = _tc.get("opening_book_prob", 0.0)
+        obook_dir = _tc.get("opening_book_dir", "")
+        if obook_dir and obook_prob > 0:
+            from train.games.opening_book import OpeningBook
+            obook = OpeningBook(game, obook_dir)
+
     rng = np.random.RandomState(worker_id * 1000 + g_start)
     local_score = {name0: 0, name1: 0, "draw": 0}
     local_seqs = []
@@ -321,7 +357,10 @@ def _eval_actor_process(worker_id, g_start, g_end, cfg0, cfg1,
             label_b, label_w = name1, name0
             ev_b, ev_w = evals["m1"], evals["m0"]
 
-        state = game.new_initial_state()
+        if obook and rng.random() < obook_prob:
+            state = obook.sample(rng)
+        else:
+            state = game.new_initial_state()
         move_num = 0
         moves = []
         while not state.is_terminal():
@@ -506,8 +545,8 @@ PLAYER = {
 
 PLAYER = {
     0: {"strategy": "mcts",
-        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud_b",
-        "checkpoint_step": 170,
+        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud_fpu",
+        "checkpoint_step": 160,
         "mcts_simulations": 400, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
     # 1: {"strategy": "mcts", # 早期的benchmark
     #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_argmax", # argmax 240 us benchmark
@@ -517,9 +556,9 @@ PLAYER = {
     #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_b",
     #     "checkpoint_step": 990,
     #     "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
-    1: {"strategy": "mcts",
-        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud_b",
-        "checkpoint_step": 170,
+    1: {"strategy": "model",
+        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud_fpu",
+        "checkpoint_step": 160,
         "mcts_simulations": 401, "mcts_batch_size": 1, "mcts_uct_c": 1.41},
 }
 

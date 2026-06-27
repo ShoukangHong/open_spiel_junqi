@@ -56,6 +56,19 @@ class BaseTrainConfig:
     prune_threshold: float = 0.99    # MCTS Q exceeding this triggers prune
     prune_prob: float = 0.9          # probability of actually pruning
 
+    # Opening book
+    opening_book_dir: str = ""         # directory of serialized opening states
+    opening_book_prob: float = 0.0     # probability of using an opening (0=off)
+
+    # Speculative probe (piggybacks NN eval for surprise detection)
+    probe_depth: int = 0               # probe layers (0=off, 1=NN cache only)
+    probe_surprise: float = 0.3        # Q-drop threshold for probe termination
+
+    # Surprise detection (KL-based)
+    surprise_pol_kl: float = 0.3       # KL(search_pol || NN_prior) threshold
+    surprise_val_kl: float = 0.3       # KL(search_WDL || NN_WDL) threshold
+    surprise_child_min_n: int = 150    # min visits for child to trigger
+
     # Misc
     path: str = "train_output"
     seed: int = 42

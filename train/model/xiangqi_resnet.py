@@ -39,8 +39,10 @@ class XiangqiResNet(nn.Module):
             *[ResBlock(nn_width) for _ in range(nn_depth)]
         )
 
-        # Policy head — plane encoding: 1 plane per source square
-        self.policy_conv = nn.Conv2d(nn_width, num_src, 1, bias=False)
+        # Policy head: 3×3 conv → ReLU → 3×3 conv → ReLU → 1×1 conv → logits
+        self.policy_conv1 = nn.Conv2d(nn_width, nn_width, 3, padding=1, bias=False)
+        self.policy_conv2 = nn.Conv2d(nn_width, nn_width, 3, padding=1, bias=False)
+        self.policy_conv3 = nn.Conv2d(nn_width, num_src, 1, bias=False)
 
         # Value head — WDL 3-class
         self.value_conv = nn.Conv2d(nn_width, 4, 1, bias=False)
@@ -54,8 +56,11 @@ class XiangqiResNet(nn.Module):
     def _init_weights(self):
         for name, m in self.named_modules():
             if isinstance(m, (nn.Conv2d, nn.Linear)):
-                if name == "policy_conv":
-                    nn.init.uniform_(m.weight, -0.03, 0.03)
+                if name == "policy_conv3":
+                    nn.init.uniform_(m.weight, -1e-3, 1e-3)
+                elif "policy_conv" in name:
+                    nn.init.kaiming_normal_(m.weight, mode="fan_out",
+                                            nonlinearity="relu")
                 elif name == "value_fc2":
                     nn.init.zeros_(m.weight)
                 else:
@@ -78,8 +83,10 @@ class XiangqiResNet(nn.Module):
         x = self.conv_in(x)
         x = self.res_blocks(x)
 
-        # Policy head: 90 planes × (10, 9) → flat 8100
-        policy_logits = self.policy_conv(x).reshape(batch, -1)  # (batch, 8100)
+        # Policy head: 3×3 → ReLU → 3×3 → ReLU → 1×1 → logits
+        p = F.relu(self.policy_conv1(x))
+        p = F.relu(self.policy_conv2(p))
+        policy_logits = self.policy_conv3(p).reshape(batch, -1)  # (batch, 8100)
 
         # Value head
         v = F.relu(self.value_bn(self.value_conv(x)))       # (batch, 4, 10, 9)

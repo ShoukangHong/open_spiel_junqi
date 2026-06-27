@@ -1,7 +1,8 @@
 """Play Xiangqi (Chinese Chess) against a trained AlphaZero model."""
 
-import sys
 import os
+import sys
+
 _sys_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _sys_root not in sys.path:
     sys.path.insert(0, _sys_root)
@@ -12,21 +13,17 @@ import pygame
 from game_ui.core import (load_model_for_ui, create_bot, create_ab_bot,
                           MCTSHintEngine, AlphaBetaHintEngine,
                           choose_color_menu, game_over_screen, print_search_info,
-                          BLACK, WHITE, RED, BLUE, GREEN, YELLOW, get_font)
+                          BLACK, get_font)
 from game_ui.xiangqi_render import (
-    ROWS, COLS, SQ_SIZE, LABEL_MARGIN, BOARD_W, BOARD_H, PANEL_W,
-    BG_COLOR, LINE_COLOR, BoardData,
-    draw_board_bg, draw_board_ui, draw_pieces, draw_legal_dots,
-    draw_source_heatmap, draw_mcts_hints, draw_move_arrows, obs_to_board,
-    action_label, click_to_square, ActionSelector, compute_source_probs,
-    hint_arrows)
+    BOARD_W, BOARD_H, BG_COLOR, draw_board_ui, obs_to_board,
+    action_label, ActionSelector)
 from train.core.model_builder import build_xiangqi_model
 
 # ── Config ──────────────────────────────────────────────────────────────────
-CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_fpu"
-CHECKPOINT_STEP = 60
+CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_new"
+CHECKPOINT_STEP = 20
 MCTS_SIMULATIONS = 1024
-HINT_MAX_SIM = 500
+HINT_MAX_SIM = 10000
 INFERENCE_BATCH_SIZE = 10  # shared by MCTS and AlphaBeta
 UCT_C = 4.0
 FPU_LAMBDA = 0.2  # FPU penalty for unvisited nodes in MCTS (0 = disabled)
@@ -35,7 +32,7 @@ PROBE_SURPRISE = 1.0  # Q-drop threshold for probe early termination
 AI_TEMPERATURE = 0.01  # τ for AI move selection (0 = argmax)
 TEMP_DROP = 5         # use τ=0.5 + advantage mixing before this move
 SAVE_DIR = os.path.join(CHECKPOINT_DIR, "saved_positions")
-POLICY_EPSILON = 0.25  # Dirichlet noise weight for AI/hint search
+POLICY_EPSILON = 0.0  # Dirichlet noise weight for AI/hint search
 POLICY_ALPHA = 0.25     # Dirichlet concentration parameter
 AB_DEPTH = 3           # alpha-beta search depth
 AB_POLICY_TEMP = 0.003   # temperature for value→policy softmax in AB
@@ -112,7 +109,9 @@ def main():
             bot, evaluator, _ = create_bot(game, model, MCTS_SIMULATIONS,
                                            INFERENCE_BATCH_SIZE, UCT_C,
                                            DRAW_PENALTY, REPEAT_PENALTY,
-                                           POLICY_EPSILON, POLICY_ALPHA,
+                                           random_state=None,
+                                           policy_epsilon=POLICY_EPSILON,
+                                           policy_alpha=POLICY_ALPHA,
                                            fpu_lambda=FPU_LAMBDA,
                                            probe_depth=PROBE_DEPTH,
                                            probe_surprise=PROBE_SURPRISE)

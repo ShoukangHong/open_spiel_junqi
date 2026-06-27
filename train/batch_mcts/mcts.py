@@ -634,7 +634,6 @@ class BatchMCTS:
         # ── Speculative probe: pre-expand along NN-prior-best path ──────
         if self.config.probe_depth > 0 and not root.children:
             self._speculative_probe(root, state)
-
         max_sim = self.config.max_simulations
         batch_size = self.config.batch_size
 
@@ -759,20 +758,54 @@ class BatchMCTS:
             cs = state.clone()
             cs.apply_action(a)
             root_states.append(cs)
-        to_eval = [state] + root_states
-        vals0, priors0 = self.evaluator.batch_inference_raw(to_eval)
-        root_priors = priors0[0]
-        child_priors0 = priors0[1:]
+
+        # Evaluate root state alone → root priors
+        root_vals, root_priors_list = self.evaluator.batch_inference_raw([state])
+        root_priors = root_priors_list[0]
+        root_wdl = root_vals[0]
+        root.nn_q = float(root_wdl[0] - root_wdl[2]) * max_u
+        root.nn_draw = float(root_wdl[1])
+        pd_root = dict(root_priors)
+        best_a = max(legal, key=lambda a: pd_root.get(a, 0.0))
+        root.nn_argmax = best_a
+        root.nn_prior_max = pd_root.get(best_a, 0.0)
+
+        # Evaluate root children in batches (SHM-friendly)
+        n = len(legal)
+        child_wdl_list = [None] * n
+        child_priors_list = [None] * n
+        # Handle terminal children (use game returns, not NN)
+        for i, a in enumerate(legal):
+            if root_states[i].is_terminal():
+                ret = root_states[i].returns()
+                w = 1.0 if ret[player] > 0 else 0.0
+                d = 1.0 if ret[player] == 0 else 0.0
+                l = 1.0 if ret[player] < 0 else 0.0
+                child_wdl_list[i] = np.array([w, d, l], dtype=np.float32)
+                child_priors_list[i] = [(a, 1.0)]
+        # Batch-eval non-terminal children
+        bs = self.config.batch_size
+        nt_idx = [i for i in range(n) if child_wdl_list[i] is None]
+        for start in range(0, len(nt_idx), bs):
+            chunk_idx = nt_idx[start:start + bs]
+            chunk = [root_states[i] for i in chunk_idx]
+            v, p = self.evaluator.batch_inference_raw(chunk)
+            for j, i in enumerate(chunk_idx):
+                child_wdl_list[i] = v[j]
+                child_priors_list[i] = p[j]
 
         # action → (state, wdl, priors)
         _act_map = {}
         for i, a in enumerate(legal):
-            _act_map[a] = (root_states[i], vals0[1 + i], child_priors0[i])
+            _act_map[a] = (root_states[i], child_wdl_list[i], child_priors_list[i])
 
         self._expand(root, state, root_priors)
         for c in root.children:
             if c.action in _act_map:
                 c.state = _act_map[c.action][0]
+                c_wdl = _act_map[c.action][1]
+                c.nn_q = float(c_wdl[0] - c_wdl[2]) * max_u
+                c.nn_draw = float(c_wdl[1])
 
         # Paths: (node_list, state, prior_list, root_child_Q).  No backprop yet.
         paths = []
@@ -807,7 +840,15 @@ class BatchMCTS:
                     next_info.append((p_idx, ns, best_a))
 
             if next_states:
-                vals_d, priors_d = self.evaluator.batch_inference_raw(next_states)
+                # Split to SHM-friendly batches
+                vals_d, priors_d = [], []
+                bs = self.config.batch_size
+                for start in range(0, len(next_states), bs):
+                    chunk = next_states[start:start + bs]
+                    v, p = self.evaluator.batch_inference_raw(chunk)
+                    vals_d.append(v)
+                    priors_d.extend(p)
+                vals_d = np.concatenate(vals_d, axis=0)
 
             new_paths = []
             for j, (p_idx, ns, best_a) in enumerate(next_info):
@@ -863,7 +904,14 @@ class BatchMCTS:
                     leaf_info.append((False, len(leaf_states) - 1))
 
             if leaf_states:
-                leaf_vals, _ = self.evaluator.batch_inference_raw(leaf_states)
+                # Split to SHM-friendly batch sizes
+                leaf_vals = []
+                bs = self.config.batch_size
+                for start in range(0, len(leaf_states), bs):
+                    chunk = leaf_states[start:start + bs]
+                    v, _ = self.evaluator.batch_inference_raw(chunk)
+                    leaf_vals.append(v)
+                leaf_vals = np.concatenate(leaf_vals, axis=0)
 
             leaf_idx = 0
             for p_idx, (bp_path, ns, pr, q0) in enumerate(paths):
@@ -901,7 +949,7 @@ class BatchMCTS:
             if ln in seen:
                 for n in pn:
                     if n.virtual_visits > 0:
-                        n.virtual_visits -= 1
+                        n.virtual_visits -= 2
                 early_flush = True
                 continue
             seen.add(ln)
@@ -1046,7 +1094,7 @@ class BatchMCTS:
                 + (1e6 if node is root and c.explore_count == 0 else 0))
 
             # Apply virtual loss
-            best_child.virtual_visits += 1
+            best_child.virtual_visits += 2
 
             if best_child.state is not None:
                 state = best_child.state.clone()
@@ -1088,7 +1136,7 @@ class BatchMCTS:
             node = path[i]
             # Always clean up virtual loss, even for proven nodes
             if node.virtual_visits > 0:
-                node.virtual_visits -= 1
+                node.virtual_visits -= 2
             if node.outcome is not None:
                 continue
             decision_idx = i

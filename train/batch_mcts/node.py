@@ -36,9 +36,13 @@ class Node:
         "virtual_visits",
         "outcome",
         "children",
-        "state",           # cached state clone (cheap for Othello)
+        "state",           # cached state clone
         "noise_applied",   # whether Dirichlet noise has been applied
         "_pos_hash",       # hash of static board position (repeat detection)
+        "nn_q",            # NN raw Q value (cached for surprise detection)
+        "nn_draw",         # NN draw rate
+        "nn_prior_max",    # NN's max prior among legal actions
+        "nn_argmax",       # NN's argmax action
     )
 
     def __init__(self, action: Optional[int], player: int, prior: float):
@@ -54,6 +58,10 @@ class Node:
         self.state = None
         self.noise_applied = False
         self._pos_hash = None
+        self.nn_q = None
+        self.nn_draw = None
+        self.nn_prior_max = None
+        self.nn_argmax = None
 
     # ── Q / N / PUCT ──────────────────────────────────────────────────────
 

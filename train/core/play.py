@@ -9,6 +9,7 @@ import numpy as np
 from train.batch_mcts.mcts import compute_solved_policy
 from train.core.policy import mix_advantage
 from train.core.weak_move import try_weak_move
+from train.core.surprise import detect_surprise
 
 _EPS = 1e-6  # label smoothing — prevents float32 underflow from CE with p=0
 
@@ -131,6 +132,7 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
         (states_info, returns, rare_games, wstats)
     """
     states_info = []
+    extra_surprise = []  # collected here, appended at end (keeps game sequence clean)
     rare_games = []
     wstats = {"rare": 0, "weak": 0, "weak_final": 0, "rare_flip": 0}
     state = game.new_initial_state() if init_state is None else init_state.clone()
@@ -242,14 +244,27 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
             q, dr = _stable_qdr(root)
         states_info.append((obs, mask, policy, cur_player, tag, q, dr))
 
+        # Surprise detection: collect candidates (resolved at end of game)
+        if (getattr(config, 'surprise_val_kl', 0) > 0
+                and root.nn_q is not None and not tag):
+            surprise_tag, child_tags, kl_sum = detect_surprise(
+                state, root, config, game.max_utility())
+            if surprise_tag:
+                extra_surprise.append(
+                    (obs.copy(), mask.copy(), policy.copy(),
+                     cur_player, surprise_tag, q, dr, kl_sum))
+
         # Action selection with temperature
         # Forked (rare) games: always use post-drop tau for clean evaluation
         after_drop = (init_state is not None
                       or move_num >= config.temperature_drop)
         tau_sel = config.temperature if after_drop else 0.5
-        if tau_sel > 0 and tau_sel != 1.0:
+        if tau_sel > 0.01 and tau_sel != 1.0:
             sel_probs = policy.astype(np.float64) ** (1.0 / tau_sel)
             sel_probs /= sel_probs.sum()
+        elif 0 < tau_sel <= 0.01:
+            sel_probs = np.zeros(len(policy), dtype=np.float64)
+            sel_probs[policy.argmax()] = 1.0
         else:
             sel_probs = policy
 
@@ -284,4 +299,24 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
         returns = state.returns()
     if logger is not None:
         logger.log_game_end(returns, move_num, len(rare_games))
+    # Generate extra copies: top-3 super_surprise ×3, rest ×1, surprise ×1
+    extra_surprise.sort(key=lambda x: x[7], reverse=True)
+    super_count = 0
+    copies = []
+    for item in extra_surprise:
+        tag = item[4]
+        if tag == "super_surprise":
+            super_count += 1
+            n = 3 if super_count <= 3 else 1
+            final_tag = "super_surprise" if super_count <= 3 else "surprise"
+        else:
+            n = 1
+            final_tag = tag
+        for _ in range(n):
+            copies.append((item[0], item[1], item[2], item[3],
+                           final_tag, item[5], item[6], item[7]))
+    max_copies = max(10, len(states_info) // 5)
+    if len(copies) > max_copies:
+        copies = copies[:max_copies]
+    states_info.extend(copies)
     return states_info, returns, rare_games, wstats

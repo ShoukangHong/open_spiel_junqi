@@ -83,7 +83,7 @@ def _mixed_target(game_ret, q_value, draw_rate, alpha):
 # ── Actor process (multi-actor mode) ────────────────────────────────────────
 
 def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
-                  actor_id, play_game_fn, shm_name=None):
+                  actor_id, play_game_fn, shm_name=None, log_id=None):
     """Actor subprocess: self-play loop pushing states to the trainer."""
     try:
         import os as _os
@@ -93,7 +93,7 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
             leave = min(num_gpus, len(allowed) - 1)
             _os.sched_setaffinity(0, set(allowed[:-leave]))
     except Exception as _e:
-        print(f"[actor-{actor_id}] CPU affinity failed: {_e}", flush=True)
+        print(f"[actor-{log_id or actor_id}] CPU affinity failed: {_e}", flush=True)
     cfg = config_class(**cfg_dict)
     game = pyspiel.load_game(cfg.game)
     actor_shm = None
@@ -116,6 +116,9 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
             policy_alpha=cfg.policy_alpha,
             draw_penalty=cfg.draw_penalty,
             repeat_penalty=getattr(cfg, 'repeat_penalty', 0.1),
+            fpu_lambda=getattr(cfg, 'fpu_lambda', 0.2),
+            probe_depth=getattr(cfg, 'probe_depth', 0),
+            probe_surprise=getattr(cfg, 'probe_surprise', 0.3),
             verbose=False)
         mcts_opp = BatchMCTS(game, mcts_cfg_opp, ev_opp,
                              random_state=np.random.RandomState())
@@ -127,13 +130,25 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
         policy_alpha=cfg.policy_alpha,
         draw_penalty=cfg.draw_penalty,
         repeat_penalty=getattr(cfg, 'repeat_penalty', 0.1),
+        fpu_lambda=getattr(cfg, 'fpu_lambda', 0.2),
+        probe_depth=getattr(cfg, 'probe_depth', 0),
+        probe_surprise=getattr(cfg, 'probe_surprise', 0.3),
         verbose=False)
     mcts_main = BatchMCTS(game, mcts_cfg, ev_main,
                           random_state=np.random.RandomState())
     mcts_best = BatchMCTS(game, mcts_cfg, ev_best,
                           random_state=np.random.RandomState())
     rng = np.random.RandomState()
-    logger = GameLogger(cfg.path, actor_id)
+    # Opening book
+    opening_book = None
+    opening_prob = getattr(cfg, 'opening_book_prob', 0.0)
+    opening_dir = getattr(cfg, 'opening_book_dir', '')
+    if opening_dir and opening_prob > 0:
+        from train.games.opening_book import OpeningBook
+        opening_book = OpeningBook(game, opening_dir)
+
+    logger = GameLogger(cfg.path, log_id if log_id is not None else actor_id,
+                        sample_rate=0)
     pending = []
     while True:
         if pending:
@@ -144,6 +159,10 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
                 use_opp=use_opp)
         else:
             init_state, allow_weak, tag_override = None, True, ""
+            if opening_book and rng.random() < opening_prob:
+                init_state = opening_book.sample(rng)
+                if init_state is not None:
+                    tag_override = "opening"
             mcts_p0, mcts_p1, use_best, use_opp = assign_players(
                 rng, mcts_main, mcts_best, mcts_opp,
                 cfg.best_model_prob, cfg.random_opponent_prob)
@@ -161,8 +180,13 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
         if tag_override:
             for i in range(len(states_info)):
                 item = states_info[i]
+                old_tag = item[4] if len(item) > 4 else ""
+                if "surprise" in old_tag:
+                    new_tag = old_tag  # surprise overrides
+                else:
+                    new_tag = f"{tag_override}_{old_tag}" if old_tag else tag_override
                 states_info[i] = (item[0], item[1], item[2], item[3],
-                                  tag_override, *item[5:])
+                                  new_tag, *item[5:])
         rare_at = len(init_state.history()) if init_state is not None else 0
         try:
             state_queue.put((states_info, returns, wstats, rare_at), timeout=1)
@@ -243,7 +267,6 @@ def run_training(
             if a_start >= a_end:
                 break  # fewer actors than GPUs
 
-            # Register actor slots for this GPU (local IDs: 0, 1, ...)
             for local_id in range(a_end - a_start):
                 server.register_actor(local_id, cfg.mcts_batch_size,
                                       obs_flat, mask_flat, mask_flat)
@@ -266,11 +289,23 @@ def run_training(
                 p = mp.Process(target=actor_process,
                                args=(config_class, cfg_dict, incoming_q, result_q,
                                      state_q, local_id, play_game_fn, shm_name),
+                               kwargs={"log_id": global_id},
                                name=f"actor-gpu{gpu_id}-{local_id}")
                 p.start()
                 actors.append((p, state_q))
         _log(f"[train] {len(actors)} actors on {len(servers)} GPU(s)"
              f" ({actors_per_gpu} each)")
+
+    # ── Opening book ────────────────────────────────────────────────────
+    opening_book = None
+    opening_prob = getattr(cfg, 'opening_book_prob', 0.0)
+    opening_dir = getattr(cfg, 'opening_book_dir', '')
+    if opening_dir and opening_prob > 0:
+        from train.games.opening_book import OpeningBook
+        opening_book = OpeningBook(game, opening_dir)
+        if opening_book:
+            _log(f"[train] Opening book: {len(opening_book)} positions"
+                 f"  prob={opening_prob:.0%}")
 
     # ── Training state ─────────────────────────────────────────────────────
     global_rng = np.random.RandomState(cfg.seed + start_step)
@@ -318,6 +353,10 @@ def run_training(
                          tag_override, use_best, _) = pending.pop()
                     else:
                         init_state, allow_weak, tag_override = None, True, ""
+                        if opening_book and global_rng.random() < opening_prob:
+                            init_state = opening_book.sample(global_rng)
+                            if init_state is not None:
+                                tag_override = "opening"
                         use_best = (cfg.best_model_prob > 0
                                     and global_rng.random()
                                     < cfg.best_model_prob)
@@ -353,8 +392,9 @@ def run_training(
                         q_value = item[5] if len(item) > 5 else 0.0
                         draw_rate = item[6] if len(item) > 6 else 0.0
                         if tag_override:
-                            tag = tag_override
-                        alpha = (offset + i) / denom
+                            if "surprise" not in tag:
+                                tag = f"{tag_override}_{tag}" if tag else tag_override
+                        alpha = 0.0 if (offset + i) < cfg.temperature_drop else (offset + i - cfg.temperature_drop) / denom
                         val = _mixed_target(returns[cur_player], q_value,
                                             draw_rate, alpha)
                         buffer.append(obs, mask, policy, val, tag, step=step)
@@ -388,7 +428,7 @@ def run_training(
                             tag = item[4] if len(item) > 4 else ""
                             q_value = item[5] if len(item) > 5 else 0.0
                             draw_rate = item[6] if len(item) > 6 else 0.0
-                            alpha = (offset + i) / denom
+                            alpha = 0.0 if (offset + i) < cfg.temperature_drop else (offset + i - cfg.temperature_drop) / denom
                             val = _mixed_target(returns[cur_player], q_value,
                                                 draw_rate, alpha)
                             buffer.append(obs, mask, policy, val, tag,

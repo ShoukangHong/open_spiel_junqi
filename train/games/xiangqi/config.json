@@ -3,7 +3,7 @@
 
     "nn_width": 64,
     "nn_depth": 12,
-    "learning_rate": 0.01,
+    "learning_rate": 0.001,
     "weight_decay": 0.0001,
     "train_batch_size": 64,
     "entropy_weight": 0.01,
@@ -19,6 +19,11 @@
     "policy_alpha": 1.0,
     "temperature": 0.01,
     "temperature_drop": 25,
+    "probe_depth": 1,
+    "probe_surprise": 0.3,
+    "surprise_pol_kl": 0.5,
+    "surprise_val_kl": 0.5,
+    "surprise_child_min_n": 150,
 
     "replay_buffer_size": 10000,
     "buffer_sampling_frac": 0.2,
