@@ -33,11 +33,8 @@ import torch
 torch.set_num_threads(1)
 
 from train.batch_mcts.config import MCTSConfig
-from train.batch_mcts.evaluator import PyTorchEvaluator
 from train.batch_mcts.mcts import BatchMCTS
 from train.batch_mcts.shared_evaluator import InferenceServer, SharedEvaluator
-from train.core.base_config import BaseTrainConfig
-from train.core.checkpoint import find_latest_checkpoint
 from train.core.game_logger import GameLogger
 from train.core.replay_buffer import ReplayBuffer
 from train.core.train_utils import (
@@ -46,13 +43,29 @@ from train.core.train_utils import (
 from train.core.play import assign_players
 from train.core.types import Losses, TrainInput
 from train.core.weak_move import (
-    accum_wstats, nn_raw_after_move, reset_wstats, try_weak_move,
+    accum_wstats, reset_wstats,
     wstats_summary)
 
 _LATEST = -999
 
 
 # ── WDL value target helpers ────────────────────────────────────────────────
+
+def compute_alpha(step_index: int, game_length: int, offset: int,
+                  temperature_drop: int) -> float:
+    """Outcome mixing weight for step i of a game.
+
+    Returns α ∈ [0, 1] where value_target = α·outcome + (1−α)·MCTS_WDL.
+    α=0 at temperature_drop, α=1.0 at final step (always 100% outcome).
+    """
+    if step_index == game_length - 1:
+        return 1.0
+    denom = max(offset + game_length - 1 - temperature_drop, 1)
+    step_pos = offset + step_index
+    if step_pos < temperature_drop:
+        return 0.0
+    return min((step_pos - temperature_drop) / denom, 1.0)
+
 
 def _mcts_wdl(q_value, draw_rate):
     """Reconstruct WDL from MCTS Q and draw rate.  Returns [w, d, l]."""
@@ -236,65 +249,64 @@ def run_training(
     num_gpus = max(getattr(cfg, 'num_gpus', 1), 1)
     servers = []  # list of (server, a_start, a_end, gpu_id)
     actors = []
-    if cfg.num_actors > 1:
-        model.save_checkpoint(_LATEST)
-        cfg_dict = asdict(cfg)
-        cfg_dict["path"] = cfg.path
-        obs_flat = int(np.prod(game.observation_tensor_shape()))
-        mask_flat = game.num_distinct_actions()
+    model.save_checkpoint(_LATEST)
+    cfg_dict = asdict(cfg)
+    cfg_dict["path"] = cfg.path
+    obs_flat = int(np.prod(game.observation_tensor_shape()))
+    mask_flat = game.num_distinct_actions()
 
-        # Best-model state dict (shared across all servers)
-        best_sd = model._model.state_dict()
-        best_file = os.path.join(cfg.path, "best_step.txt")
-        if os.path.exists(best_file):
-            try:
-                with open(best_file) as f:
-                    best_step = int(f.read().strip())
-                ckpt = os.path.join(cfg.path, f"checkpoint-{best_step}.pt")
-                if os.path.exists(ckpt):
-                    best_sd = torch.load(
-                        ckpt, map_location="cpu",
-                        weights_only=False)["model_state_dict"]
-                    _log(f"[train] Best model: step {best_step}")
-            except Exception:
-                pass
+    # Best-model state dict (shared across all servers)
+    best_sd = model._model.state_dict()
+    best_file = os.path.join(cfg.path, "best_step.txt")
+    if os.path.exists(best_file):
+        try:
+            with open(best_file) as f:
+                best_step = int(f.read().strip())
+            ckpt = os.path.join(cfg.path, f"checkpoint-{best_step}.pt")
+            if os.path.exists(ckpt):
+                best_sd = torch.load(
+                    ckpt, map_location="cpu",
+                    weights_only=False)["model_state_dict"]
+                _log(f"[train] Best model: step {best_step}")
+        except Exception:
+            pass
 
-        actors_per_gpu = (cfg.num_actors + num_gpus - 1) // num_gpus
-        for gpu_id in range(num_gpus):
-            server = InferenceServer(build_model_fn=build_model_fn, gpu_id=gpu_id)
-            a_start = gpu_id * actors_per_gpu
-            a_end = min(a_start + actors_per_gpu, cfg.num_actors)
-            if a_start >= a_end:
-                break  # fewer actors than GPUs
+    actors_per_gpu = (cfg.num_actors + num_gpus - 1) // num_gpus
+    for gpu_id in range(num_gpus):
+        server = InferenceServer(build_model_fn=build_model_fn, gpu_id=gpu_id)
+        a_start = gpu_id * actors_per_gpu
+        a_end = min(a_start + actors_per_gpu, cfg.num_actors)
+        if a_start >= a_end:
+            break  # fewer actors than GPUs
 
-            for local_id in range(a_end - a_start):
-                server.register_actor(local_id, cfg.mcts_batch_size,
-                                      obs_flat, mask_flat, mask_flat)
-            server.register_model("main", model._model.state_dict(),
-                                  cfg.nn_width, cfg.nn_depth)
-            server.register_model("best", best_sd, cfg.nn_width, cfg.nn_depth)
-            server.register_model("random_opp", model._model.state_dict(),
-                                  cfg.nn_width, cfg.nn_depth)
-            server.start(cfg.game, cfg.inference_batch_size)
-            servers.append((server, a_start, a_end, gpu_id))
+        for local_id in range(a_end - a_start):
+            server.register_actor(local_id, cfg.mcts_batch_size,
+                                  obs_flat, mask_flat, mask_flat)
+        server.register_model("main", model._model.state_dict(),
+                              cfg.nn_width, cfg.nn_depth)
+        server.register_model("best", best_sd, cfg.nn_width, cfg.nn_depth)
+        server.register_model("random_opp", model._model.state_dict(),
+                              cfg.nn_width, cfg.nn_depth)
+        server.start(cfg.game, cfg.inference_batch_size)
+        servers.append((server, a_start, a_end, gpu_id))
 
-        # Spawn actors, each connected to its GPU's server
-        for server, a_start, a_end, gpu_id in servers:
-            incoming_q = server.incoming_queue
-            for global_id in range(a_start, a_end):
-                local_id = global_id - a_start
-                result_q = server.result_queue(local_id)
-                shm_name = server.actor_shm_name(local_id)
-                state_q = mp.Queue(maxsize=200)
-                p = mp.Process(target=actor_process,
-                               args=(config_class, cfg_dict, incoming_q, result_q,
-                                     state_q, local_id, play_game_fn, shm_name),
-                               kwargs={"log_id": global_id},
-                               name=f"actor-gpu{gpu_id}-{local_id}")
-                p.start()
-                actors.append((p, state_q))
-        _log(f"[train] {len(actors)} actors on {len(servers)} GPU(s)"
-             f" ({actors_per_gpu} each)")
+    # Spawn actors, each connected to its GPU's server
+    for server, a_start, a_end, gpu_id in servers:
+        incoming_q = server.incoming_queue
+        for global_id in range(a_start, a_end):
+            local_id = global_id - a_start
+            result_q = server.result_queue(local_id)
+            shm_name = server.actor_shm_name(local_id)
+            state_q = mp.Queue(maxsize=200)
+            p = mp.Process(target=actor_process,
+                           args=(config_class, cfg_dict, incoming_q, result_q,
+                                 state_q, local_id, play_game_fn, shm_name),
+                           kwargs={"log_id": global_id},
+                           name=f"actor-gpu{gpu_id}-{local_id}")
+            p.start()
+            actors.append((p, state_q))
+    _log(f"[train] {len(actors)} actors on {len(servers)} GPU(s)"
+         f" ({actors_per_gpu} each)")
 
     # ── Opening book ────────────────────────────────────────────────────
     opening_book = None
@@ -320,84 +332,38 @@ def run_training(
             total_states = 0
             total_games = 0
             outcomes = {"p0": 0, "p1": 0, "draw": 0}
-
-            if cfg.num_actors == 1:
-                # Single-process path
-                ev_main = PyTorchEvaluator(game, model)
-                mcts_main = BatchMCTS(game, mcts_config, ev_main,
-                                      random_state=np.random.RandomState(
-                                          cfg.seed + step * 1000))
-                mcts_best = mcts_main
-                best_file = os.path.join(cfg.path, "best_step.txt")
-                if os.path.exists(best_file):
+            # Multi-actor path
+            while total_states < samples_per_step:
+                for _, q in actors:
                     try:
-                        with open(best_file) as f:
-                            bs = int(f.read().strip())
-                        ckpt = os.path.join(cfg.path, f"checkpoint-{bs}.pt")
-                        if os.path.exists(ckpt):
-                            best_model = build_model_fn(game, cfg)
-                            best_model.load_checkpoint(bs)
-                            ev_best = PyTorchEvaluator(game, best_model)
-                            mcts_best = BatchMCTS(
-                                game, mcts_config, ev_best,
-                                random_state=np.random.RandomState(
-                                    cfg.seed + step * 1000 + 1))
-                    except Exception:
-                        pass
-                game_logger = GameLogger(cfg.path, 0)
-                pending = []
-
-                while total_states < samples_per_step:
-                    if pending:
-                        (init_state, allow_weak,
-                         tag_override, use_best, _) = pending.pop()
-                    else:
-                        init_state, allow_weak, tag_override = None, True, ""
-                        if opening_book and global_rng.random() < opening_prob:
-                            init_state = opening_book.sample(global_rng)
-                            if init_state is not None:
-                                tag_override = "opening"
-                        use_best = (cfg.best_model_prob > 0
-                                    and global_rng.random()
-                                    < cfg.best_model_prob)
-
-                    mb = mcts_main
-                    mw = mcts_best if use_best else mcts_main
-                    if use_best and global_rng.random() < 0.5:
-                        mb, mw = mw, mb
-                    states_info, returns, rare_games, wstats = play_game_fn(
-                        game, mb, mw, cfg, global_rng, logger=game_logger,
-                        init_state=init_state, allow_weak=allow_weak)
-
-                    for rs in rare_games:
-                        pending.append((rs, False, "rare", use_best, False))
-
-                    if (tag_override == "rare" and init_state is not None
-                            and not init_state.is_terminal()
-                            and returns[1 - init_state.current_player()] > 0):
-                        tag_override = "rare_flip"
-                        wstats["rare_flip"] = wstats.get("rare_flip", 0) + 1
+                        states_info, returns, wstats, rare_at = q.get_nowait()
+                    except queue.Empty:
+                        continue
                     accum_wstats(cfg, wstats)
-
                     game_outcome_p0 = returns[0]
+
                     game_length = len(states_info)
-                    rare_at = 0
-                    if init_state is not None:
-                        rare_at = len(init_state.history())
+                    for i, s in enumerate(states_info):
+                        tag = s[4] if len(s) > 4 else ""
+                        if "surprise" in tag:
+                            game_length = i
+                            break
                     offset = rare_at
-                    denom = max(offset + game_length - 1, 1)
                     for i, item in enumerate(states_info):
                         obs, mask, policy, cur_player = item[:4]
                         tag = item[4] if len(item) > 4 else ""
                         q_value = item[5] if len(item) > 5 else 0.0
                         draw_rate = item[6] if len(item) > 6 else 0.0
-                        if tag_override:
-                            if "surprise" not in tag:
-                                tag = f"{tag_override}_{tag}" if tag else tag_override
-                        alpha = 0.0 if (offset + i) < cfg.temperature_drop else (offset + i - cfg.temperature_drop) / denom
-                        val = _mixed_target(returns[cur_player], q_value,
-                                            draw_rate, alpha)
-                        buffer.append(obs, mask, policy, val, tag, step=step)
+                        if "child_" in tag:
+                            val = _mcts_wdl(q_value, draw_rate)
+                        else:
+                            step_i = item[8] if len(item) > 8 and item[8] >= 0 else i
+                            alpha = compute_alpha(
+                                step_i, game_length, offset, cfg.temperature_drop)
+                            val = _mixed_target(returns[cur_player], q_value,
+                                                draw_rate, alpha)
+                        buffer.append(obs, mask, policy, val, tag,
+                                      step=step)
 
                     if game_outcome_p0 > 0:
                         outcomes["p0"] += 1
@@ -408,44 +374,9 @@ def run_training(
 
                     total_states += len(states_info)
                     total_games += 1
-
-            else:
-                # Multi-actor path
-                while total_states < samples_per_step:
-                    for _, q in actors:
-                        try:
-                            states_info, returns, wstats, rare_at = q.get_nowait()
-                        except queue.Empty:
-                            continue
-                        accum_wstats(cfg, wstats)
-                        game_outcome_p0 = returns[0]
-
-                        game_length = len(states_info)
-                        offset = rare_at
-                        denom = max(offset + game_length - 1, 1)
-                        for i, item in enumerate(states_info):
-                            obs, mask, policy, cur_player = item[:4]
-                            tag = item[4] if len(item) > 4 else ""
-                            q_value = item[5] if len(item) > 5 else 0.0
-                            draw_rate = item[6] if len(item) > 6 else 0.0
-                            alpha = 0.0 if (offset + i) < cfg.temperature_drop else (offset + i - cfg.temperature_drop) / denom
-                            val = _mixed_target(returns[cur_player], q_value,
-                                                draw_rate, alpha)
-                            buffer.append(obs, mask, policy, val, tag,
-                                          step=step)
-
-                        if game_outcome_p0 > 0:
-                            outcomes["p0"] += 1
-                        elif game_outcome_p0 < 0:
-                            outcomes["p1"] += 1
-                        else:
-                            outcomes["draw"] += 1
-
-                        total_states += len(states_info)
-                        total_games += 1
-                        if total_states >= samples_per_step:
-                            break
-                    time.sleep(0.001)
+                    if total_states >= samples_per_step:
+                        break
+                time.sleep(0.001)
 
             selfplay_time = time.time() - t0
 
@@ -536,7 +467,7 @@ def run_training(
                 _log(f"  [checkpoint] Saved {ckpt_path}")
 
             # ── Broadcast weights to all GPU servers ──────────────────
-            if cfg.num_actors > 1 and servers:
+            if servers:
                 model.save_checkpoint(_LATEST)
                 main_sd = model._model.state_dict()
                 for server, _, _, _ in servers:

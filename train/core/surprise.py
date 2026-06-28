@@ -8,6 +8,26 @@ import numpy as np
 from train.batch_mcts.mcts import compute_solved_policy
 
 
+def _stable_qdr(node):
+    """Q and draw_rate from children with >1 visit, excluding noise.
+    If the node is proven (outcome set), use that directly.
+    """
+    if node.outcome is not None:
+        s = node.state
+        p = s.current_player() if s is not None and not s.is_terminal() else node.player
+        q = node.outcome[p]
+        return q, 1.0 if q == 0 else 0.0
+    valid = [c for c in node.children if c.explore_count > 1]
+    if valid:
+        total_n = sum(c.explore_count for c in valid)
+        q = sum(c.total_reward for c in valid) / total_n
+        dr = sum(c.draw_reward for c in valid) / total_n
+    else:
+        q = node.q_value
+        dr = node.draw_rate
+    return q, dr
+
+
 def _wdl_from_qdr(q, draw_rate):
     """Reconstruct WDL distribution from Q and draw rate."""
     w = max((q + 1.0 - draw_rate) / 2.0, 0.0)
@@ -43,7 +63,7 @@ def detect_surprise(state, root, config, game_max_utility=1.0):
         return "", {}, 0.0
 
     cur = state.current_player()
-    mcts_q = root.q_value
+    mcts_q, mcts_draw = _stable_qdr(root)
     nn_q = root.nn_q
 
     # ── Policy KL ─────────────────────────────────────────────────────
@@ -63,31 +83,51 @@ def detect_surprise(state, root, config, game_max_utility=1.0):
     # ── Value KL ──────────────────────────────────────────────────────
     nn_draw = root.nn_draw if root.nn_draw is not None else 0.0
     nn_wdl = _wdl_from_qdr(nn_q, nn_draw)
-    mcts_draw = root.draw_rate
     mcts_wdl = _wdl_from_qdr(mcts_q, mcts_draw)
     val_kl = _kl(mcts_wdl, nn_wdl)
 
-    # ── Root tag ──────────────────────────────────────────────────────
-    combined = pol_kl + val_kl
-    if combined > config.surprise_pol_kl + config.surprise_val_kl:
-        root_tag = "super_surprise"
-    elif pol_kl > config.surprise_pol_kl or val_kl > config.surprise_val_kl:
-        root_tag = "surprise"
-    else:
-        root_tag = ""
+    # ── Tag helper ─────────────────────────────────────────────────────
+    def _surprise_tag(p_kl, v_kl, prefix=""):
+        combined = p_kl + v_kl
+        if combined > config.surprise_pol_kl + config.surprise_val_kl:
+            return prefix + "super_surprise", combined
+        if p_kl > config.surprise_pol_kl or v_kl > config.surprise_val_kl:
+            return prefix + "surprise", combined
+        return "", combined
+
+    root_tag, combined = _surprise_tag(pol_kl, val_kl)
 
     # ── Child tags ─────────────────────────────────────────────────────
     child_tags = {}
     min_n = config.surprise_child_min_n
     for c in root.children:
-        if c.nn_q is None:
+        if c.nn_q is None or c.nn_prior is None:
             continue
         if c.outcome is not None or c.explore_count >= min_n:
+            if c.children:
+                c_actions = [cc.action for cc in c.children]
+                c_nn_prior = np.array(
+                    [max(dict(c.nn_prior).get(a, 0.0), 0.0) for a in c_actions],
+                    dtype=np.float64)
+                c_nn_prior /= c_nn_prior.sum()
+                c_player = c.state.current_player() if c.state is not None else c.player
+                c_solved = compute_solved_policy(
+                    c.children, c_player, game_max_utility,
+                    root_visits=c.explore_count)
+                c_mcts_pol = np.array(
+                    [c_solved.get(a, 0.0) for a in c_actions],
+                    dtype=np.float64)
+                c_mcts_pol /= c_mcts_pol.sum()
+                c_pol_kl = _kl(c_mcts_pol, c_nn_prior)
+            else:
+                c_pol_kl = 0.0
             c_nn_draw = c.nn_draw if c.nn_draw is not None else 0.0
             c_nn_wdl = _wdl_from_qdr(c.nn_q, c_nn_draw)
-            c_mcts_draw = c.draw_rate
-            c_mcts_wdl = _wdl_from_qdr(c.q_value, c_mcts_draw)
-            if _kl(c_mcts_wdl, c_nn_wdl) > config.surprise_val_kl:
-                child_tags[c.action] = "child_surprise"
+            c_mcts_q, c_mcts_draw = _stable_qdr(c)
+            c_mcts_wdl = _wdl_from_qdr(c_mcts_q, c_mcts_draw)
+            c_val_kl = _kl(c_mcts_wdl, c_nn_wdl)
+            ctag, c_combined = _surprise_tag(c_pol_kl, c_val_kl, prefix="child_")
+            if ctag:
+                child_tags[c.action] = (ctag, c_combined)
 
     return root_tag, child_tags, combined

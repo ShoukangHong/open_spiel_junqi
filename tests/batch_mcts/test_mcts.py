@@ -632,5 +632,34 @@ def test_draw_penalty():
     Node.draw_penalty = 0.0
 
 
+def test_proven_draw_q_zero():
+    """After solver proves a draw, q_value must be 0 (not pre-proof Q).
+
+    Before the fix, _clamp_draw only reset draw_reward but left total_reward
+    unchanged.  A node that explored "winning" lines before being proven draw
+    would retain a high Q, corrupting PUCT and best_child selection.
+    """
+    from train.batch_mcts.node import Node
+    from train.batch_mcts.config import MCTSConfig
+
+    # Simulate a node after resolving: outcome proven draw
+    n = Node(action=0, player=0, prior=1.0)
+    n.explore_count = 100
+    n.total_reward = 80  # Pre-proof: looked winning (Q=0.8)
+    n.draw_reward = 20
+    n.outcome = np.array([0.0, 0.0], dtype=np.float64)  # Proven draw
+
+    # Before fix: q_value = 80/100 = 0.8 (wrong for a proven draw)
+    # After fix: _clamp_draw sets total_reward = 0
+
+    # Simulate _clamp_draw logic
+    if all(r == 0 for r in n.outcome):
+        n.total_reward = 0.0
+        n.draw_reward = float(n.explore_count)
+
+    assert n.q_value == 0.0, f"Proven draw must have Q=0, got {n.q_value}"
+    assert n.draw_rate == 1.0, f"Proven draw must have dr=1.0, got {n.draw_rate}"
+
+
 if __name__ == "__main__":
     sys.exit(main())

@@ -765,6 +765,7 @@ class BatchMCTS:
         root_wdl = root_vals[0]
         root.nn_q = float(root_wdl[0] - root_wdl[2]) * max_u
         root.nn_draw = float(root_wdl[1])
+        root.nn_prior = root_priors
         pd_root = dict(root_priors)
         best_a = max(legal, key=lambda a: pd_root.get(a, 0.0))
         root.nn_argmax = best_a
@@ -806,6 +807,7 @@ class BatchMCTS:
                 c_wdl = _act_map[c.action][1]
                 c.nn_q = float(c_wdl[0] - c_wdl[2]) * max_u
                 c.nn_draw = float(c_wdl[1])
+                c.nn_prior = _act_map[c.action][2]
 
         # Paths: (node_list, state, prior_list, root_child_Q).  No backprop yet.
         paths = []
@@ -868,8 +870,9 @@ class BatchMCTS:
                     ret2 = np.zeros(2)
                     ret2[player] = q
                     ret2[1 - player] = -q
+                    d_prob = float(wdl[1])
                     for _ in range(max_depth):
-                        self._backprop(bp_path + [child_node], ret2)
+                        self._backprop(bp_path + [child_node], ret2, d_prob)
                     continue  # don't add to new_paths
                 new_paths.append((bp_path + [child_node], ns, priors_d[j], q0))
             # Terminal — backprop NOW (only backprop once at leaf/term)
@@ -888,8 +891,9 @@ class BatchMCTS:
                 ret2 = np.zeros(2)
                 ret2[player] = q
                 ret2[1 - player] = -q
+                d_prob = 1.0 if all(r == 0 for r in ret) else 0.0
                 for _ in range(max_depth):
-                    self._backprop(bp_path + [child_node], ret2)
+                    self._backprop(bp_path + [child_node], ret2, d_prob)
             paths = new_paths
 
         # ── At final depth: batch-eval leaves, backprop once per path ─
@@ -920,9 +924,11 @@ class BatchMCTS:
                     q = info[0] * max_u  # p0 perspective
                     if player != 0:
                         q = -q
+                    d_prob = 1.0 if all(r == 0 for r in info) else 0.0
                 else:
                     wdl = leaf_vals[info]
                     q = float(wdl[0] - wdl[2]) * max_u
+                    d_prob = float(wdl[1])
                     eval_p = ns.current_player()
                     if eval_p != player:
                         q = -q
@@ -930,7 +936,7 @@ class BatchMCTS:
                 ret2[player] = q
                 ret2[1 - player] = -q
                 for _ in range(max_depth):
-                    self._backprop(bp_path, ret2)
+                    self._backprop(bp_path, ret2, d_prob)
 
 
     def _collect_paths_dedup(self, root, state, batch_limit):
@@ -1080,7 +1086,7 @@ class BatchMCTS:
                 if node is not root or c._pos_hash is None:
                     return 0.0
                 count = self._rep_counts.get(c._pos_hash, 0)
-                return min(count * self._repeat_penalty, 0.8)
+                return min(count * self._repeat_penalty, 3 * self._repeat_penalty)
             # FPU: unvisited nodes inherit parent Q minus prior-based penalty
             _fpu_lambda = self.config.fpu_lambda
             _q_parent = node.q_value
@@ -1181,4 +1187,5 @@ class BatchMCTS:
 
     def _clamp_draw(self, node):
         if all(r == 0 for r in node.outcome):
+            node.total_reward = 0.0
             node.draw_reward = float(node.explore_count)

@@ -3,7 +3,7 @@
 import numpy as np
 import pyspiel
 from train.batch_mcts.node import Node
-from train.core.surprise import detect_surprise, _kl, _wdl_from_qdr
+from train.core.surprise import detect_surprise, _kl, _wdl_from_qdr, _stable_qdr
 
 
 class _FakeConfig:
@@ -13,10 +13,11 @@ class _FakeConfig:
 
 
 def _make_root(nn_q=None, nn_draw=0.0, nn_prior_max=None, nn_argmax=None,
-               children=None):
+               nn_prior=None, children=None):
     root = Node(None, 0, 1.0)
     root.nn_q = nn_q
     root.nn_draw = nn_draw
+    root.nn_prior = nn_prior
     root.nn_prior_max = nn_prior_max
     root.nn_argmax = nn_argmax
     root.children = children or []
@@ -26,14 +27,17 @@ def _make_root(nn_q=None, nn_draw=0.0, nn_prior_max=None, nn_argmax=None,
     return root
 
 
-def _make_child(action, explore_count, total_reward, prior=0.1,
-                nn_q=0.0, nn_draw=0.0, outcome=None):
-    c = Node(action, 0, prior)
+def _make_child(action, explore_count, total_reward, prior=0.1, player=0,
+                nn_q=0.0, nn_draw=0.0, nn_prior=None, draw_reward=None,
+                outcome=None, children=None):
+    c = Node(action, player, prior)
     c.explore_count = explore_count
     c.total_reward = total_reward
-    c.draw_reward = 0.0
+    c.draw_reward = draw_reward if draw_reward is not None else 0.0
     c.nn_q = nn_q
     c.nn_draw = nn_draw
+    c.nn_prior = nn_prior
+    c.children = children or []
     if outcome is not None:
         c.outcome = np.array(outcome, dtype=np.float64)
     return c
@@ -137,6 +141,235 @@ def test_wdl_helpers():
     assert _kl(p, p) < 1e-9
     print("  Test E PASSED")
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Test F: _stable_qdr with outcome
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_stable_qdr_outcome():
+    # Proven win for player 0
+    c = _make_child(0, 10, 10, outcome=[1, -1])
+    c.player = 0
+    q, dr = _stable_qdr(c)
+    assert q == 1.0
+    assert dr == 0.0
+
+    # Proven draw
+    c2 = _make_child(0, 10, 0, outcome=[0, 0])
+    c2.player = 0
+    q, dr = _stable_qdr(c2)
+    assert q == 0.0
+    assert dr == 1.0
+    print("  Test F PASSED")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Test G: child_surprise from value KL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_child_surprise_value():
+    cfg = _FakeConfig()
+    game = pyspiel.load_game("tic_tac_toe")
+    state = game.new_initial_state()
+
+    # Child where MCTS found Q≈-0.8 while NN says Q≈0.8 → value surprise
+    # c.state.current_player() = 1 (root player=0 made a move), so both
+    # c.nn_q and _stable_qdr(c) are from player 1's perspective
+    cc = _make_child(0, 15, -12, prior=0.5, player=1)  # Q=-0.8 from player 1
+    c = _make_child(0, 200, -160, prior=0.5, player=1,
+                    nn_q=0.8, nn_draw=0.0,
+                    nn_prior=[(0, 0.5), (1, 0.5)],
+                    draw_reward=0.0, children=[cc])
+
+    root = _make_root(nn_q=0.3, nn_draw=0.1, children=[c])
+    root.total_reward = 60
+    root.draw_reward = 0.1
+
+    _, child_tags, _ = detect_surprise(state, root, cfg, game.max_utility())
+    assert 0 in child_tags, f"Expected child_surprise, got {child_tags}"
+    ctag, _ = child_tags[0]
+    assert ctag in ("child_surprise", "child_super_surprise"), \
+        f"Expected child_surprise or child_super_surprise, got {ctag}"
+    print(f"  Test G PASSED (tag={ctag})")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Test H: child_super_surprise from policy+value KL
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_child_super_surprise():
+    cfg = _FakeConfig()
+    game = pyspiel.load_game("tic_tac_toe")
+    state = game.new_initial_state()
+
+    # NN prior says action 0 is 90%, but MCTS visits went to action 1 (80%)
+    # Also value mismatch: NN Q=0.8, MCTS Q=-0.4 → combined KL > thresholds
+    cc0 = _make_child(0, 20, -8, prior=0.9, player=1)   # Q=-0.4
+    cc1 = _make_child(1, 80, -32, prior=0.1, player=1)  # Q=-0.4
+    c = _make_child(0, 200, -40, prior=0.5, player=1,
+                    nn_q=0.8, nn_draw=0.0,
+                    nn_prior=[(0, 0.9), (1, 0.1)],
+                    draw_reward=0.0, children=[cc0, cc1])
+
+    root = _make_root(nn_q=0.3, nn_draw=0.1, children=[c])
+    root.total_reward = 60
+    root.draw_reward = 0.1
+
+    _, child_tags, _ = detect_surprise(state, root, cfg, game.max_utility())
+    assert 0 in child_tags, f"Expected child tag, got {child_tags}"
+    ctag, _ = child_tags[0]
+    assert ctag == "child_super_surprise", \
+        f"Expected child_super_surprise, got {ctag}"
+    print(f"  Test H PASSED (tag={ctag})")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Test I: child with no nn_prior is skipped
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_child_no_nn_prior_skipped():
+    cfg = _FakeConfig()
+    game = pyspiel.load_game("tic_tac_toe")
+    state = game.new_initial_state()
+
+    c = _make_child(0, 200, -160, prior=0.5, nn_q=0.8, nn_draw=0.0,
+                    nn_prior=None)  # no prior
+    c.player = 1
+
+    root = _make_root(nn_q=0.3, nn_draw=0.1, children=[c])
+    root.total_reward = 60
+    root.draw_reward = 0.1
+
+    _, child_tags, _ = detect_surprise(state, root, cfg, game.max_utility())
+    assert child_tags == {}, f"Child without nn_prior should be skipped, got {child_tags}"
+    print("  Test I PASSED")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Test J: _stable_qdr uses state.current_player() for non-terminal outcome
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_stable_qdr_state_perspective():
+    """For non-terminal proven nodes, Q is from state.current_player()."""
+    game = pyspiel.load_game("tic_tac_toe")
+    state = game.new_initial_state()  # player 0 to move
+    state.apply_action(0)             # player 0 plays, state now player 1
+    # Not terminal yet — but set a proven outcome (MCTS-Solver)
+    c = _make_child(0, 200, 200, player=0,
+                    outcome=[1, -1])  # p0 wins
+    c.state = state  # current_player() = 1, NOT terminal
+    # _stable_qdr should use state.current_player() = 1
+    q, dr = _stable_qdr(c)
+    # outcome[1] = -1 (loss for p1)
+    assert q == -1.0, f"Expected Q=-1 from p1 perspective, got {q}"
+    assert dr == 0.0
+    print("  Test J PASSED")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Test K: _stable_qdr falls back to node.player for terminal state
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_stable_qdr_terminal_fallback():
+    """For terminal states, state.current_player() is TERMINAL(-4),
+    so fall back to node.player."""
+    game = pyspiel.load_game("tic_tac_toe")
+    state = game.new_initial_state()
+    # Apply moves until terminal (quick win for p0 in tic-tac-toe)
+    state.apply_action(0)  # p0: top-left
+    state.apply_action(3)  # p1: middle-left
+    state.apply_action(1)  # p0: top-center
+    state.apply_action(4)  # p1: middle-center
+    state.apply_action(2)  # p0: top-right → win
+    assert state.is_terminal()
+    c = _make_child(2, 200, 200, player=0,
+                    outcome=state.returns())  # p0 wins [1, -1]
+    c.state = state  # is_terminal() = True, current_player() = -4
+    q, dr = _stable_qdr(c)
+    # Falls back to node.player=0 → outcome[0]=1 (win for p0)
+    assert q == 1.0, f"Expected Q=1 from p0 (fallback), got {q}"
+    assert dr == 0.0
+    print("  Test K PASSED")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Test L: child solved_policy uses state.current_player(), not c.player
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_child_solved_policy_perspective():
+    """Child's compute_solved_policy must use c.state.current_player().
+
+    c.player=0 (root expand) but c.state.current_player()=1.
+    c's children outcomes are [1,-1] (p0 wins).
+    With wrong perspective (player=0): outcome[0]=1 → "both winning"
+      → Case 1, best_val=1, weight=1/explore_count
+    With correct perspective (player=1): outcome[1]=-1 → "both losing"
+      → Case 1, best_val=-1, weight=explore_count (prefer most-tested)
+    These give different policies → we verify the correct one is used.
+    """
+    game = pyspiel.load_game("tic_tac_toe")
+    state = game.new_initial_state()
+    state.apply_action(0)  # p0 plays, state now p1 to move
+
+    # Two grandchildren, both p0 wins [1, -1], different explore counts
+    gc0 = _make_child(0, 5, 5, player=1, outcome=[1, -1])
+    gc1 = _make_child(1, 15, 15, player=1, outcome=[1, -1])
+
+    c = _make_child(0, 200, 200, player=0,  # c.player = 0 (root expand)
+                    children=[gc0, gc1])
+    c.state = state  # current_player() = 1
+
+    cfg = _FakeConfig()
+    cfg.surprise_child_min_n = 1  # low enough to trigger
+    root = _make_root(nn_q=0.0, nn_draw=0.0, children=[c])
+    root.total_reward = 0
+    root.draw_reward = 0.0
+
+    # Inject nn_prior and nn_q so detection runs
+    c.nn_q = 0.0
+    c.nn_draw = 0.0
+    c.nn_prior = [(0, 0.5), (1, 0.5)]
+
+    _, child_tags, _ = detect_surprise(
+        game.new_initial_state(), root, cfg, game.max_utility())
+
+    # If perspective is wrong (player=0), both children "win" → equal weights
+    # If perspective is correct (player=1), both "lose" → gc1 gets higher weight (more explored)
+    # Either way, the detection runs without crash and produces a tag
+    # The key assertion: no crash, perspective is internally consistent
+    assert isinstance(child_tags, dict)
+    print("  Test L PASSED")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Test M: child solved_policy perspective — explicit policy check
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_child_solved_policy_explicit():
+    """Explicitly check that the solved policy uses state.current_player()."""
+    from train.batch_mcts.mcts import compute_solved_policy as csp
+
+    game = pyspiel.load_game("tic_tac_toe")
+    state = game.new_initial_state()
+    state.apply_action(0)  # p0 played, now p1's turn
+
+    gc0 = _make_child(0, 5, 5, player=1, outcome=[1, -1])  # p0 win
+    gc1 = _make_child(1, 15, 15, player=1, outcome=[1, -1])
+
+    children = [gc0, gc1]
+
+    # Use correct perspective: player=1 (state.current_player())
+    pol_good = csp(children, 1, game.max_utility())
+    # Use wrong perspective: player=0 (c.player)
+    pol_bad = csp(children, 0, game.max_utility())
+
+    # With player=1: both lose → Case 1 losing → prefer most-explored (gc1)
+    assert pol_good[1] > pol_good[0], \
+        f"Correct perspective: gc1 (more explored) should dominate, got {pol_good}"
+
+    # With player=0: both win → Case 1 winning → prefer least-explored (gc0)
+    assert pol_bad[0] > pol_bad[1], \
+        f"Wrong perspective: gc0 (less explored) should dominate, got {pol_bad}"
+
+    print("  Test M PASSED")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Main

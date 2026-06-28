@@ -41,6 +41,7 @@ class Node:
         "_pos_hash",       # hash of static board position (repeat detection)
         "nn_q",            # NN raw Q value (cached for surprise detection)
         "nn_draw",         # NN draw rate
+        "nn_prior",        # NN prior distribution (list of (action, prob))
         "nn_prior_max",    # NN's max prior among legal actions
         "nn_argmax",       # NN's argmax action
     )
@@ -60,6 +61,7 @@ class Node:
         self._pos_hash = None
         self.nn_q = None
         self.nn_draw = None
+        self.nn_prior = None
         self.nn_prior_max = None
         self.nn_argmax = None
 

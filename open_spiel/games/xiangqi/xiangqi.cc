@@ -151,6 +151,16 @@ std::vector<Action> XiangqiState::LegalActions() const {
   std::vector<Action> legal;
   GeneratePseudoLegalMoves(&legal);
 
+  // When in check, filter to only moves that resolve the check.
+  if (IsInCheck(current_player_)) {
+    legal.erase(std::remove_if(legal.begin(), legal.end(),
+                               [this](Action a) {
+                                 auto [from, to] = DecodeMove(a);
+                                 return WouldLeaveInCheck(from, to);
+                               }),
+                legal.end());
+  }
+
   // Flying-general capture: if the two generals face each other with
   // nothing between, the current player can capture the opponent's general.
   int our_gen = FindGeneral(current_player_);

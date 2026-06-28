@@ -231,6 +231,26 @@ Python 3.11 Windows 上，`SharedMemory.buf` 返回的 `memoryview` 不支持 `b
 
 **修复**：空闲时 `get(timeout=0.1)` 阻塞等待，有消息才唤醒；凑 batch 时 `get(timeout=0.002)` 短暂阻塞。提取 `_handle_msg()` 内部函数消除 drain / 等待 / 处理三处重复代码。预分配 `obs_buf = np.empty((max_batch, obs_dim))` 消除每次 batch 的 `np.concatenate` malloc/memcpy。
 
+### 35. Policy head 3×3 conv 输出层初始化不当导致 prior 极度集中（严重）
+
+将 policy head 从 `Conv1×1` 扩展为 `3×3→ReLU→3×3→ReLU→1×1` 后，3×3 conv 用 `kaiming_normal`（fan_out 模式下 std≈0.08），1×1 也是 `kaiming_normal`。forward 通过两层 ReLU+3×3（每层放大~1×）再经 1×1（再放大），最终 logits std≈31。softmax 后 8100 个动作中一个占 99.9% 概率，其余全 0。
+
+MCTS 展开后每批 10 个状态全部走同一个动作，batch 内去重后只剩 1 个叶子，600 次 sim 仅探索 60 个动作——完全丧失搜索广度。
+
+**修复**：`policy_conv3`（最后一层 1×1）用 `uniform(-1e-3, 1e-3)` 初始化。3×3 conv 保持 `kaiming_normal(relu)`。forward 输出 logits 在 ±0.24 窄区间，softmax 后 prior 接近均匀。
+
+**教训**：多卷积层 policy head 的输出尺度需要显式控制。最后一层 1×1 是信息瓶颈——其权重范围直接决定 logits 方差。3×3 + ReLU 负责特征提取（可放开），1×1 负责压缩到 logits（必须掐死）。
+
+### 36. Probe 批量推理超过 SHM buffer 限制
+
+`_speculative_probe` 的 level 0 将所有 root children 和 root state 合并为一个大 batch 推理，deep walk 的 leaves 也是整批发送。当 branching factor 大时（象棋 ~40-80 合法着法），单 batch 超过 SHM buffer 的 `mcts_batch_size × num_actors` 容量，server 返回空结果导致 `np.exp(pl - pl.max())` 在 zero-size array 上崩溃。
+
+**修复**：所有 probe 中的 `batch_inference_raw` 调用按 `self.config.batch_size` 分片发送。
+
+**教训**：所有发送到 SHM server 的 batch 必须 ≤ `batch_size`。树内展开（probe、solver）的批量评估很容易忘掉这个约束——它们处理的集合可能是所有 root children（~80）而非 MCTS 路径（~10）。
+
+---
+
 ### 33. Policy head 的 BN + ReLU 破坏 NN prior（致命）
 
 Xiangqi / Othello ResNet 的 policy head 原为 `Conv1x1 → BN → ReLU`。OpenSpiel AlphaZero 的标准做法是 `Conv1x1 → Flatten → FC(relu) → FC(None)`——policy logits 的**最后一层无 BN 无激活**。
@@ -300,7 +320,7 @@ Traceback (most recent call last):
 ValueError: zero-size array to reduction operation maximum which has no identity
 
 
-在10万数据，1e-3学习率下3000个256的batch的学习结果，实际训练会用80万数据，更难拟合： 
+在10万数据，1e-3学习率下3000个256的batch的学习结果： 
 Done. 3000 batches in 342s (0.1s/batch) 
 P-KL: 0.2553 → 0.2319 (-9.2%) 
 V-KL: 0.1498 → 0.1006 (-32.8%)

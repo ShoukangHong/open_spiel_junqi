@@ -585,7 +585,7 @@ def main():
         plot_metrics(records, smooth=args.smooth, output_path=output_path,
                      elo_pairs=elo_pairs)
 
-DEFAULT_LOG = r"C:\Users\shouk\xiangqi_train\cloud_fpu\train.log"
+DEFAULT_LOG = r"C:\Users\shouk\xiangqi_train\cloud_new\train.log"
 DEFAULT_SMOOTH = 1
 DEFAULT_NO_PLOT = False
 

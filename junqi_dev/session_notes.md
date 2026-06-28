@@ -29,8 +29,7 @@
  - 棋子类型多样，通道数多。
 
 目前的需要：
-1. batch_mcts在改动后使用了一种去重的搜索方式（每次遇到重复的action就直接将batch 提交给inference server，导致了mcts 400 playout下不过nn，需要修复，回退到原来的评估方式。以确认是否是这个改动导致了mcts变弱。
-2. 继续训练xianqi ai，直到其达到专业棋手级别的水平。
+1. 继续训练xianqi ai，直到其达到专业棋手级别的水平。
 
 ### 军棋与 Othello 的关键差异
 | 属性 | Othello | 军棋 |

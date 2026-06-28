@@ -231,7 +231,8 @@ def run_match(cfg0, cfg1, num_games=100, temperature=0.1, temp_drop=4,
 # ── Parallel version ─────────────────────────────────────────────────────────
 
 def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
-                       temp_drop=4, num_actors=4, quiet=True):
+                       temp_drop=4, num_actors=4, quiet=True,
+                       inference_batch_size=128):
     """Parallel eval using shared GPU inference server.
 
     Spawns N game processes sharing one GPU process for batched inference.
@@ -272,7 +273,7 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
     # Register all actor queues BEFORE start (fork/spawn copies _result_qs)
     actor_rqs = [server.register_actor(i) for i in range(num_actors)]
 
-    server.start(game_name, 128)
+    server.start(game_name, inference_batch_size)
 
     score = {name0: 0, name1: 0, "draw": 0}
     sequences = []

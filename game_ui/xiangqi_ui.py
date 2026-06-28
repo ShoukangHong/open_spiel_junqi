@@ -21,16 +21,16 @@ from train.core.model_builder import build_xiangqi_model
 
 # ── Config ──────────────────────────────────────────────────────────────────
 CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_new"
-CHECKPOINT_STEP = 20
-MCTS_SIMULATIONS = 1024
+CHECKPOINT_STEP = 70
+MCTS_SIMULATIONS = 1000
 HINT_MAX_SIM = 10000
 INFERENCE_BATCH_SIZE = 10  # shared by MCTS and AlphaBeta
-UCT_C = 4.0
+UCT_C = 3.0
 FPU_LAMBDA = 0.2  # FPU penalty for unvisited nodes in MCTS (0 = disabled)
 PROBE_DEPTH = 0   # speculative probe layers (0 = disabled)
 PROBE_SURPRISE = 1.0  # Q-drop threshold for probe early termination
 AI_TEMPERATURE = 0.01  # τ for AI move selection (0 = argmax)
-TEMP_DROP = 5         # use τ=0.5 + advantage mixing before this move
+TEMP_DROP = 1         # use τ=0.5 + advantage mixing before this move
 SAVE_DIR = os.path.join(CHECKPOINT_DIR, "saved_positions")
 POLICY_EPSILON = 0.0  # Dirichlet noise weight for AI/hint search
 POLICY_ALPHA = 0.25     # Dirichlet concentration parameter

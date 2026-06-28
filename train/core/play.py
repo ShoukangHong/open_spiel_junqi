@@ -63,7 +63,13 @@ def _stable_qdr(root):
 
     Root children that were visited only once (e.g. uniform-expand coverage)
     add noise to the value target.  Filtering them out gives a stabler V.
+    If the node is proven (outcome set), use that directly.
     """
+    if root.outcome is not None:
+        s = root.state
+        p = s.current_player() if s is not None and not s.is_terminal() else root.player
+        q = root.outcome[p]
+        return q, 1.0 if q == 0 else 0.0
     valid = [c for c in root.children if c.explore_count > 1]
     if valid:
         total_n = sum(c.explore_count for c in valid)
@@ -136,7 +142,7 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
     rare_games = []
     wstats = {"rare": 0, "weak": 0, "weak_final": 0, "rare_flip": 0}
     state = game.new_initial_state() if init_state is None else init_state.clone()
-    move_num = 0
+    move_num = len(state.history())
     weak_enabled = allow_weak and init_state is None
 
     weak_side, weak_max, weak_steps = _setup_weak_moves(
@@ -250,14 +256,36 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
             surprise_tag, child_tags, kl_sum = detect_surprise(
                 state, root, config, game.max_utility())
             if surprise_tag:
+                si = len(states_info) - 1  # index of the state that triggered this
                 extra_surprise.append(
                     (obs.copy(), mask.copy(), policy.copy(),
-                     cur_player, surprise_tag, q, dr, kl_sum))
+                     cur_player, surprise_tag, q, dr, kl_sum, si))
+            for a, (ctag, c_combined) in child_tags.items():
+                child = next((c for c in root.children if c.action == a), None)
+                if child is not None and child.state is not None \
+                        and not child.state.is_terminal():
+                    cq, cdr = _stable_qdr(child)
+                    cs = child.state
+                    c_obs = np.asarray(cs.observation_tensor(), dtype=np.float32)
+                    c_mask = np.asarray(cs.legal_actions_mask(), dtype=bool)
+                    c_pol = np.zeros(game.num_distinct_actions(), dtype=np.float32)
+                    solved = compute_solved_policy(
+                        child.children, cs.current_player(), game.max_utility(),
+                        root_visits=child.explore_count)
+                    for ac, p in solved.items():
+                        c_pol[ac] = p
+                    if c_pol.sum() > 0:
+                        c_pol /= c_pol.sum()
+                    else:
+                        c_pol[...] = 1.0 / c_pol.size
+                    c_pol = _smooth_policy(c_pol, cs.legal_actions())
+                    extra_surprise.append(
+                        (c_obs, c_mask, c_pol, cs.current_player(),
+                         ctag, cq, cdr, c_combined))
 
         # Action selection with temperature
         # Forked (rare) games: always use post-drop tau for clean evaluation
-        after_drop = (init_state is not None
-                      or move_num >= config.temperature_drop)
+        after_drop = move_num >= config.temperature_drop
         tau_sel = config.temperature if after_drop else 0.5
         if tau_sel > 0.01 and tau_sel != 1.0:
             sel_probs = policy.astype(np.float64) ** (1.0 / tau_sel)
@@ -299,23 +327,24 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
         returns = state.returns()
     if logger is not None:
         logger.log_game_end(returns, move_num, len(rare_games))
-    # Generate extra copies: top-3 super_surprise ×3, rest ×1, surprise ×1
+    # Extra copies: super ×2 (up to max_copies//4), rest ×1
     extra_surprise.sort(key=lambda x: x[7], reverse=True)
     super_count = 0
     copies = []
+    max_copies = max(12, len(states_info) // 4)
     for item in extra_surprise:
         tag = item[4]
-        if tag == "super_surprise":
+        if "super_surprise" in tag:
             super_count += 1
-            n = 3 if super_count <= 3 else 1
-            final_tag = "super_surprise" if super_count <= 3 else "surprise"
+            n = 2 if super_count <= max_copies//4 else 1
+            final_tag = tag if super_count <= max_copies // 4 else tag.replace("super_", "")
         else:
             n = 1
             final_tag = tag
+        step_idx = item[8] if len(item) > 8 else -1
         for _ in range(n):
             copies.append((item[0], item[1], item[2], item[3],
-                           final_tag, item[5], item[6], item[7]))
-    max_copies = max(10, len(states_info) // 5)
+                           final_tag, item[5], item[6], item[7], step_idx))
     if len(copies) > max_copies:
         copies = copies[:max_copies]
     states_info.extend(copies)

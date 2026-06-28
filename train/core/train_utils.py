@@ -210,14 +210,16 @@ def maybe_trigger_eval(step, cfg, _eval_thread, _last_eval_time,
         target=eval_func,
         args=(cfg.path, step, refs, cfg.evaluation_window,
               getattr(cfg, 'eval_num_actors', 10),
-              cfg.temperature, cfg.temperature_drop),
+              cfg.temperature, cfg.temperature_drop,
+              getattr(cfg, 'inference_batch_size', 128)),
         daemon=True)
     _eval_thread.start()
     return _eval_thread, _last_eval_time
 
 
 def run_eval_background(cfg_path, current_step, ref_steps, num_games,
-                        num_actors=10, temperature=None, temp_drop=None):
+                        num_actors=10, temperature=None, temp_drop=None,
+                        inference_batch_size=128):
     """Run model-vs-model eval against multiple references (background)."""
     import platform
     if platform.system() == "Windows":
@@ -225,7 +227,8 @@ def run_eval_background(cfg_path, current_step, ref_steps, num_games,
         _kwargs = {}
     else:
         from train.eval_match import run_match_parallel as _run
-        _kwargs = {"num_actors": num_actors}
+        _kwargs = {"num_actors": num_actors,
+                   "inference_batch_size": inference_batch_size}
 
     # Read training config to match MCTS settings
     import json
