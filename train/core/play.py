@@ -285,7 +285,7 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
 
         # Action selection with temperature
         # Forked (rare) games: always use post-drop tau for clean evaluation
-        after_drop = move_num >= 5
+        after_drop = move_num >= config.temperature_drop
         tau_sel = config.temperature if after_drop else 0.67
         if tau_sel > 0.01 and tau_sel != 1.0:
             sel_probs = policy.astype(np.float64) ** (1.0 / tau_sel)

@@ -505,6 +505,13 @@ bool XiangqiState::WouldLeaveInCheck(int from, int to) const {
   auto& mutable_board = const_cast<std::array<Piece, kNumCells>&>(board_);
   Piece from_piece = mutable_board[from];
   Piece captured = mutable_board[to];
+
+  // Capturing the opponent's general wins immediately — always legal
+  // regardless of whether the moving side is still in check.
+  if (captured.type == kGeneral && captured.player == 1 - current_player_) {
+    return false;
+  }
+
   mutable_board[to] = from_piece;
   mutable_board[from] = kEmptyPiece;
 

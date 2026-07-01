@@ -512,8 +512,9 @@ def run_training(
                          and f != f"checkpoint-{_LATEST}.pt"
                          and f != f"checkpoint-{step}.pt"],
                         key=lambda f: int(f.split("-")[1].split(".")[0]))
-                    # Exclude the first 5 — too weak to be useful opponents
-                    ckpts = ckpts[5:]
+                    # Only pick opponents from the second half of training
+                    ckpts = [f for f in ckpts
+                             if int(f.split("-")[1].split(".")[0]) > step // 2]
                     if ckpts:
                         ckpt_file = global_rng.choice(ckpts)
                         ckpt_path = os.path.join(cfg.path, ckpt_file)

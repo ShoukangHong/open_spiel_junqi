@@ -123,9 +123,11 @@ class XiangqiResNet(nn.Module):
             policy_logits, value = self.forward(obs_t)
             policy_logits = torch.clamp(policy_logits, -30, 30)
             value = torch.clamp(value, -10, 10)
-            policy_logits = torch.where(mask_t, policy_logits,
-                                        torch.full_like(policy_logits, -1e9))
-            policy = F.softmax(policy_logits.float(), dim=-1)
+
+            mask_t = mask_t.float()
+            policy_logits = torch.where(mask_t > 0, policy_logits.float(),
+                                        torch.tensor(-1e9, device=self.device))
+            policy = F.softmax(policy_logits, dim=-1)
             policy = policy * mask_t
             policy = policy / policy.sum(dim=-1, keepdims=True).clamp(min=1e-9)
 
@@ -183,9 +185,11 @@ class XiangqiResNet(nn.Module):
             policy_logits = torch.clamp(policy_logits, -30, 30)
             value = torch.clamp(value, -10, 10)
 
-            policy_logits = torch.where(mask_t, policy_logits,
-                                        torch.full_like(policy_logits, -1e9))
-            policies = F.softmax(policy_logits.float(), dim=-1)
+            # Autocast may produce FP16 — cast to FP32 for safe softmax mask
+            mask_t = mask_t.float()
+            policy_logits = torch.where(mask_t > 0, policy_logits.float(),
+                                        torch.tensor(-1e9, device=self.device))
+            policies = F.softmax(policy_logits, dim=-1)
             policies = policies * mask_t
             policies = policies / policies.sum(dim=-1, keepdims=True).clamp(min=1e-9)
 
