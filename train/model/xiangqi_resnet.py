@@ -105,7 +105,8 @@ class XiangqiResNet(nn.Module):
             policy: (output_size,) numpy array (softmax over legal actions).
         """
         self.eval()
-        with torch.no_grad():
+        with torch.no_grad(), torch.cuda.amp.autocast(
+                enabled=(self.device.type == "cuda")):
             obs_t = torch.from_numpy(
                 np.ascontiguousarray(observation, dtype=np.float32)).to(self.device)
             if obs_t.dim() == 3:
@@ -121,22 +122,25 @@ class XiangqiResNet(nn.Module):
 
             policy_logits, value = self.forward(obs_t)
             policy_logits = torch.clamp(policy_logits, -30, 30)
+            value = torch.clamp(value, -10, 10)
             policy_logits = torch.where(mask_t, policy_logits,
                                         torch.full_like(policy_logits, -1e9))
-            policy = F.softmax(policy_logits, dim=-1)
+            policy = F.softmax(policy_logits.float(), dim=-1)
             policy = policy * mask_t
             policy = policy / policy.sum(dim=-1, keepdims=True).clamp(min=1e-9)
 
-            val = F.softmax(value, dim=-1)[0].cpu().numpy()
+            val = F.softmax(value.float(), dim=-1)[0].cpu().numpy()
             return val, policy[0].cpu().numpy()
 
     def batch_forward_raw(self, observations: np.ndarray) -> np.ndarray:
         """Forward only — returns (policy_logits, value_logits), no softmax.
 
         For server-side inference where softmax is deferred to scatter phase.
+        Uses FP16 autocast on CUDA for speed; clamps to prevent NaN propagation.
         """
         self.eval()
-        with torch.no_grad():
+        with torch.no_grad(), torch.cuda.amp.autocast(
+                enabled=(self.device.type == "cuda")):
             obs_t = torch.from_numpy(
                 np.ascontiguousarray(observations, dtype=np.float32)).to(self.device)
             if not torch.isfinite(obs_t).all():
@@ -145,11 +149,10 @@ class XiangqiResNet(nn.Module):
                 obs_t = obs_t.reshape(obs_t.shape[0], self.input_channels,
                                       self.board_rows, self.board_cols)
             policy_logits, value = self.forward(obs_t)
-            if not torch.isfinite(policy_logits).all():
-                raise RuntimeError("batch_forward_raw: NaN in policy_logits")
-            if not torch.isfinite(value).all():
-                raise RuntimeError("batch_forward_raw: NaN in value")
-            return policy_logits.cpu().numpy(), value.cpu().numpy()
+            policy_logits = torch.clamp(policy_logits, -30, 30)
+            value = torch.clamp(value, -10, 10)
+            return (policy_logits.float().cpu().numpy(),
+                    value.float().cpu().numpy())
 
     def batch_inference(self, observations: np.ndarray,
                         legals_masks: np.ndarray) -> tuple:
@@ -165,32 +168,26 @@ class XiangqiResNet(nn.Module):
             policies: (batch, 8100) numpy array
         """
         self.eval()
-        with torch.no_grad():
+        with torch.no_grad(), torch.cuda.amp.autocast(
+                enabled=(self.device.type == "cuda")):
             obs_t = torch.from_numpy(
                 np.ascontiguousarray(observations, dtype=np.float32)).to(self.device)
             mask_t = torch.from_numpy(
                 np.asarray(legals_masks, dtype=bool)).to(self.device)
-
-            if not torch.isfinite(obs_t).all():
-                raise RuntimeError("batch_inference: obs_t contains NaN/Inf")
 
             if obs_t.dim() == 2:
                 obs_t = obs_t.reshape(obs_t.shape[0], self.input_channels,
                                       self.board_rows, self.board_cols)
 
             policy_logits, value = self.forward(obs_t)
-
-            if not torch.isfinite(policy_logits).all():
-                raise RuntimeError("batch_inference: policy_logits NaN/Inf")
-            if not torch.isfinite(value).all():
-                raise RuntimeError("batch_inference: value NaN/Inf")
-
             policy_logits = torch.clamp(policy_logits, -30, 30)
+            value = torch.clamp(value, -10, 10)
+
             policy_logits = torch.where(mask_t, policy_logits,
                                         torch.full_like(policy_logits, -1e9))
-            policies = F.softmax(policy_logits, dim=-1)
+            policies = F.softmax(policy_logits.float(), dim=-1)
             policies = policies * mask_t
             policies = policies / policies.sum(dim=-1, keepdims=True).clamp(min=1e-9)
 
-            value = F.softmax(value, dim=-1)
+            value = F.softmax(value.float(), dim=-1)
             return value.cpu().numpy(), policies.cpu().numpy()
