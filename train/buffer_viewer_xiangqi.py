@@ -10,10 +10,12 @@ Controls:
     T           — cycle tag filter   R — filter rare only   A — show all
     Click       — select source square to see target heatmap
     Q / Esc     — quit
+    S           — save current sample as .npz
 """
 
 import os
 import sys
+import time as _time
 
 import numpy as np
 import pygame
@@ -137,6 +139,7 @@ def draw_side_panel(screen, index, total, global_idx, tag_filter_name,
         "PgUp/Dn: +-100   Home/End",
         "H: heatmap   Click: select src",
         "T: cycle filter   R: rare   A: all",
+        "S: save sample",
         "Q/Esc: quit",
     ]:
         screen.blit(sf.render(line_text, True, GRAY), (x0, y))
@@ -250,6 +253,17 @@ def main():
                     cur = (TAG_FILTERS.index(tag_filter.name) + 1) % len(TAG_FILTERS)
                     tag_filter.set_filter(TAG_FILTERS[cur]); need_refresh = True
                 elif key == pygame.K_a: tag_filter.set_filter("all"); need_refresh = True
+                elif key == pygame.K_s:
+                    gi = tag_filter.current_global_idx
+                    row = buf.read(gi)
+                    out_dir = os.path.join(os.path.dirname(path) or ".", "saved")
+                    os.makedirs(out_dir, exist_ok=True)
+                    fname = _time.strftime(f"sample_{gi}_%Y%m%d_%H%M%S.npz")
+                    fpath = os.path.join(out_dir, fname)
+                    np.savez(fpath,
+                             obs=row[0], mask=row[1], policy=row[2],
+                             value=row[3], tag=row[4])
+                    print(f"Saved: {fpath}")
                 elif key in (pygame.K_q, pygame.K_ESCAPE): running = False
 
         if need_refresh:

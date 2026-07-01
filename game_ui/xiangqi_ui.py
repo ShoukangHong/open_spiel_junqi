@@ -21,13 +21,13 @@ from train.core.model_builder import build_xiangqi_model
 
 # ── Config ──────────────────────────────────────────────────────────────────
 CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_new"
-CHECKPOINT_STEP = 70
+CHECKPOINT_STEP = 150
 MCTS_SIMULATIONS = 1000
 HINT_MAX_SIM = 10000
 INFERENCE_BATCH_SIZE = 10  # shared by MCTS and AlphaBeta
 UCT_C = 3.0
 FPU_LAMBDA = 0.2  # FPU penalty for unvisited nodes in MCTS (0 = disabled)
-PROBE_DEPTH = 0   # speculative probe layers (0 = disabled)
+PROBE_DEPTH = 1   # speculative probe layers (0 = disabled)
 PROBE_SURPRISE = 1.0  # Q-drop threshold for probe early termination
 AI_TEMPERATURE = 0.01  # τ for AI move selection (0 = argmax)
 TEMP_DROP = 1         # use τ=0.5 + advantage mixing before this move
@@ -37,7 +37,7 @@ POLICY_ALPHA = 0.25     # Dirichlet concentration parameter
 AB_DEPTH = 3           # alpha-beta search depth
 AB_POLICY_TEMP = 0.003   # temperature for value→policy softmax in AB
 _AB_FLAG = [False]      # toggle with 'A' key — list to allow mutation from nested scope
-MAX_PRINT_MOVES = 20   # top N moves printed to console
+MAX_PRINT_MOVES = 25   # top N moves printed to console
 
 # Read MCTS params from training config (fall back to defaults)
 import json as _json, os as _os
@@ -144,6 +144,7 @@ def main():
         hint_src_probs = None
         _hint_arrows = None
         hint_frozen = False
+        _last_dir = [None]  # mutable to update from event handler
         show_hints = False
         message = ""
         restart = False
@@ -219,13 +220,15 @@ def main():
                             os.makedirs(SAVE_DIR, exist_ok=True)
                             import time as _time
                             defname = _time.strftime("xiangqi_%Y%m%d_%H%M%S.txt")
+                            init_dir = _last_dir[0] if _last_dir[0] else SAVE_DIR
                             fpath = asksaveasfilename(
-                                initialdir=SAVE_DIR, initialfile=defname,
+                                initialdir=init_dir, initialfile=defname,
                                 defaultextension=".txt",
                                 filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
                             if fpath:
                                 with open(fpath, "w") as _f:
                                     _f.write(state.serialize())
+                                _last_dir[0] = os.path.dirname(fpath)
                                 message = f"Saved: {os.path.basename(fpath)}"
                             else:
                                 message = "Save cancelled"
@@ -233,8 +236,9 @@ def main():
                             from tkinter import Tk; from tkinter.filedialog import askopenfilename
                             Tk().withdraw()
                             os.makedirs(SAVE_DIR, exist_ok=True)
+                            init_dir = _last_dir[0] if _last_dir[0] else SAVE_DIR
                             fpath = askopenfilename(
-                                initialdir=SAVE_DIR,
+                                initialdir=init_dir,
                                 filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
                             if fpath:
                                 with open(fpath) as _f:
@@ -246,6 +250,7 @@ def main():
                                 hint_src_probs = None; _hint_arrows = None
                                 hint_draw_rate = 0.0
                                 selector.reset()
+                                _last_dir[0] = os.path.dirname(fpath)
                                 message = f"Loaded: {os.path.basename(fpath)}"
                             else:
                                 message = "Load cancelled"

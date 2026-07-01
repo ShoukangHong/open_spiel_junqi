@@ -117,7 +117,7 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
         actor_shm = ActorShm(shm_name, cfg.mcts_batch_size,
                              obs_flat, act_flat, act_flat, create=False)
     ev_main = SharedEvaluator(game, incoming_q, result_q, actor_id,
-                              model_id="main", actor_shm=actor_shm)
+                              model_id="best", actor_shm=actor_shm)
     ev_best = SharedEvaluator(game, incoming_q, result_q, actor_id,
                               model_id="best", actor_shm=actor_shm)
     if getattr(cfg, 'random_opponent_prob', 0) > 0:
@@ -268,8 +268,18 @@ def run_training(
                     ckpt, map_location="cpu",
                     weights_only=False)["model_state_dict"]
                 _log(f"[train] Best model: step {best_step}")
+                run_training._last_best_step = best_step
         except Exception:
             pass
+    elif start_step > 0:
+        # No best_step.txt yet — initialise from the checkpoint we loaded
+        best_file_init = os.path.join(cfg.path,
+                                       f"checkpoint-{start_step}.pt")
+        if os.path.exists(best_file_init):
+            with open(best_file, "w") as f:
+                f.write(str(start_step))
+            run_training._last_best_step = start_step
+            _log(f"[train] Best model initialised: step {start_step}")
 
     actors_per_gpu = (cfg.num_actors + num_gpus - 1) // num_gpus
     for gpu_id in range(num_gpus):
@@ -417,9 +427,9 @@ def run_training(
                     grad_rel=sum(l.grad_rel for l in losses_list) / n,
                     update_rel=sum(l.update_rel for l in losses_list) / n,
                 )
-                h = min(4, n)
+                h = min(50, n)
                 p_kl_head = sum(l.p_kl for l in losses_list[:h]) / h
-                mid = max(0, n // 2 - 2)
+                mid = max(0, n // 2 - h // 2)
                 p_kl_mid = sum(l.p_kl for l in losses_list[mid:mid + h]) / max(1, min(h, n - mid))
                 p_kl_tail = sum(l.p_kl for l in losses_list[-h:]) / h
                 v_kl_head = sum(l.v_kl for l in losses_list[:h]) / h

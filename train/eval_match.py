@@ -132,7 +132,7 @@ def _act(player_cfg, state, move_num, temperature, temp_drop):
 
 # ── Core function ────────────────────────────────────────────────────────────
 
-def run_match(cfg0, cfg1, num_games=100, temperature=0.1, temp_drop=4,
+def run_match(cfg0, cfg1, num_games=100, temperature=0.1, temp_drop=5,
               quiet=True):
     """Run a match between two strategies.
 
@@ -183,7 +183,7 @@ def run_match(cfg0, cfg1, num_games=100, temperature=0.1, temp_drop=4,
                 tc = json.load(f)
         else:
             tc = {}
-        _opening_prob = tc.get("opening_book_prob", 0.0)
+        _opening_prob = 1.0  # always use opening book for eval
         opening_dir = tc.get("opening_book_dir", "")
         if opening_dir and _opening_prob > 0:
             from train.games.opening_book import OpeningBook
@@ -231,7 +231,7 @@ def run_match(cfg0, cfg1, num_games=100, temperature=0.1, temp_drop=4,
 # ── Parallel version ─────────────────────────────────────────────────────────
 
 def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
-                       temp_drop=4, num_actors=4, quiet=True,
+                       temp_drop=5, num_actors=4, quiet=True,
                        inference_batch_size=128):
     """Parallel eval using shared GPU inference server.
 
@@ -338,7 +338,7 @@ def _eval_actor_process(worker_id, g_start, g_end, cfg0, cfg1,
     if os.path.exists(tc_path):
         with open(tc_path) as f:
             _tc = json.load(f)
-        obook_prob = _tc.get("opening_book_prob", 0.0)
+        obook_prob = 1.0  # always use opening book for eval
         obook_dir = _tc.get("opening_book_dir", "")
         if obook_dir and obook_prob > 0:
             from train.games.opening_book import OpeningBook

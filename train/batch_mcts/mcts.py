@@ -1056,7 +1056,11 @@ class BatchMCTS:
 
             # Select child with virtual-loss-adjusted PUCT.
             # Prune children proven worse than another sibling.
-            uct_c = self.config.uct_c
+            # Dynamic exploration: scale U and FPU by root Q.  In decisive
+            # positions both the exploration bonus and FPU's inherited Q
+            # benefit shrink — PUCT becomes Q-dominated.
+            dyn_c = max(0.05, 1.0 - 0.8 * abs(root.q_value))
+            uct_c = self.config.uct_c * dyn_c
             vloss = self.config.virtual_loss
             candidates = node.children
             if self.config.solve:
@@ -1088,7 +1092,7 @@ class BatchMCTS:
                 count = self._rep_counts.get(c._pos_hash, 0)
                 return min(count * self._repeat_penalty, 3 * self._repeat_penalty)
             # FPU: unvisited nodes inherit parent Q minus prior-based penalty
-            _fpu_lambda = self.config.fpu_lambda
+            _fpu_lambda = self.config.fpu_lambda * dyn_c
             _q_parent = node.q_value
             _p_max = max((c.prior for c in candidates), default=1.0)
             best_child = max(

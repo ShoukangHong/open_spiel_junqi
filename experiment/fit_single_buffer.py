@@ -24,13 +24,13 @@ import json, pyspiel
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-DB_PATH = r"C:\Users\shouk\xiangqi_train\cloud_fpu\buffer_4000960.db"
-CKPT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_fpu"
-CKPT_STEP = 60
+DB_PATH = r"C:\Users\shouk\xiangqi_train\cloud_new\buffer_8693824.db"
+CKPT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_new"
+CKPT_STEP = 180
 CONFIG_PATH = os.path.join(CKPT_DIR, "train_config.json")
 NUM_BATCHES = 2000
 LOG_EVERY = 50
-SUBSET_SIZE = 100_000  # sample this many rows from DB once, then train in-memory
+SUBSET_SIZE = 1000_000  # sample this many rows from DB once, then train in-memory
 
 
 def load_model_and_config():

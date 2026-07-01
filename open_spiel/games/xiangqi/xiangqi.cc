@@ -541,6 +541,16 @@ void XiangqiState::DoApplyAction(Action action) {
   }
 
   current_player_ = 1 - current_player_;
+
+  // Checkmate: opponent in check with no legal moves.
+  // Guard: skip if game already ended (e.g. no-capture draw limit).
+  if (outcome_ == kInvalidPlayer && !IsTerminal() && IsInCheck(current_player_)) {
+    std::vector<Action> next_legal = LegalActions();
+    if (next_legal.empty()) {
+      outcome_ = 1 - current_player_;
+      no_legal_moves_ = true;
+    }
+  }
 }
 
 void XiangqiState::UndoAction(Player player, Action action) {
