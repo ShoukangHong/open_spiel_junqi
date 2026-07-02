@@ -143,7 +143,7 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
     wstats = {"rare": 0, "weak": 0, "weak_final": 0, "rare_flip": 0}
     state = game.new_initial_state() if init_state is None else init_state.clone()
     move_num = len(state.history())
-    weak_enabled = allow_weak and init_state is None
+    weak_enabled = allow_weak  # only forks pass False
 
     weak_side, weak_max, weak_steps = _setup_weak_moves(
         config, rng, allow_weak=weak_enabled)

@@ -1,9 +1,7 @@
-"""SQLite-backed FIFO ring buffer for AlphaZero samples.
+"""SQLite-backed replay buffer for AlphaZero samples — disk only, no memory ring.
 
-Each state is persisted immediately to SQLite with its training step,
-solving crash-resilience and checkpoint-alignment in one shot.
-An in-memory ring buffer mirrors the most recent *max_size* states
-for fast GPU sampling.
+Append writes directly to SQLite.  Sample picks random rows via ID lookup.
+Buffer size is limited only by disk — no in-memory numpy arrays.
 """
 
 import os
@@ -15,9 +13,6 @@ import numpy as np
 from train.core.types import TrainInput
 
 _WAL_PRAGMAS = ("PRAGMA journal_mode=WAL;", "PRAGMA synchronous=NORMAL;")
-
-
-from train.core.position_hash import hash_obs
 
 
 def _pack(arr):
@@ -32,36 +27,31 @@ def _unpack(raw, dtype):
     try:
         return np.frombuffer(zlib.decompress(raw), dtype=dtype)
     except zlib.error:
-        return np.frombuffer(raw, dtype=dtype)  # old uncompressed format
+        return np.frombuffer(raw, dtype=dtype)
 
 
 class ReplayBuffer:
-    """SQLite-persisted FIFO ring buffer.
+    """Disk-only SQLite replay buffer.
 
     Args:
-        max_size: in-memory ring capacity (also limits how many recent
-                  states are loaded from DB on resume).
-        db_path: path to SQLite file.  If None, operates in-memory only
-                 (backward compat for tests).
+        max_size: deprecated (kept for API compat) — buffer is unbounded.
+        db_path: SQLite file path.
+        max_db_rows: rotate DB when this many rows accumulate.
+        recent_db_rows: if >0, maintain a small _recent.db with latest N rows.
     """
 
-    def __init__(self, max_size: int, db_path: str = None,
-                 max_db_rows: int = 1_000_000, recent_db_rows: int = 0,
-                 game_name: str = ""):
+    def __init__(self, max_size: int = 500_000, db_path: str = None,
+                 max_db_rows: int = 1_000_000, recent_db_rows: int = 0):
         self._max_size = max_size
         self._db_path = db_path
         self._max_db_rows = max_db_rows
         self._recent_db_rows = recent_db_rows
-        self._obs = None
-        self._masks = None
-        self._policies = None
-        self._values = None
-        self._tags = None           # ring-buffer tags
-        self._index = 0             # total states ever appended
-        self._size = 0              # ring occupancy
-        self._pending = 0           # unflushed DB inserts
-        self._game_name = game_name
+        self._total = 0              # total rows ever appended (across rotations)
+        self._pending = 0            # unflushed DB inserts
         self._recent_pending = 0
+        self._sample_rng = np.random.RandomState()
+        self._stats_total = 0   # samples drawn this step
+        self._stats_hashes = set()
 
         if db_path:
             self._conn = sqlite3.connect(db_path, timeout=30)
@@ -80,8 +70,7 @@ class ReplayBuffer:
             )
             self._conn.execute("CREATE INDEX IF NOT EXISTS idx_step ON states(step)")
             self._conn.commit()
-            self._load_ring_from_db()
-            # Separate small DB for the most recent N rows (fast local download)
+            self._sync_total()
             if recent_db_rows > 0:
                 rpath = db_path.replace(".db", "_recent.db")
                 self._recent_conn = sqlite3.connect(rpath, timeout=30)
@@ -105,30 +94,40 @@ class ReplayBuffer:
             self._conn = None
             self._recent_conn = None
 
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _sync_total(self):
+        """Recalculate _total from all DB files (for resume / rollback)."""
+        if not self._db_path:
+            return
+        self._total = 0
+        for p in self._all_db_paths():
+            try:
+                conn = sqlite3.connect(p)
+                cur = conn.execute("SELECT COUNT(*) FROM states")
+                self._total += cur.fetchone()[0]
+                conn.close()
+            except Exception:
+                pass
+
+    def _all_db_paths(self):
+        import glob as _glob
+        base = self._db_path
+        archived = sorted(_glob.glob(base.replace(".db", "_*.db")), reverse=True)
+        if os.path.exists(base):
+            return [base] + archived
+        return archived
+
+    def _count_current(self):
+        cur = self._conn.execute("SELECT COUNT(*) FROM states")
+        return cur.fetchone()[0]
+
     # ── Public API ──────────────────────────────────────────────────────────
 
     def append(self, obs: np.ndarray, mask: np.ndarray,
                policy: np.ndarray, value, tag: str = "", step: int = 0):
         """Insert one state.  *step* is the training step that produced it."""
-        if self._obs is None:
-            self._obs = np.empty((self._max_size, *obs.shape), dtype=np.float32)
-            self._masks = np.empty((self._max_size, *mask.shape), dtype=bool)
-            self._policies = np.empty((self._max_size, *policy.shape),
-                                       dtype=np.float32)
-            self._values = np.empty((self._max_size, 3), dtype=np.float32)
-            self._tags = np.empty((self._max_size,), dtype=object)
-
-        # In-memory ring
-        idx = self._index % self._max_size
-        self._obs[idx] = obs.astype(np.float32)
-        self._masks[idx] = mask
-        self._policies[idx] = policy.astype(np.float32)
-        self._values[idx] = np.asarray(value, dtype=np.float32)
-        self._tags[idx] = tag
-        self._index += 1
-        self._size = min(self._size + 1, self._max_size)
-
-        # SQLite — batch flush every 256 appends
+        self._total += 1
         if self._conn:
             self._conn.execute(
                 "INSERT INTO states (step, obs, mask, policy, value, tag) "
@@ -140,7 +139,6 @@ class ReplayBuffer:
                 self._conn.commit()
                 self._pending = 0
                 self._rotate_db()
-        # Recent-only DB (small, fast to download)
         if self._recent_conn:
             self._recent_conn.execute(
                 "INSERT INTO states (step, obs, mask, policy, value, tag) "
@@ -157,27 +155,99 @@ class ReplayBuffer:
                 self._recent_pending = 0
 
     def sample(self, n: int) -> TrainInput:
-        """Random sample from the in-memory ring buffer."""
-        indices = np.random.randint(0, self._size, size=n)
+        """Weighted random sample — newer rows have higher probability.
+
+        Uses linear weighting: weight ∝ position within the window (0 = oldest
+        in window, w-1 = newest).  Samples via inverse-CDF of pos² distribution.
+        """
+        if self._conn is None:
+            raise RuntimeError("sample() requires a DB-backed buffer")
+
+        w = min(self._total, self._max_size)  # window size
+        if w == 0:
+            raise RuntimeError("buffer is empty")
+
+        # Linear-weight inverse CDF: pos ~ sqrt(uniform)
+        u = self._sample_rng.random(n).astype(np.float64)
+        pos = (np.sqrt(u * w * (w + 1) + 0.25) - 0.5)
+        pos = np.clip(pos.astype(np.int64), 0, w - 1)
+
+        # Map window positions → absolute row IDs (1-based across all files)
+        start_abs = max(0, self._total - w)  # oldest global offset in window
+        abs_ids = (start_abs + pos + 1).tolist()  # 1-based global
+
+        # Build (path → row_count) — oldest first (ID grows with time)
+        paths = list(reversed(self._all_db_paths()))
+        file_sizes = []
+        for p in paths:
+            conn = self._conn if p == self._db_path else None
+            close_after = False
+            if conn is None:
+                conn = sqlite3.connect(p)
+                close_after = True
+            try:
+                cnt = conn.execute("SELECT COUNT(*) FROM states").fetchone()[0]
+                file_sizes.append((p, cnt))
+            finally:
+                if close_after:
+                    conn.close()
+
+        # Map absolute IDs → (path, local_id), group by path
+        file_ofs = {}  # path → [local_id, ...]
+        for a_id in abs_ids:
+            remain = a_id
+            for p, cnt in file_sizes:
+                if remain <= cnt:
+                    file_ofs.setdefault(p, []).append(remain)
+                    break
+                remain -= cnt
+
+        # Query each file
+        rows = []
+        temp_conns = []
+        for p, local_ids in file_ofs.items():
+            conn = self._conn if p == self._db_path else sqlite3.connect(p)
+            if p != self._db_path:
+                temp_conns.append(conn)
+            placeholders = ",".join("?" for _ in local_ids)
+            file_rows = conn.execute(
+                f"SELECT obs, mask, policy, value FROM states "
+                f"WHERE id IN ({placeholders})",
+                local_ids).fetchall()
+            rows.extend(file_rows)
+
+        for c in temp_conns:
+            try: c.close()
+            except: pass
+
+        obs_l, mask_l, pol_l, val_l = [], [], [], []
+        for obs_b, mask_b, pol_b, val_b in rows:
+            obs_l.append(_unpack(obs_b, np.float32))
+            mask_l.append(_unpack(mask_b, bool))
+            pol_l.append(_unpack(pol_b, np.float32))
+            val_l.append(_unpack(val_b, np.float32))
+            self._stats_total += 1
+            self._stats_hashes.add(hash(obs_b))
         return TrainInput(
-            observation=self._obs[indices],
-            legals_mask=self._masks[indices],
-            policy=self._policies[indices],
-            value=self._values[indices],
+            observation=np.stack(obs_l),
+            legals_mask=np.stack(mask_l),
+            policy=np.stack(pol_l),
+            value=np.stack(val_l),
         )
 
+    _STATS_WINDOW = 50000
+
     def tag_counts(self) -> dict:
-        if self._tags is None:
+        """Tag distribution over the latest {_STATS_WINDOW} rows (current DB)."""
+        if not self._conn:
             return {}
-        tags = self._tags[:self._size]
-        valid = [str(t) for t in tags if t is not None]
-        if not valid:
-            return {}
-        unique, counts = np.unique(valid, return_counts=True)
-        return {str(k): int(v) for k, v in zip(unique, counts)}
+        cur = self._conn.execute(
+            "SELECT tag, COUNT(*) FROM ("
+            "  SELECT tag FROM states ORDER BY id DESC LIMIT ?"
+            ") GROUP BY tag", (self._STATS_WINDOW,))
+        return {str(k): int(v) for k, v in cur.fetchall()}
 
     def flush(self):
-        """Commit any pending SQLite writes (call before shutdown)."""
         if self._conn and self._pending > 0:
             self._conn.commit()
             self._pending = 0
@@ -191,18 +261,16 @@ class ReplayBuffer:
             self._recent_conn.commit()
             self._recent_pending = 0
 
-    def _rotate_db(self, db_path=None):
-        """If current DB exceeds max_db_rows, archive it and start a new one."""
-        if db_path is None:
-            db_path = self._db_path
-        cur = self._conn.execute("SELECT COUNT(*) FROM states")
-        if cur.fetchone()[0] < self._max_db_rows:
+    def _rotate_db(self):
+        if self._db_path is None:
+            return
+        if self._count_current() < self._max_db_rows:
             return
         self._conn.close()
-        suffix = self._index - self._max_db_rows  # approx row count in archived file
-        rotated = db_path.replace(".db", f"_{suffix}.db")
-        os.rename(db_path, rotated)
-        self._conn = sqlite3.connect(db_path, timeout=30)
+        suffix = self._total - self._max_db_rows
+        rotated = self._db_path.replace(".db", f"_{suffix}.db")
+        os.rename(self._db_path, rotated)
+        self._conn = sqlite3.connect(self._db_path, timeout=30)
         for p in _WAL_PRAGMAS:
             self._conn.execute(p)
         self._conn.execute(
@@ -219,71 +287,10 @@ class ReplayBuffer:
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_step ON states(step)")
         self._conn.commit()
 
-    def _all_db_paths(self):
-        """Return all buffer DB paths (current + archived), newest first."""
-        import glob as _glob
-        base = self._db_path
-        archived = sorted(_glob.glob(base.replace(".db", "_*.db")), reverse=True)
-        if os.path.exists(base):
-            return [base] + archived
-        return archived
-
-    def _load_ring_from_db(self):
-        """Fill the in-memory ring from the most recent DB rows across all files."""
-        paths = self._all_db_paths()
-        rows = []
-        for p in paths:
-            conn = sqlite3.connect(p)
-            cur = conn.execute(
-                "SELECT obs, mask, policy, value, tag FROM states "
-                "ORDER BY id DESC LIMIT ?", (self._max_size,))
-            rows.extend(cur.fetchall())
-            conn.close()
-            if len(rows) >= self._max_size:
-                break
-        rows = rows[:self._max_size]
-        rows.reverse()  # chronological order
-
-        n = len(rows)
-        if n == 0:
-            self._index = 0
-            self._size = 0
-            return
-        first_obs = _unpack(rows[0][0], np.float32)
-        first_mask = _unpack(rows[0][1], bool)
-        first_pol = _unpack(rows[0][2], np.float32)
-
-        self._obs = np.empty((self._max_size, *first_obs.shape), dtype=np.float32)
-        self._masks = np.empty((self._max_size, *first_mask.shape), dtype=bool)
-        self._policies = np.empty((self._max_size, *first_pol.shape), dtype=np.float32)
-        self._values = np.empty((self._max_size, 3), dtype=np.float32)
-        self._tags = np.empty((self._max_size,), dtype=object)
-
-        for i, (obs_b, mask_b, pol_b, val_b, tag) in enumerate(rows):
-            self._obs[i] = _unpack(obs_b, np.float32)
-            self._masks[i] = _unpack(mask_b, bool)
-            self._policies[i] = _unpack(pol_b, np.float32)
-            self._values[i] = _unpack(val_b, np.float32)
-            self._tags[i] = tag
-
-        self._size = n
-        # Recover _index: total rows across all files
-        total = 0
-        for p in paths:
-            conn = sqlite3.connect(p)
-            cur = conn.execute("SELECT COUNT(*) FROM states")
-            total += cur.fetchone()[0]
-            conn.close()
-        self._index = max(total, n)
-
     def rollback(self, target_step: int):
-        """Delete states with step > target_step from all DB files, reload ring."""
         if not self._conn:
             return
         self.flush()
-        # Only touch files that might have step > target_step.
-        # Archived files are named buffer_<first_index>.db — skip if all rows
-        # in the file predate the target step.
         for p in self._all_db_paths():
             conn = sqlite3.connect(p)
             cur = conn.execute("SELECT MAX(step) FROM states")
@@ -297,11 +304,9 @@ class ReplayBuffer:
         if self._recent_conn:
             self._recent_conn.execute("DELETE FROM states")
             self._recent_conn.commit()
-        self._obs = None
-        self._load_ring_from_db()
+        self._sync_total()
 
     def close(self):
-        """Close the database connection."""
         self.flush()
         if self._conn:
             self._conn.close()
@@ -313,54 +318,31 @@ class ReplayBuffer:
     # ── Properties ──────────────────────────────────────────────────────────
 
     def __len__(self) -> int:
-        return self._size
+        return min(self._total, self._max_size)
 
     @property
     def total_seen(self) -> int:
-        return self._index
+        return self._total
+
+    @property
+    def recent_unique_ratio(self) -> float:
+        """Fraction of unique samples drawn this step (resets on read)."""
+        if self._stats_total == 0:
+            return 1.0
+        r = len(self._stats_hashes) / self._stats_total
+        self._stats_total = 0
+        self._stats_hashes.clear()
+        return r
 
     @property
     def unique_states(self) -> int:
-        if self._obs is None or self._size == 0:
+        """Unique samples this step (estimated from sampled ratio)."""
+        if self._stats_total == 0:
             return 0
-        seen = set()
-        for i in range(self._size):
-            seen.add(hash_obs(self._obs[i], self._game_name))
-        return len(seen)
+        return len(self._stats_hashes)
 
 
-# ── Buffer converter (old scalar → new WDL) ──────────────────────────────────
-
-def _convert_buffer(src_path: str, dst_path: str = None):
-    """Convert old scalar buffer to WDL format.  Writes in-place if no dst."""
-    data = np.load(src_path)
-    vals = data["values"]
-    if vals.ndim > 1:
-        data.close()
-        print(f"[convert] Already WDL format ({vals.shape[1]}-dim), skipping.")
-        return
-
-    wdl = np.zeros((vals.shape[0], 3), dtype=np.float32)
-    v = vals.astype(np.float32)
-    wdl[:, 0] = np.maximum(v, 0)
-    wdl[:, 1] = 1.0 - np.abs(v)
-    wdl[:, 2] = np.maximum(-v, 0)
-
-    obs = data["obs"].copy()
-    masks = data["masks"].copy()
-    policies = data["policies"].copy()
-    tags = data.get("tags", np.array([""] * vals.shape[0]))
-    idx = int(data.get("index", vals.shape[0]))
-    sz = int(data.get("size", vals.shape[0]))
-    data.close()
-
-    out = dst_path or src_path
-    tmp = out + ".converting.npz"
-    np.savez_compressed(tmp, obs=obs, masks=masks, policies=policies,
-                        values=wdl, tags=tags, index=idx, size=sz)
-    os.replace(tmp, out)
-    print(f"[convert] {vals.shape[0]} states: scalar → WDL → {out}")
-
+# ── Buffer maintenance ───────────────────────────────────────────────────────
 
 def _compress_db(db_path: str):
     """In-place convert uncompressed DB rows to zlib-compressed format."""
@@ -400,7 +382,3 @@ def _compress_db(db_path: str):
     conn.execute("VACUUM")
     conn.close()
     print(f"[compress] Done — {updated} rows compressed + VACUUM.")
-
-
-if __name__ == "__main__":
-    _compress_db(r"C:\Users\shouk\othello_train\cloud_wdl_db\buffer.db")

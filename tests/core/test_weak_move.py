@@ -202,8 +202,10 @@ def test_fork_no_weak():
 # Test E
 
 def test_buffer_tags():
+    import tempfile
     print("Test E: buffer tag_counts() ...", end=" ")
-    buf = ReplayBuffer(max_size=100)
+    db = tempfile.mktemp(suffix=".db")
+    buf = ReplayBuffer(max_size=100, db_path=db)
     o = np.zeros((4, 8, 8), dtype=np.float32)
     mk = np.ones(65, dtype=bool)
     po = np.zeros(65, dtype=np.float32)
@@ -213,6 +215,11 @@ def test_buffer_tags():
     buf.append(o, mk, po, 0.8, tag="rare")
     c = buf.tag_counts()
     assert c.get("", 0) == 1 and c.get("rare", 0) == 2
+    buf.close()
+    import os
+    for ext in ("", "-shm", "-wal"):
+        try: os.unlink(db + ext)
+        except: pass
     print("PASSED")
 
 

@@ -79,8 +79,7 @@ def init_training(cfg, game_module, model_builder, ReplayBuffer_class,
 
     buffer = ReplayBuffer_class(max_size=cfg.replay_buffer_size,
                                  db_path=os.path.join(cfg.path, "buffer.db"),
-                                 recent_db_rows=10000,
-                                 game_name=getattr(cfg, 'game', ''))
+                                 recent_db_rows=10000)
     sym = Symmetry_class() if cfg.symmetry > 1 else None
     logging.info(f"[train] buffer_sampling_frac={cfg.buffer_sampling_frac}"
                  f"  symmetry={cfg.symmetry}")

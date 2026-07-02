@@ -451,7 +451,7 @@ def run_training(
                 f"[step {step:3d}/{cfg.max_steps}] "
                 f"games={total_games:3d}  states={total_states:4d}  "
                 f"buffer={len(buffer):5d}/{buffer.total_seen:5d}"
-                f" unique={buffer.unique_states}"
+                f" uniq_ratio={buffer.recent_unique_ratio:.1%}"
                 f"  tags={buffer.tag_counts()}"
                 f"  weak={wstats_summary(cfg)}  "
                 f"states/s={states_per_s:.1f}  "
