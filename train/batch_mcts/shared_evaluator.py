@@ -5,8 +5,10 @@ different checkpoint without spawning separate GPU processes.
 
 Architecture:
   actor → incoming_q: (actor_id, model_id, obs_list, mask_list)
-  Server: groups by model_id, batched forward per group, scatters
-  actor ← result_qs[actor_id]: (actor_id, results)
+  Server: groups by model_id, batched forward per group, writes to
+          shared ServerShm, notifies each actor with (offset, n)
+  actor ← result_qs[actor_id]: (actor_id, model_id, offset, n)
+  actor reads slice from ServerShm
 """
 
 import multiprocessing as mp
@@ -16,12 +18,25 @@ import time
 import numpy as np
 
 
+def fast_legal_mask(state, num_actions: int) -> np.ndarray:
+    """Numpy bool mask of legal actions — avoids pybind list-of-8100-ints.
+
+    ``state.legal_actions_mask()`` returns a C++ ``std::vector<int>(8100)``
+    which pybind11 converts to a Python list of 8100 int objects, only for
+    ``np.asarray()`` to read them back.  Using ``legal_actions()`` (~44 ints)
+    + numpy indexing is 100–1000× cheaper on the Python side.
+    """
+    m = np.zeros(num_actions, dtype=bool)
+    m[state.legal_actions()] = True
+    return m
+
+
 class SharedEvaluator:
     """BatchMCTS-compatible evaluator backed by a shared GPU process."""
 
     def __init__(self, game, incoming_q: mp.Queue, result_q: mp.Queue,
                  actor_id: int = 0, model_id: str = "main",
-                 actor_shm=None):
+                 actor_shm=None, server_shm=None):
         self._game = game
         self._incoming = incoming_q
         self._result = result_q
@@ -29,6 +44,7 @@ class SharedEvaluator:
         self._model_id = model_id
         self._shm = actor_shm
         self._use_shm = actor_shm is not None
+        self._server_shm = server_shm
 
     def scalar_value(self, state):
         """Return p0-perspective scalar Q from WDL output."""
@@ -82,15 +98,23 @@ class SharedEvaluator:
 
     def _recv(self):
         while True:
-            msg = self._result.get()
+            try:
+                msg = self._result.get(timeout=60)
+            except queue.Empty:
+                raise RuntimeError(
+                    f"SharedEvaluator actor={self._actor_id}: "
+                    f"no response from server after 60s — server may have crashed")
             aid, mid = msg[:2]
             if aid == self._actor_id and mid == self._model_id:
-                if len(msg) == 2:
-                    return self._shm.read_output()
+                if len(msg) == 4:
+                    # SHM offset protocol: (actor_id, mid, offset, n)
+                    offset, n = msg[2], msg[3]
+                    return self._server_shm.read_slice(offset, n)
                 if len(msg) >= 3 and isinstance(msg[2], Exception):
                     raise msg[2]
-                # legacy: (actor_id, model_id, (policy_logits, value_logits))
+                # legacy / non-SHM: (actor_id, model_id, (pl, vl))
                 return msg[2]
+
 
     def _process_batch(self, data, mask_b):
         """Sparse softmax on actor side — only over legal actions (~40 dims)."""
@@ -118,14 +142,16 @@ class SharedEvaluator:
 
 # ── GPU Inference Server ────────────────────────────────────────────────────
 
-_MAX_WAIT = 0.010
+_MAX_WAIT = 0.010  # unused, kept for reference
 
 
 def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
-               build_model_fn=None, actor_shms=None, gpu_id=0):
+               build_model_fn=None, actor_shms=None, server_shm=None,
+               gpu_id=0):
     """GPU inference process with multi-model support.
 
-    *actor_shms*: dict actor_id → ActorShm (optional shared memory buffers).
+    *actor_shms*: dict actor_id → ActorShm (input buffers).
+    *server_shm*: ServerShm — single shared output buffer for all actors.
     """
     import os as _os
 
@@ -288,10 +314,10 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
                 return
             continue  # drain remaining + re-check
 
-        if total < _cfg["max_batch"] and _oldest_ms() < 2.0:
+        if total < _cfg["max_batch"] and _oldest_ms() < 0.5:
             # Batch not full: short block for more messages
             try:
-                msg = incoming_q.get(timeout=0.002)
+                msg = incoming_q.get(timeout=0.0005)
             except queue.Empty:
                 continue  # timeout → re-check conditions
             if _handle_msg(msg):
@@ -336,7 +362,6 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
         model = models[best_mid]
 
         concat_t0 = time.time()
-        # Scatter-copy directly into pre-allocated buffer (no malloc)
         obs_buf = _cfg["obs_buf"]
         resolved = []
         cursor = 0
@@ -360,16 +385,18 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
         fwd_ms = (time.time() - fwd_t0) * 1000
 
         scatter_t0 = time.time()
+
+        # Write batch once to shared output SHM
+        if server_shm is not None:
+            server_shm.write_batch(policy_logits, value_logits)
+
         cursor = 0
         for actor_id, _, _, n, is_shm in resolved:
-            pl = policy_logits[cursor:cursor + n]
-            vl = value_logits[cursor:cursor + n]
             if is_shm:
-                shm_buf = _actor_shms.get(actor_id)
-                if shm_buf:
-                    shm_buf.write_output(pl, vl)
-                result_qs[actor_id].put((actor_id, best_mid))
+                result_qs[actor_id].put((actor_id, best_mid, cursor, n))
             else:
+                pl = policy_logits[cursor:cursor + n]
+                vl = value_logits[cursor:cursor + n]
                 result_qs[actor_id].put(
                     (actor_id, best_mid, (pl, vl)))
             cursor += n
@@ -457,8 +484,11 @@ class InferenceServer:
         self._proc = None
         self._build_model_fn = build_model_fn
         self._gpu_id = gpu_id
-        self._shm_bufs = {}    # actor_id → ActorShm
-        self._shm_names = {}   # actor_id → name (for actor to open)
+        self._shm_bufs = {}      # actor_id → ActorShm (input)
+        self._shm_names = {}     # actor_id → name
+        self._server_shm = None  # ServerShm (output, shared by all actors)
+        self._server_shm_name = None
+        self._pol_flat = None    # stored from first register_actor
 
     @property
     def incoming_queue(self):
@@ -473,14 +503,20 @@ class InferenceServer:
             from train.batch_mcts.shm import ActorShm
             import os as _os, time as _time
             name = f"jq_{_os.getpid()}_{int(_time.monotonic()*1e6)}_{self._gpu_id}_{actor_id}"
-            shm = ActorShm(name, max_states, obs_flat, mask_flat, pol_flat,
-                           create=True)
+            shm = ActorShm(name, max_states, obs_flat, mask_flat, create=True)
             self._shm_bufs[actor_id] = shm
             self._shm_names[actor_id] = name
+            if self._pol_flat is None:
+                self._pol_flat = pol_flat
         return q
 
     def actor_shm_name(self, actor_id: int):
         return self._shm_names.get(actor_id)
+
+    @property
+    def server_shm_name(self):
+        """Name of the shared output buffer — all actors open this."""
+        return self._server_shm_name
 
     def result_queue(self, actor_id: int):
         return self._result_qs[actor_id]
@@ -495,11 +531,21 @@ class InferenceServer:
     def start(self, game_name, max_batch):
         if not self._model_specs:
             raise RuntimeError("No models registered")
+        # Create shared output SHM (one per GPU, sized for inference_batch_size)
+        if self._pol_flat is not None and self._server_shm is None:
+            from train.batch_mcts.shm import ServerShm
+            import os as _os, time as _time
+            pid = _os.getpid()
+            ts = int(_time.monotonic() * 1e6)
+            out_name = f"jq_out_{pid}_{ts}_{self._gpu_id}"
+            self._server_shm = ServerShm(out_name, max_batch, self._pol_flat,
+                                         create=True)
+            self._server_shm_name = out_name
         self._proc = mp.Process(
             target=_run_server,
             args=(self._incoming, self._result_qs, self._model_specs,
                   game_name, max_batch, self._build_model_fn,
-                  self._shm_bufs, self._gpu_id),
+                  self._shm_bufs, self._server_shm, self._gpu_id),
             daemon=True,
         )
         self._proc.start()
@@ -514,6 +560,14 @@ class InferenceServer:
                 pass
         self._shm_bufs.clear()
         self._shm_names.clear()
+        if self._server_shm is not None:
+            try:
+                self._server_shm.close()
+                self._server_shm.unlink()
+            except Exception:
+                pass
+            self._server_shm = None
+            self._server_shm_name = None
 
     def update_weights(self, model_id: str, state_dict, max_batch):
         self._incoming.put((model_id, state_dict, max_batch))

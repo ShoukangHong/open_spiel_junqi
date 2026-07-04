@@ -5,7 +5,7 @@ import threading
 import numpy as np
 import pyspiel
 
-from train.batch_mcts.shm import ActorShm
+from train.batch_mcts.shm import ActorShm, ServerShm
 from train.batch_mcts.shared_evaluator import (
     InferenceServer, SharedEvaluator, _run_server)
 from train.batch_mcts.evaluator import PyTorchEvaluator
@@ -39,16 +39,12 @@ def _make_states(n=3):
 def test_shm_vs_direct_model():
     game = pyspiel.load_game("othello")
     model = _make_model()
-    direct_ev = PyTorchEvaluator(game, model)
     states = _make_states(5)
 
     # Get direct results
     direct_vals = []
     direct_pols = []
     for s in states:
-        v, pol = model.inference(
-            np.asarray(s.observation_tensor(), dtype=np.float32),
-            np.asarray(s.legal_actions_mask(), dtype=bool))
         obs = np.asarray(s.observation_tensor(), dtype=np.float32)
         mask = np.asarray(s.legal_actions_mask(), dtype=bool)
         v2, pol2 = model.inference(obs, mask)
@@ -56,36 +52,41 @@ def test_shm_vs_direct_model():
         direct_pols.append(pol2)
 
     # Start server + actor with shm
+    obs_flat = int(np.prod(game.observation_tensor_shape()))
+    act_flat = game.num_distinct_actions()
+
     server = InferenceServer()
     try:
-        obs_flat = int(np.prod(game.observation_tensor_shape()))
-        act_flat = game.num_distinct_actions()
         rq = server.register_actor(0, max_states=8, obs_flat=obs_flat,
                                    mask_flat=act_flat, pol_flat=act_flat)
         server.register_model("main", model._model.state_dict(), 8, 1)
+        # Create ServerShm for the test (normally done in server.start())
+        out_name = f"test_osh_{id(server)}"
+        srv_shm = ServerShm(out_name, 128, act_flat, create=True)
         shm_name = server.actor_shm_name(0)
         server._thread = threading.Thread(
             target=_run_server,
             args=(server.incoming_queue, server._result_qs,
                   server._model_specs, "othello", 128, None,
-                  server._shm_bufs))
+                  server._shm_bufs, srv_shm),
+            daemon=True)
         server._thread.start()
-        time.sleep(0.05)
+        time.sleep(0.1)
+        if not server._thread.is_alive():
+            raise RuntimeError("Server thread crashed on startup")
 
-        actor_shm = ActorShm(shm_name, 8, obs_flat, act_flat, act_flat,
-                             create=False)
+        actor_shm = ActorShm(shm_name, 8, obs_flat, act_flat, create=False)
         ev = SharedEvaluator(game, server.incoming_queue, rq, actor_id=0,
-                             model_id="main", actor_shm=actor_shm)
+                             model_id="main", actor_shm=actor_shm,
+                             server_shm=srv_shm)
 
-        vals_shm, priors_shm_bypass = ev.batch_inference_raw(states)
+        vals_shm, priors_shm = ev.batch_inference_raw(states)
 
         for i, s in enumerate(states):
-            # Direct: (value, policy_array)
             v_direct = direct_vals[i]
             p_direct = direct_pols[i]
-            # Server: (values_array, prior_list)
             v_shm = vals_shm[i]
-            prior = priors_shm_bypass[i]
+            prior = priors_shm[i]
             p_shm = np.zeros(act_flat, dtype=np.float32)
             for a, pr in prior:
                 p_shm[a] = pr
@@ -96,6 +97,7 @@ def test_shm_vs_direct_model():
                                        err_msg=f"policy mismatch state {i}")
     finally:
         _stop_server(server)
+        _safe_cleanup_shm(srv_shm)
 
 
 # ── Concurrency ──────────────────────────────────────────────────────────────
@@ -111,6 +113,19 @@ def _stop_server(server):
         pass
 
 
+def _safe_cleanup_shm(shm):
+    import gc
+    gc.collect()
+    try:
+        shm.close()
+    except Exception:
+        pass
+    try:
+        shm.unlink()
+    except Exception:
+        pass
+
+
 def test_shm_concurrent():
     game = pyspiel.load_game("othello")
     model = _make_model()
@@ -120,6 +135,7 @@ def test_shm_concurrent():
     act_flat = game.num_distinct_actions()
 
     server = InferenceServer()
+    srv_shm = None
     try:
         n_actors = 3
         evs = []
@@ -128,21 +144,27 @@ def test_shm_concurrent():
                                        mask_flat=act_flat, pol_flat=act_flat)
             rq  # keep reference
         server.register_model("main", model._model.state_dict(), 8, 1)
+        out_name = f"test_csh_{id(server)}"
+        srv_shm = ServerShm(out_name, 128, act_flat, create=True)
         server._thread = threading.Thread(
             target=_run_server,
             args=(server.incoming_queue, server._result_qs,
                   server._model_specs, "othello", 128, None,
-                  server._shm_bufs))
+                  server._shm_bufs, srv_shm),
+            daemon=True)
         server._thread.start()
+        time.sleep(0.1)
+        if not server._thread.is_alive():
+            raise RuntimeError("Server thread crashed on startup")
         time.sleep(0.05)
 
         for i in range(n_actors):
             shm_name = server.actor_shm_name(i)
-            shm = ActorShm(shm_name, 8, obs_flat, act_flat, act_flat,
-                           create=False)
+            shm = ActorShm(shm_name, 8, obs_flat, act_flat, create=False)
             ev = SharedEvaluator(game, server.incoming_queue,
                                  server.result_queue(i), actor_id=i,
-                                 model_id="main", actor_shm=shm)
+                                 model_id="main", actor_shm=shm,
+                                 server_shm=srv_shm)
             evs.append(ev)
 
         errors = []
@@ -174,3 +196,5 @@ def test_shm_concurrent():
         assert not errors, f"{len(errors)} errors: {errors[:3]}"
     finally:
         _stop_server(server)
+        if srv_shm:
+            _safe_cleanup_shm(srv_shm)

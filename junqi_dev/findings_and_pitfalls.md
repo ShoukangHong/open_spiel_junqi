@@ -328,3 +328,83 @@ V-KL: 0.1498 → 0.1006 (-32.8%)
 Done. 3000 batches in 341s (0.1s/batch) 
 P-KL: 0.2562 → 0.2321 (-9.4%) 
 V-KL: 0.1497 → 0.1011 (-32.5%)
+
+---
+
+## 2026-07 会话新增
+
+### 37. DB 归档文件字符串排序在 10M 处出错（致命）
+`_all_db_paths` 用 `sorted(archives, reverse=True)` 对文件名排序。
+`buffer_9000000.db` 和 `buffer_10000000.db` 的字符串比较 `"9" > "1"`，
+10M 文件排在 9M 之后，绝对 ID 映射全错。采样窗口指向完全错误的时间段。
+
+**影响**：模型在学 1000 万行之前的旧策略，loss 周期性跳变，ELO 断崖下跌。
+**修复**：改用 `key=lambda p: int(re.search(r'_(\d+)\.db$', p).group(1))` 数值排序。
+**教训**：任何依赖文件名字符串排序的代码必须用数值排序或加测试覆盖跨位数场景。
+
+### 38. `_rotate_db` suffix 冲突导致静默覆盖归档（致命）
+旧公式 `suffix = _total - max_db_rows`。续训时若旧归档已被手动删除，
+`_sync_total` 重新计算 `_total` → suffix 可能等于已被删除归档的旧命名 →
+`os.rename` 在 Linux 上静默覆盖同名文件。15M 行数据瞬间消失。
+
+**影响**：训练分布断层，loss 跳变。
+**修复**：`suffix = _total`（单调递增，永久唯一）。
+**教训**：文件命名必须保证单调唯一；旋转时检查目标是否存在。
+
+### 39. `_clamp_draw` 未清零 `total_reward`（中等）
+Solver 证明某节点为和棋时 `_clamp_draw` 只设 `draw_reward = explore_count`，
+但 `total_reward` 保持原值不变。证明前 MCTS 探索过的"优势"分支 → Q 残留 > 0 →
+`node.q_value` 显示必胜而非和棋。
+
+**影响**：MCTS 搜索中已证明的和棋节点仍被 PUCT 当成优势选。
+**修复**：`_clamp_draw` 同步设 `total_reward = 0.0`。
+
+### 40. no-capture 边界最后一手将军被误判为将死（严重）
+Xiangqi `DoApplyAction` 先递增 `moves_since_capture_`，再检查
+`IsInCheck(current_player_)` → `LegalActions()`。`LegalActions()` 第一行
+`if (IsTerminal()) return {};`——由于 `moves_since_capture_` 已超限，
+`IsTerminal()` 返回 true，`LegalActions()` 返回空 → 被误认为将死。
+
+**影响**：40 步无吃子终局前的最后一手将军被判为获胜，和棋变必胜。
+**修复**：checkmate 检测加上 `!IsTerminal()` guard。
+
+### 41. `WouldLeaveInCheck` 禁止吃将（严重）
+`WouldLeaveInCheck` 在临时移动后检查自己的将是否仍被攻击。
+但吃掉对方老将后，攻击方（对方的车/炮等）仍在原位置，`IsInCheck` 返回 true →
+吃将被判非法。
+
+**影响**：被将军时无法用吃将解围，`LegalActions` 在将死局面返回空，
+但实际存在解围着法。
+**修复**：检测到 `captured.type == kGeneral` 时直接返回合法。
+
+### 42. Opening book 中 `weak_enabled` 被关闭
+旧代码 `weak_enabled = allow_weak and init_state is None`。
+使用 opening book 时 `init_state is not None` → 弱着被完全关闭。
+
+**影响**：50% 的对局没有弱着探索。
+**修复**：改为 `weak_enabled = allow_weak`（只有 fork 传 False）。
+
+### 43. OpeningBook 启动时加载全部 state 到内存
+旧实现 `self._states.append(game.deserialize_state(raw))`。
+xiangqi state 含完整走子历史，每个开销大。开局库 >500 局 → 内存爆炸。
+
+**修复**：只存序列化字符串，`sample()` 时按需 `deserialize_state`。
+
+### 44. 系统安装的旧 pyspiel.so 被优先加载（严重）
+
+项目根目录有最新编译的 `pyspiel.so`（obso=17 通道），
+但 `/usr/local/lib/python3.11/dist-packages/pyspiel.so` 是旧版（15 通道）。
+Python import 优先级 `dist-packages` > 当前目录。
+
+当从项目根目录执行 `python -c "import pyspiel"` 时，cwd 优先 → 加载新版（17 通道）。
+当 pytest 从 `tests/` 子目录运行时，cwd 不包含 `.so` → fallback 到 dist-packages（15 通道）。
+
+**影响**：训练正常（train_*.py 从项目根目录启动），但测试在 import 路径上拿到
+旧 .so，observation_tensor_shape 与模型期望不匹配。手动验证和自动测试结果矛盾。
+
+**修复**：删掉 `/usr/local/lib/python3.11/dist-packages/pyspiel.so`，
+或将新版 `.so` 复制/软链接到 dist-packages。
+
+**教训**：编译型 Python 模块（.so/.pyd）可能存在多份副本。排查 shape 不匹配问题时，
+首先检查 `pyspiel.__file__` 而不是 `pyspiel.load_game().observation_tensor_shape()`——
+后者在同一个模块里内部一致，不会暴露加载了错误副本的问题。

@@ -78,7 +78,7 @@ def _make_state(moves=()):
     return s
 
 
-def _start_server(server, mock_models):
+def _start_server(server, mock_models, **run_kw):
     """Start server with mock models using the real _run_server."""
     import threading
     specs = {}
@@ -87,9 +87,12 @@ def _start_server(server, mock_models):
     server._thread = threading.Thread(
         target=_run_server,
         args=(server.incoming_queue, server._result_qs, specs,
-              "tic_tac_toe", 128))
+              "tic_tac_toe", 128) + run_kw.get('extra_args', ()),
+        daemon=True)
     server._thread.start()
-    time.sleep(0.05)
+    time.sleep(0.1)
+    if not server._thread.is_alive():
+        raise RuntimeError("Server thread crashed on startup")
 
 def _stop_server(server):
     try:
@@ -250,9 +253,12 @@ def test_wdl_scalar_value_perspective():
         server._thread = threading.Thread(
             target=_run_server,
             args=(server.incoming_queue, server._result_qs, specs,
-                  "tic_tac_toe", 128))
+                  "tic_tac_toe", 128),
+            daemon=True)
         server._thread.start()
-        time.sleep(0.05)
+        time.sleep(0.1)
+        if not server._thread.is_alive():
+            raise RuntimeError("Server thread crashed on startup")
 
         ev = SharedEvaluator(game, server.incoming_queue, rq, actor_id=0,
                              model_id="wdl")
@@ -564,26 +570,32 @@ def main():
 def test_shm():
     """Shared memory path: single + batch inference, various sizes."""
     import threading
-    from train.batch_mcts.shm import ActorShm
+    from train.batch_mcts.shm import ActorShm, ServerShm
 
     game = pyspiel.load_game("tic_tac_toe")
     mm = _MockModel("main", num_actions=9)
     server = InferenceServer()
+    srv_shm = None
     try:
         rq = server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9,
                                    pol_flat=9)
         specs = {"main": {"model": mm}}
         shm_name = server.actor_shm_name(0)
+        srv_shm = ServerShm(f"test_shm_srv_{id(server)}", 128, 9, create=True)
         server._thread = threading.Thread(
             target=_run_server,
             args=(server.incoming_queue, server._result_qs, specs,
-                  "tic_tac_toe", 128, None, server._shm_bufs))
+                  "tic_tac_toe", 128, None, server._shm_bufs, srv_shm),
+            daemon=True)
         server._thread.start()
-        time.sleep(0.05)
+        time.sleep(0.1)
+        if not server._thread.is_alive():
+            raise RuntimeError("Server thread crashed on startup")
 
-        actor_shm = ActorShm(shm_name, 8, 27, 9, 9, create=False)
+        actor_shm = ActorShm(shm_name, 8, 27, 9, create=False)
         ev = SharedEvaluator(game, server.incoming_queue, rq,
-                             actor_id=0, model_id="main", actor_shm=actor_shm)
+                             actor_id=0, model_id="main", actor_shm=actor_shm,
+                             server_shm=srv_shm)
         # Single inference
         s = _make_state([0, 4])
         v, _ = ev._inference(s)
@@ -606,6 +618,11 @@ def test_shm():
             assert all(v >= 0 for v in val)
     finally:
         _stop_server(server)
+        if srv_shm:
+            try: srv_shm.close()
+            except Exception: pass
+            try: srv_shm.unlink()
+            except Exception: pass
 
 
 def test_multi_server_isolation():
@@ -625,14 +642,18 @@ def test_multi_server_isolation():
         s0._thread = threading.Thread(
             target=_run_server,
             args=(s0.incoming_queue, s0._result_qs, {"main": {"model": mm0}},
-                  "tic_tac_toe", 128, None, s0._shm_bufs, 0))
+                  "tic_tac_toe", 128, None, s0._shm_bufs, None, 0),
+            daemon=True)
         s1._thread = threading.Thread(
             target=_run_server,
             args=(s1.incoming_queue, s1._result_qs, {"main": {"model": mm1}},
-                  "tic_tac_toe", 128, None, s1._shm_bufs, 1))
+                  "tic_tac_toe", 128, None, s1._shm_bufs, None, 1),
+            daemon=True)
         s0._thread.start()
         s1._thread.start()
-        time.sleep(0.05)
+        time.sleep(0.1)
+        if not s0._thread.is_alive() or not s1._thread.is_alive():
+            raise RuntimeError("Server thread crashed on startup")
 
         ev0 = SharedEvaluator(game, s0.incoming_queue, rq0, actor_id=0, model_id="main")
         ev1 = SharedEvaluator(game, s1.incoming_queue, rq1, actor_id=0, model_id="main")
@@ -669,14 +690,18 @@ def test_multi_server_weight_broadcast():
         s0._thread = threading.Thread(
             target=_run_server,
             args=(s0.incoming_queue, s0._result_qs, specs,
-                  "tic_tac_toe", 128, None, s0._shm_bufs, 0))
+                  "tic_tac_toe", 128, None, s0._shm_bufs, None, 0),
+            daemon=True)
         s1._thread = threading.Thread(
             target=_run_server,
             args=(s1.incoming_queue, s1._result_qs, specs,
-                  "tic_tac_toe", 128, None, s1._shm_bufs, 1))
+                  "tic_tac_toe", 128, None, s1._shm_bufs, None, 1),
+            daemon=True)
         s0._thread.start()
         s1._thread.start()
-        time.sleep(0.05)
+        time.sleep(0.1)
+        if not s0._thread.is_alive() or not s1._thread.is_alive():
+            raise RuntimeError("Server thread crashed on startup")
 
         ev0 = SharedEvaluator(game, s0.incoming_queue, rq0, actor_id=0, model_id="main")
         ev1 = SharedEvaluator(game, s1.incoming_queue, rq1, actor_id=0, model_id="main")

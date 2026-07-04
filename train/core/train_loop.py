@@ -96,7 +96,8 @@ def _mixed_target(game_ret, q_value, draw_rate, alpha):
 # ── Actor process (multi-actor mode) ────────────────────────────────────────
 
 def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
-                  actor_id, play_game_fn, shm_name=None, log_id=None):
+                  actor_id, play_game_fn, shm_name=None, server_shm_name=None,
+                  log_id=None):
     """Actor subprocess: self-play loop pushing states to the trainer."""
     try:
         import os as _os
@@ -110,19 +111,26 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
     cfg = config_class(**cfg_dict)
     game = pyspiel.load_game(cfg.game)
     actor_shm = None
+    server_shm = None
     if shm_name is not None:
         obs_flat = int(np.prod(game.observation_tensor_shape()))
         act_flat = game.num_distinct_actions()
-        from train.batch_mcts.shm import ActorShm
+        from train.batch_mcts.shm import ActorShm, ServerShm
         actor_shm = ActorShm(shm_name, cfg.mcts_batch_size,
-                             obs_flat, act_flat, act_flat, create=False)
+                             obs_flat, act_flat, create=False)
+        if server_shm_name is not None:
+            server_shm = ServerShm(server_shm_name, cfg.inference_batch_size,
+                                   act_flat, create=False)
     ev_main = SharedEvaluator(game, incoming_q, result_q, actor_id,
-                              model_id="best", actor_shm=actor_shm)
+                              model_id="best", actor_shm=actor_shm,
+                              server_shm=server_shm)
     ev_best = SharedEvaluator(game, incoming_q, result_q, actor_id,
-                              model_id="best", actor_shm=actor_shm)
+                              model_id="best", actor_shm=actor_shm,
+                              server_shm=server_shm)
     if getattr(cfg, 'random_opponent_prob', 0) > 0:
         ev_opp = SharedEvaluator(game, incoming_q, result_q, actor_id,
-                                 model_id="random_opp", actor_shm=actor_shm)
+                                 model_id="random_opp", actor_shm=actor_shm,
+                                 server_shm=server_shm)
         mcts_cfg_opp = MCTSConfig(
             max_simulations=cfg.max_simulations, batch_size=cfg.mcts_batch_size,
             uct_c=cfg.uct_c, policy_epsilon=cfg.policy_epsilon,
@@ -310,7 +318,8 @@ def run_training(
             state_q = mp.Queue(maxsize=200)
             p = mp.Process(target=actor_process,
                            args=(config_class, cfg_dict, incoming_q, result_q,
-                                 state_q, local_id, play_game_fn, shm_name),
+                                 state_q, local_id, play_game_fn, shm_name,
+                                 server.server_shm_name),
                            kwargs={"log_id": global_id},
                            name=f"actor-gpu{gpu_id}-{local_id}")
             p.start()

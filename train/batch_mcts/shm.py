@@ -1,29 +1,48 @@
-"""Shared-memory buffers for actor↔server communication — no pickle overhead."""
+"""Shared-memory buffers for actor↔server communication — no pickle overhead.
+
+ActorShm: per-actor, input-only (actor → server).
+ServerShm: single output buffer per GPU (server → all actors).
+
+Layout — ActorShm:
+  [8B: in_off][8B: reserved]
+  [input: obs...][mask...]  2× safety margin
+
+Layout — ServerShm:
+  [8B: total_n]
+  [policy_logits: max_batch * pol_flat * 4]
+  [value_logits: max_batch * 3 * 4]
+"""
 
 import multiprocessing.shared_memory as _shm
 import numpy as np
 
 
+def _has_direct_view():
+    """True on Linux where np.ndarray(buffer=...) works reliably."""
+    import sys
+    return sys.platform != "win32"
+
+
+def _write_bytes(shm, offset, data):
+    """Fallback: copy bytes via intermediate array (Windows-safe)."""
+    buf = np.ndarray(len(shm.buf), dtype=np.byte, buffer=shm.buf)
+    buf[offset:offset + len(data)] = np.frombuffer(data, dtype=np.uint8)
+
+
+# ── Per-actor input buffer ────────────────────────────────────────────────────
+
 class ActorShm:
-    """Per-actor shared-memory buffer.
+    """Per-actor shared-memory buffer — input only (actor → server).
 
-    Layout:
-      [8B: in_off=8+max_n*(obs_flat*4+mask_flat)][8B: out_cap]
-      [input: obs...][mask...][output: policy_logits...][value_logits...]
-
-    The header stores the input section size so both sides agree on offsets
-    regardless of how the shm was opened.
+    The actor writes obs (and optionally mask) then sends a short queue
+    message.  The server reads directly from this buffer.
     """
 
-    def __init__(self, name, max_states, obs_flat, mask_flat, policy_flat,
-                 create=False):
+    def __init__(self, name, max_states, obs_flat, mask_flat, create=False):
         self._obs_flat = obs_flat
         self._mask_flat = mask_flat
-        self._pol_flat = policy_flat
         in_size = max_states * (obs_flat * 4 + mask_flat * 1)
-        out_cap = 4 + max_states * (policy_flat * 4 + 3 * 4)
-        # 2× safety margin: MCTS may send more than max_states rare cases
-        total = 16 + in_size * 2 + out_cap
+        total = 16 + in_size * 2
         if create:
             try:
                 self._shm = _shm.SharedMemory(name=name, create=True, size=total)
@@ -37,11 +56,10 @@ class ActorShm:
                 self._shm = _shm.SharedMemory(name=name, create=True, size=total)
             self._shm.buf[:total] = b'\x00' * total
             self._shm.buf[0:8] = np.int64(16 + in_size).tobytes()
-            self._shm.buf[8:16] = np.int64(out_cap).tobytes()
+            self._shm.buf[8:16] = np.int64(0).tobytes()
         else:
             self._shm = _shm.SharedMemory(name=name)
         self._in_off = int(np.frombuffer(self._shm.buf[0:8], dtype=np.int64)[0])
-        self._out_cap = int(np.frombuffer(self._shm.buf[8:16], dtype=np.int64)[0])
         self._name = name
 
     @property
@@ -52,7 +70,7 @@ class ActorShm:
         try:
             self._shm.close()
         except BufferError:
-            pass  # numpy arrays still hold buffer views, safe to ignore
+            pass
 
     def unlink(self):
         try:
@@ -62,22 +80,12 @@ class ActorShm:
 
     # ── Actor side ──────────────────────────────────────────────────────────
 
-    def _write_bytes(self, offset, data):
-        """Fallback: copy bytes via intermediate numpy array (Windows-safe)."""
-        buf = np.ndarray(len(self._shm.buf), dtype=np.byte, buffer=self._shm.buf)
-        buf[offset:offset + len(data)] = np.frombuffer(data, dtype=np.uint8)
-
-    def _has_direct_view(self):
-        """True on Linux where np.ndarray(buffer=...) works reliably."""
-        import sys
-        return sys.platform != "win32"
-
     def write_input_obs(self, obs):
         """Server only needs obs — skip mask for zero-copy efficiency."""
         n = obs.shape[0]
         self._write_bytes(0, np.int32(n).tobytes())
         off = self._in_off
-        if self._has_direct_view():
+        if _has_direct_view():
             dst = np.ndarray(obs.shape, dtype=np.float32,
                              buffer=self._shm.buf, offset=off)
             np.copyto(dst, obs)
@@ -88,7 +96,7 @@ class ActorShm:
         n = obs.shape[0]
         self._write_bytes(0, np.int32(n).tobytes())
         off = self._in_off
-        if self._has_direct_view():
+        if _has_direct_view():
             dst = np.ndarray(obs.shape, dtype=np.float32,
                              buffer=self._shm.buf, offset=off)
             np.copyto(dst, obs)
@@ -125,43 +133,110 @@ class ActorShm:
         return np.frombuffer(self._shm.buf, dtype=np.float32,
                              count=size, offset=off).reshape(n, self._obs_flat)
 
-    def write_output(self, policy_logits, value_logits):
-        """Pad policy to pol_flat, write to output area."""
-        n = policy_logits.shape[0]
-        pad = self._pol_flat - policy_logits.shape[1]
-        end = self._in_off + self._out_cap
-        total = n * (self._pol_flat * 4 + 3 * 4)
-        off = end - 4 - total
-        if pad > 0:
-            pl = np.pad(policy_logits.astype(np.float32),
-                        ((0, 0), (0, pad)))
+    def _write_bytes(self, offset, data):
+        _write_bytes(self._shm, offset, data)
+
+
+# ── Shared output buffer (one per GPU server) ─────────────────────────────────
+
+class ServerShm:
+    """Single output buffer shared by all actors on one GPU.
+
+    Server writes inference results once; each actor reads its slice
+    using the (offset, n) it received in the queue notification.
+    """
+
+    def __init__(self, name, max_states, pol_flat, create=False):
+        self._pol_flat = pol_flat
+        out_size = max_states * (pol_flat * 4 + 3 * 4)
+        total = 8 + out_size
+        self._name = name
+        if create:
+            try:
+                self._shm = _shm.SharedMemory(name=name, create=True, size=total)
+            except FileExistsError:
+                try:
+                    old = _shm.SharedMemory(name=name)
+                    old.close()
+                    old.unlink()
+                except Exception:
+                    pass
+                self._shm = _shm.SharedMemory(name=name, create=True, size=total)
         else:
-            pl = policy_logits
-        if self._has_direct_view():
-            dst = np.ndarray(pl.shape, dtype=np.float32,
+            self._shm = _shm.SharedMemory(name=name)
+        if create:
+            self._shm.buf[0:8] = np.int64(0).tobytes()
+
+    @property
+    def name(self):
+        return self._name
+
+    def close(self):
+        try:
+            self._shm.close()
+        except BufferError:
+            pass
+
+    def unlink(self):
+        try:
+            self._shm.unlink()
+        except Exception:
+            pass
+
+    # ── Server side ─────────────────────────────────────────────────────────
+
+    def write_batch(self, policy_logits, value_logits):
+        """Write a full batch of inference results (one forward call)."""
+        n = policy_logits.shape[0]
+        self._shm.buf[0:8] = np.int64(n).tobytes()
+        off = 8
+        if _has_direct_view():
+            dst = np.ndarray(policy_logits.shape, dtype=np.float32,
                              buffer=self._shm.buf, offset=off)
-            np.copyto(dst, pl)
+            np.copyto(dst, policy_logits)
             off += n * self._pol_flat * 4
             dst = np.ndarray(value_logits.shape, dtype=np.float32,
                              buffer=self._shm.buf, offset=off)
             np.copyto(dst, value_logits)
         else:
-            self._write_bytes(off, np.ascontiguousarray(pl).tobytes())
+            _write_bytes(self._shm, off,
+                         np.ascontiguousarray(policy_logits).tobytes())
             off += n * self._pol_flat * 4
-            self._write_bytes(off,
-                              np.ascontiguousarray(value_logits).tobytes())
-        self._write_bytes(end - 4, np.int32(n).tobytes())
+            _write_bytes(self._shm, off,
+                         np.ascontiguousarray(value_logits).tobytes())
 
-    def read_output(self):
-        """Read n from very end; read max-sized block before it."""
-        end = self._in_off + self._out_cap
-        n = int(np.frombuffer(self._shm.buf[end - 4:end], dtype=np.int32)[0])
-        if n <= 0:
-            return None
-        off = end - 4 - n * (self._pol_flat * 4 + 3 * 4)
-        data = np.frombuffer(self._shm.buf, dtype=np.float32,
-                             count=n * (self._pol_flat + 3), offset=off)
-        return (data[:n * self._pol_flat].reshape(n, self._pol_flat),
-                data[n * self._pol_flat:].reshape(n, 3))
-        return (policy_logits.reshape(n, self._pol_flat),
-                value_logits.reshape(n, 3))
+    # ── Actor side ──────────────────────────────────────────────────────────
+
+    def read_slice(self, offset, n):
+        """Read n states starting at *offset* within the batch."""
+        total_n = int(np.frombuffer(self._shm.buf[0:8], dtype=np.int64)[0])
+        if total_n <= 0 or n <= 0:
+            return np.empty((0, self._pol_flat), dtype=np.float32), \
+                   np.empty((0, 3), dtype=np.float32)
+        pol_start = 8 + offset * self._pol_flat * 4
+        pol = np.frombuffer(self._shm.buf, dtype=np.float32,
+                            count=n * self._pol_flat, offset=pol_start)
+        val_start = 8 + total_n * self._pol_flat * 4 + offset * 3 * 4
+        val = np.frombuffer(self._shm.buf, dtype=np.float32,
+                            count=n * 3, offset=val_start)
+        return pol.reshape(n, self._pol_flat), val.reshape(n, 3)
+python -c "
+import sys, os
+# Same dir as pytest would use
+sys.path.insert(0, os.getcwd())
+import pyspiel
+print('pyspiel:', pyspiel.__file__)
+g = pyspiel.load_game('xiangqi')
+print('obs_shape:', g.observation_tensor_shape())
+# Also check the flat size
+s = g.new_initial_state()
+obs = s.observation_tensor()
+print('obs flat:', len(obs))
+# Any open_spiel python wrapper?
+if 'open_spiel' in sys.modules:
+  print('open_spiel already imported')
+# Check for shadowing
+import importlib
+spec = importlib.util.find_spec('pyspiel')
+print('spec:', spec)
+"
