@@ -343,5 +343,71 @@ def test_linear_weighted_distribution():
         except: pass
 
 
+def test_numeric_file_sorting():
+    """_all_db_paths sorts archived files by numeric suffix, not string."""
+    import re
+    # 10M should sort after 9M numerically, but not with string sort
+    names = ["buffer.db", "buffer_900000.db", "buffer_1000000.db",
+             "buffer_2000000.db", "buffer_10000000.db"]
+    # Simulate _all_db_paths logic
+    base = "buffer.db"
+    archived = [n for n in names if n != base]
+    # String sort (old buggy behavior)
+    str_sorted = sorted(archived, reverse=True)
+    assert str_sorted[0] == "buffer_900000.db", \
+        f"String sort puts 9M first: {str_sorted}"
+    # Numeric sort (fixed)
+    archived.sort(key=lambda p: int(re.search(r'_(\d+)\.db$', p).group(1)),
+                  reverse=True)
+    assert archived == ["buffer_10000000.db", "buffer_2000000.db",
+                         "buffer_1000000.db", "buffer_900000.db"], \
+        f"Numeric sort failed: {archived}"
+
+
+def test_uniform_sample_across_dbs():
+    """Uniform sampling is evenly distributed across rotated DB files."""
+    import numpy as np, glob
+    from collections import Counter
+    base = _tempfile.mktemp(suffix=".db")
+    # max_db_rows=30 → 90 rows across 3 files: 30+30+30
+    buf = ReplayBuffer(max_size=200, db_path=base, max_db_rows=30)
+    for i in range(90):
+        obs = np.array([float(i)], dtype=np.float32)
+        buf.append(obs, np.ones(1, dtype=bool),
+                   np.ones(1, dtype=np.float32),
+                   np.array([0.5, 0.3, 0.2], dtype=np.float32),
+                   step=1, tag="")
+        if i > 0 and i % 30 == 0:
+            buf.flush()  # force rotation each 30 rows
+    buf.flush()  # final
+    assert len(buf._all_db_paths()) >= 3, f"Expected >=3 DB files"
+
+    id_counts = Counter()
+    for _ in range(300):
+        batch = buf.sample_uniform(100)
+        for row_id in batch.observation[:, 0]:
+            id_counts[int(row_id)] += 1
+
+    # All 90 rows should appear at least once with 30000 attempts
+    missing = [i for i in range(90) if i not in id_counts]
+    assert len(missing) == 0, f"Rows never sampled: {missing}"
+
+    # Per-file check: each file (0-29, 30-59, 60-89) gets ~1/3 of samples
+    thirds = [sum(c for rid, c in id_counts.items() if start <= rid < start + 30)
+              for start in (0, 30, 60)]
+    total = sum(thirds)
+    for i, label in enumerate(["oldest", "middle", "newest"]):
+        frac = thirds[i] / total
+        assert 0.25 < frac < 0.42, \
+            f"{label} third fraction={frac:.2%} (expected ~33%)"
+
+    batch = buf.sample_uniform(50)
+    assert batch.value.shape[0] >= 30  # generous bound
+
+    buf.close()
+    for f in glob.glob(base.replace(".db", "_*.db")) + [base]:
+        _os.remove(f)
+
+
 if __name__ == "__main__":
     main()

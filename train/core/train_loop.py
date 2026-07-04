@@ -454,6 +454,7 @@ def run_training(
                 f" uniq_ratio={buffer.recent_unique_ratio:.1%}"
                 f"  tags={buffer.tag_counts()}"
                 f"  weak={wstats_summary(cfg)}  "
+                f"{buffer.sample_diag()}  "
                 f"states/s={states_per_s:.1f}  "
                 f"selfplay={selfplay_time:.1f}s  train={train_time:.1f}s"
             )

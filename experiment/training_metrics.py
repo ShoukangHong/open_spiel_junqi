@@ -38,7 +38,7 @@ class StepRecord:
     states: int
     buffer_current: int
     buffer_total: int
-    unique_states: int
+    unique_states: float
     tags_normal: int = 0
     tags_rare: int = 0
     rare_count: int = 0
@@ -83,7 +83,7 @@ _LINE1_RE = re.compile(
     r"games=\s*(?P<games>\d+)\s+"
     r"states=\s*(?P<states>\d+)\s+"
     r"buffer=\s*(?P<buf_cur>\d+)/\s*(?P<buf_total>\d+)\s+"
-    r"unique=\s*(?P<unique>\d+)\s+"
+    r"(?:unique=\s*(?P<unique>\d+)\s+|uniq_ratio=\s*(?P<unique_perc>[\d.]+)%\s+)"
     r"tags=\{(?P<tags>[^}]*)\}\s+"
     r"weak=rare=(?P<rare>\d+)\s+(rf=(?P<rf>\d+)\s+)?"
     r"wf=(?P<wf>\d+)\s+weak=(?P<weak>\d+)\s+"
@@ -189,7 +189,10 @@ def parse_training_log(log_path: str) -> List[StepRecord]:
                     "states": int(d["states"]),
                     "buffer_current": int(d["buf_cur"]),
                     "buffer_total": int(d["buf_total"]),
-                    "unique_states": int(d["unique"]),
+                    "unique_states": (float(d.get("unique_perc") or 0)
+                                      if d.get("unique_perc") is not None
+                                      else int(d["unique"] or 0)
+                                      / max(int(d["buf_cur"] or 1), 1) * 100),
                     "tags_normal": tags_normal,
                     "tags_rare": tags_rare,
                     "rare_count": int(d["rare"]),
@@ -398,12 +401,10 @@ def plot_metrics(records: List[StepRecord], smooth: int = 1,
     # ── (2,0) Buffer health ────────────────────────────────────────────
     ax = axes[2, 0]
     buf_cur = arr("buffer_current")
-    buf_max = np.max(buf_cur)
     unique = arr("unique_states")
-    unique_ratio = unique / np.maximum(buf_cur, 1) * 100
     ax.plot(steps, buf_cur, color="#607D8B", linewidth=1.2, label="buffer")
     ax2 = ax.twinx()
-    ax2.plot(steps, unique_ratio, color="#FF9800", linewidth=1.0, alpha=0.7)
+    ax2.plot(steps, unique, color="#FF9800", linewidth=1.0, alpha=0.7)
     ax2.set_ylabel("Unique %", color="#FF9800")
     ax2.tick_params(axis="y", colors="#FF9800")
     ax2.set_ylim(0, 105)
@@ -537,6 +538,8 @@ def main():
                         help="Path to save the plot (default: <log>_metrics.png)")
     parser.add_argument("--no-plot", action="store_true", default=DEFAULT_NO_PLOT,
                         help="Print table only, skip plot")
+    parser.add_argument("--excel", type=str, default=None,
+                        help="Save parsed data as Excel file")
     args = parser.parse_args()
 
     # Auto-detect log path
@@ -584,6 +587,11 @@ def main():
         output_path = args.output or str(Path(log_path).with_suffix("")) + "_metrics.png"
         plot_metrics(records, smooth=args.smooth, output_path=output_path,
                      elo_pairs=elo_pairs)
+
+    import pandas as pd
+    xlsx_path = args.excel or str(Path(log_path).with_suffix("")) + "_data.xlsx"
+    pd.DataFrame([r.__dict__ for r in records]).to_excel(xlsx_path, index=False)
+    print(f"[metrics] Data saved to {xlsx_path}")
 
 DEFAULT_LOG = r"C:\Users\shouk\xiangqi_train\cloud_new\train.log"
 DEFAULT_SMOOTH = 1

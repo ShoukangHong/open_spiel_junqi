@@ -25,7 +25,7 @@
     "surprise_val_kl": 0.5,
     "surprise_child_min_n": 150,
 
-    "replay_buffer_size": 10000,
+    "replay_buffer_size": 5000,
     "buffer_sampling_frac": 0.2,
     "symmetry": 4,
 

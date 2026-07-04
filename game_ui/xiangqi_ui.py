@@ -21,8 +21,8 @@ from train.core.model_builder import build_xiangqi_model
 
 # ── Config ──────────────────────────────────────────────────────────────────
 CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_new"
-CHECKPOINT_STEP = 180
-MCTS_SIMULATIONS = 600
+CHECKPOINT_STEP = 295
+MCTS_SIMULATIONS = 2000
 HINT_MAX_SIM = 10000
 INFERENCE_BATCH_SIZE = 10  # shared by MCTS and AlphaBeta
 UCT_C = 4.0
@@ -32,6 +32,7 @@ PROBE_SURPRISE = 1.0  # Q-drop threshold for probe early termination
 AI_TEMPERATURE = 0.01  # τ for AI move selection (0 = argmax)
 TEMP_DROP = 1         # use τ=0.5 + advantage mixing before this move
 SAVE_DIR = os.path.join(CHECKPOINT_DIR, "saved_positions")
+OPENING_DIR = os.path.join(CHECKPOINT_DIR, "opening_book")
 POLICY_EPSILON = 0.0  # Dirichlet noise weight for AI/hint search
 POLICY_ALPHA = 0.25     # Dirichlet concentration parameter
 AB_DEPTH = 3           # alpha-beta search depth
@@ -74,7 +75,7 @@ def draw_panel(screen, cur_player, message="", value=None, draw_rate=0.0,
         else:
             lines.append(f"Value (red): {bq:+.3f}")
     lines.append(message)
-    lines.append("H: hint  U: undo  F: freeze  A: AB/MCTS  S: save  L: load  R: restart  Q: quit")
+    lines.append("H: hint  U: undo  F: freeze  A: AB/MCTS  S: save  D: opening  L: load  R: restart  Q: quit")
 
     for t in lines:
         surf = font_sm.render(t, True, BLACK)
@@ -232,6 +233,19 @@ def main():
                                 message = f"Saved: {os.path.basename(fpath)}"
                             else:
                                 message = "Save cancelled"
+                        elif event.key == pygame.K_d:
+                            os.makedirs(OPENING_DIR, exist_ok=True)
+                            # Build filename from move coordinates
+                            parts = []
+                            for a in state.history():
+                                fr, fc = divmod(a // 90, 9)
+                                tr, tc = divmod(a % 90, 9)
+                                parts.append(f"{fr}{fc}{tr}{tc}")
+                            fname = "-".join(parts) + ".txt" if parts else "initial.txt"
+                            fpath = os.path.join(OPENING_DIR, fname)
+                            with open(fpath, "w") as _f:
+                                _f.write(state.serialize())
+                            message = f"Opening saved: {fname}"
                         elif event.key == pygame.K_l:
                             from tkinter import Tk; from tkinter.filedialog import askopenfilename
                             Tk().withdraw()

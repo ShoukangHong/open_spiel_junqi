@@ -50,8 +50,11 @@ class ReplayBuffer:
         self._pending = 0            # unflushed DB inserts
         self._recent_pending = 0
         self._sample_rng = np.random.RandomState()
-        self._stats_total = 0   # samples drawn this step
+        self._stats_total = 0
         self._stats_hashes = set()
+        self._diag_files = {}        # cumulative file→count across all samples
+        self._diag_step_min = 10**9  # min training step seen this step
+        self._diag_step_max = 0      # max training step seen this step
 
         if db_path:
             self._conn = sqlite3.connect(db_path, timeout=30)
@@ -111,9 +114,13 @@ class ReplayBuffer:
                 pass
 
     def _all_db_paths(self):
-        import glob as _glob
+        import glob as _glob, re as _re
         base = self._db_path
-        archived = sorted(_glob.glob(base.replace(".db", "_*.db")), reverse=True)
+        archived = [p for p in _glob.glob(base.replace(".db", "_*.db"))
+                    if _re.search(r'_(\d+)\.db$', p)]
+        # Sort by numeric suffix — string sort fails at 10M (9 > 1)
+        archived.sort(key=lambda p: int(_re.search(r'_(\d+)\.db$', p).group(1)),
+                      reverse=True)
         if os.path.exists(base):
             return [base] + archived
         return archived
@@ -155,28 +162,41 @@ class ReplayBuffer:
                 self._recent_pending = 0
 
     def sample(self, n: int) -> TrainInput:
-        """Weighted random sample — newer rows have higher probability.
+        """Default: linear-weighted sampling."""
+        return self.sample_weighted(n)
 
-        Uses linear weighting: weight ∝ position within the window (0 = oldest
-        in window, w-1 = newest).  Samples via inverse-CDF of pos² distribution.
+    def sample_weighted(self, n: int) -> TrainInput:
+        """Linear-weighted random sample — newer rows have higher probability.
+
+        Weight ∝ position within the window (0 = oldest, w-1 = newest).
+        Samples via inverse-CDF of pos² distribution.
         """
         if self._conn is None:
             raise RuntimeError("sample() requires a DB-backed buffer")
-
-        w = min(self._total, self._max_size)  # window size
+        w = min(self._total, self._max_size)
         if w == 0:
             raise RuntimeError("buffer is empty")
-
-        # Linear-weight inverse CDF: pos ~ sqrt(uniform)
         u = self._sample_rng.random(n).astype(np.float64)
-        pos = (np.sqrt(u * w * (w + 1) + 0.25) - 0.5)
-        pos = np.clip(pos.astype(np.int64), 0, w - 1)
+        pos = np.clip((np.sqrt(u * w * (w + 1) + 0.25) - 0.5).astype(np.int64),
+                       0, w - 1)
+        start_abs = max(0, self._total - w)
+        abs_ids = (start_abs + pos + 1).tolist()
+        return self._sample_by_ids(abs_ids)
 
-        # Map window positions → absolute row IDs (1-based across all files)
-        start_abs = max(0, self._total - w)  # oldest global offset in window
-        abs_ids = (start_abs + pos + 1).tolist()  # 1-based global
+    def sample_uniform(self, n: int) -> TrainInput:
+        """Uniform random sample from the buffer window."""
+        if self._conn is None:
+            raise RuntimeError("sample() requires a DB-backed buffer")
+        w = min(self._total, self._max_size)
+        if w == 0:
+            raise RuntimeError("buffer is empty")
+        start_abs = max(0, self._total - w)
+        abs_ids = (start_abs
+                   + self._sample_rng.randint(1, w + 1, size=n)).tolist()
+        return self._sample_by_ids(abs_ids)
 
-        # Build (path → row_count) — oldest first (ID grows with time)
+    def _sample_by_ids(self, abs_ids):
+        """Query rows by global IDs across all DB files, unpack, track stats."""
         paths = list(reversed(self._all_db_paths()))
         file_sizes = []
         for p in paths:
@@ -192,8 +212,7 @@ class ReplayBuffer:
                 if close_after:
                     conn.close()
 
-        # Map absolute IDs → (path, local_id), group by path
-        file_ofs = {}  # path → [local_id, ...]
+        file_ofs = {}
         for a_id in abs_ids:
             remain = a_id
             for p, cnt in file_sizes:
@@ -202,8 +221,9 @@ class ReplayBuffer:
                     break
                 remain -= cnt
 
-        # Query each file
         rows = []
+        file_counts = []
+        step_vals = []
         temp_conns = []
         for p, local_ids in file_ofs.items():
             conn = self._conn if p == self._db_path else sqlite3.connect(p)
@@ -211,29 +231,51 @@ class ReplayBuffer:
                 temp_conns.append(conn)
             placeholders = ",".join("?" for _ in local_ids)
             file_rows = conn.execute(
-                f"SELECT obs, mask, policy, value FROM states "
+                f"SELECT obs, mask, policy, value, step FROM states "
                 f"WHERE id IN ({placeholders})",
                 local_ids).fetchall()
             rows.extend(file_rows)
+            fname = os.path.basename(p)
+            file_counts.append((fname, len(file_rows)))
+            step_vals.extend(r[4] for r in file_rows)
 
         for c in temp_conns:
             try: c.close()
             except: pass
 
         obs_l, mask_l, pol_l, val_l = [], [], [], []
-        for obs_b, mask_b, pol_b, val_b in rows:
+        for obs_b, mask_b, pol_b, val_b, step_b in rows:
             obs_l.append(_unpack(obs_b, np.float32))
             mask_l.append(_unpack(mask_b, bool))
             pol_l.append(_unpack(pol_b, np.float32))
             val_l.append(_unpack(val_b, np.float32))
             self._stats_total += 1
             self._stats_hashes.add(hash(obs_b))
+        # Accumulate diagnostic stats across all sample() calls in this step
+        for fname, cnt in file_counts:
+            self._diag_files[fname] = self._diag_files.get(fname, 0) + cnt
+        if step_vals:
+            self._diag_step_min = min(self._diag_step_min, min(step_vals))
+            self._diag_step_max = max(self._diag_step_max, max(step_vals))
+
         return TrainInput(
             observation=np.stack(obs_l),
             legals_mask=np.stack(mask_l),
             policy=np.stack(pol_l),
             value=np.stack(val_l),
         )
+
+    def sample_diag(self) -> str:
+        """One-line diagnostic — cumulative file/step stats, resets on read."""
+        if not self._diag_files:
+            return "diag=(no data)"
+        files = " ".join(f"{f}={c}" for f, c in sorted(self._diag_files.items()))
+        smin, smax = self._diag_step_min, self._diag_step_max
+        step_r = f"step[{smin}-{smax}]" if smin <= smax else "step[empty]"
+        self._diag_files.clear()
+        self._diag_step_min = 10**9
+        self._diag_step_max = 0
+        return f"diag=({step_r}  files: {files})"
 
     _STATS_WINDOW = 50000
 
@@ -267,7 +309,7 @@ class ReplayBuffer:
         if self._count_current() < self._max_db_rows:
             return
         self._conn.close()
-        suffix = self._total - self._max_db_rows
+        suffix = self._total  # monotonic, never conflicts with existing archives
         rotated = self._db_path.replace(".db", f"_{suffix}.db")
         os.rename(self._db_path, rotated)
         self._conn = sqlite3.connect(self._db_path, timeout=30)
