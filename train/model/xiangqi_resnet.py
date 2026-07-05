@@ -104,7 +104,8 @@ class XiangqiResNet(nn.Module):
             value: (3,) numpy array (softmaxed WDL).
             policy: (output_size,) numpy array (softmax over legal actions).
         """
-        self.eval()
+        if self.training:
+            self.eval()
         with torch.no_grad(), torch.cuda.amp.autocast(
                 enabled=(self.device.type == "cuda")):
             obs_t = torch.from_numpy(
@@ -140,7 +141,8 @@ class XiangqiResNet(nn.Module):
         For server-side inference where softmax is deferred to scatter phase.
         Uses FP16 autocast on CUDA for speed; clamps to prevent NaN propagation.
         """
-        self.eval()
+        if self.training:
+            self.eval()
         with torch.no_grad(), torch.cuda.amp.autocast(
                 enabled=(self.device.type == "cuda")):
             obs_t = torch.from_numpy(
@@ -169,7 +171,8 @@ class XiangqiResNet(nn.Module):
             values: (batch, 3) numpy array
             policies: (batch, 8100) numpy array
         """
-        self.eval()
+        if self.training:
+            self.eval()
         with torch.no_grad(), torch.cuda.amp.autocast(
                 enabled=(self.device.type == "cuda")):
             obs_t = torch.from_numpy(

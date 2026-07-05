@@ -112,7 +112,8 @@ class OthelloResNet(nn.Module):
             value: float
             policy: (output_size,) numpy array (softmax over legal actions).
         """
-        self.eval()
+        if self.training:
+            self.eval()
         with torch.no_grad():
             obs_t = torch.from_numpy(
                 np.ascontiguousarray(observation, dtype=np.float32)).to(self.device)
@@ -140,7 +141,8 @@ class OthelloResNet(nn.Module):
 
     def batch_forward_raw(self, observations: np.ndarray) -> np.ndarray:
         """Forward only — returns (policy_logits, value_logits), no softmax."""
-        self.eval()
+        if self.training:
+            self.eval()
         with torch.no_grad():
             obs_t = torch.from_numpy(
                 np.ascontiguousarray(observations, dtype=np.float32)).to(self.device)
@@ -169,7 +171,8 @@ class OthelloResNet(nn.Module):
             values: (batch,) numpy array
             policies: (batch, output_size) numpy array
         """
-        self.eval()
+        if self.training:
+            self.eval()
         with torch.no_grad():
             obs_t = torch.from_numpy(
                 np.ascontiguousarray(observations, dtype=np.float32)).to(self.device)

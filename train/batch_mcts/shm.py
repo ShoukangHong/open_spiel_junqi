@@ -220,23 +220,3 @@ class ServerShm:
         val = np.frombuffer(self._shm.buf, dtype=np.float32,
                             count=n * 3, offset=val_start)
         return pol.reshape(n, self._pol_flat), val.reshape(n, 3)
-python -c "
-import sys, os
-# Same dir as pytest would use
-sys.path.insert(0, os.getcwd())
-import pyspiel
-print('pyspiel:', pyspiel.__file__)
-g = pyspiel.load_game('xiangqi')
-print('obs_shape:', g.observation_tensor_shape())
-# Also check the flat size
-s = g.new_initial_state()
-obs = s.observation_tensor()
-print('obs flat:', len(obs))
-# Any open_spiel python wrapper?
-if 'open_spiel' in sys.modules:
-  print('open_spiel already imported')
-# Check for shadowing
-import importlib
-spec = importlib.util.find_spec('pyspiel')
-print('spec:', spec)
-"

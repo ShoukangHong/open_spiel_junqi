@@ -18,6 +18,7 @@ import pyspiel
 from train.batch_mcts.config import MCTSConfig
 from train.batch_mcts.evaluator import PyTorchEvaluator
 from train.batch_mcts.mcts import BatchMCTS
+from train.batch_mcts.shared_evaluator import fast_legal_mask
 from train.model.othello_resnet import Model, OthelloResNet
 
 # ── Module-level caches (reused across run_match calls) ──────────────────────
@@ -105,7 +106,7 @@ def _act(player_cfg, state, move_num, temperature, temp_drop):
 
     if strategy == "model":
         obs = np.asarray(state.observation_tensor(), dtype=np.float32)
-        mask = np.asarray(state.legal_actions_mask(), dtype=bool)
+        mask = fast_legal_mask(state, state.get_game().num_distinct_actions())
         _, policy = _model_for(player_cfg).inference(obs, mask)
         probs = np.array([policy[a] for a in legal])
         tau = 2/3 if move_num < temp_drop else temperature

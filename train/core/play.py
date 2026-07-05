@@ -7,6 +7,7 @@ including weak-move exploration, rare-case forking, and early pruning.
 import numpy as np
 
 from train.batch_mcts.mcts import compute_solved_policy
+from train.batch_mcts.shared_evaluator import fast_legal_mask
 from train.core.policy import mix_advantage
 from train.core.weak_move import try_weak_move
 from train.core.surprise import detect_surprise
@@ -178,7 +179,7 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
                     f"Q={root.q_value:+.3f} — early win\n{state}")
             # Record pruned state before exiting
             obs = np.asarray(state.observation_tensor(), dtype=np.float32)
-            mask = np.asarray(state.legal_actions_mask(), dtype=bool)
+            mask = fast_legal_mask(state, game.num_distinct_actions())
             policy_dict = compute_solved_policy(
                 root.children, cur_player, game.max_utility(),
                 root_visits=root.explore_count)
@@ -242,7 +243,7 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
                                    config.adv_temperature)
 
         obs = np.asarray(state.observation_tensor(), dtype=np.float32)
-        mask = np.asarray(state.legal_actions_mask(), dtype=bool)
+        mask = fast_legal_mask(state, game.num_distinct_actions())
         if root.outcome is not None:
             q = root.outcome[cur_player]
             dr = 1.0 if q == 0 else 0.0
@@ -267,7 +268,7 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
                     cq, cdr = _stable_qdr(child)
                     cs = child.state
                     c_obs = np.asarray(cs.observation_tensor(), dtype=np.float32)
-                    c_mask = np.asarray(cs.legal_actions_mask(), dtype=bool)
+                    c_mask = fast_legal_mask(cs, game.num_distinct_actions())
                     c_pol = np.zeros(game.num_distinct_actions(), dtype=np.float32)
                     solved = compute_solved_policy(
                         child.children, cs.current_player(), game.max_utility(),

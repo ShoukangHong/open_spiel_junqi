@@ -13,6 +13,7 @@ import numpy as np
 from open_spiel.python.algorithms import mcts as orig_mcts
 import pyspiel
 from open_spiel.python.utils import lru_cache
+from train.batch_mcts.shared_evaluator import fast_legal_mask
 
 # Re-export original classes
 Evaluator = orig_mcts.Evaluator
@@ -122,16 +123,16 @@ class PyTorchEvaluator(BatchEvaluator):
 
     def _make_cache_key(self, state):
         obs = np.asarray(state.observation_tensor(), dtype=np.float32)
-        mask = np.asarray(state.legal_actions_mask(), dtype=bool)
+        mask = fast_legal_mask(state, self._output_size)
         return obs.tobytes() + mask.tobytes()
 
     def _inference(self, state):
-        key = self._make_cache_key(state)
+        obs = np.asarray(state.observation_tensor(), dtype=np.float32)
+        mask = fast_legal_mask(state, self._output_size)
+        key = obs.tobytes() + mask.tobytes()
         value, policy = self._cache.make(
             key,
-            lambda: self._model.inference(
-                np.asarray(state.observation_tensor(), dtype=np.float32),
-                np.asarray(state.legal_actions_mask(), dtype=bool)),
+            lambda: self._model.inference(obs, mask.copy()),
         )
         return value, policy
 
@@ -178,11 +179,15 @@ class PyTorchEvaluator(BatchEvaluator):
 
         obs_list = []
         mask_list = []
+        legals_list = []
         for state in states:
             obs_list.append(
                 np.asarray(state.observation_tensor(), dtype=np.float32))
-            mask_list.append(
-                np.asarray(state.legal_actions_mask(), dtype=bool))
+            legal = state.legal_actions()
+            legals_list.append(legal)
+            m = np.zeros(self._output_size, dtype=bool)
+            m[legal] = True
+            mask_list.append(m)
 
         obs_batch = np.stack(obs_list, axis=0)
         mask_batch = np.stack(mask_list, axis=0)
@@ -190,8 +195,7 @@ class PyTorchEvaluator(BatchEvaluator):
         values, policies = self._model.batch_inference(obs_batch, mask_batch)
 
         prior_list = []
-        for state, policy_arr in zip(states, policies):
-            legal = state.legal_actions()
+        for state, policy_arr, legal in zip(states, policies, legals_list):
             probs = policy_arr[legal]
             prior_list.append(
                 list(zip(legal, probs.astype(float).tolist())))

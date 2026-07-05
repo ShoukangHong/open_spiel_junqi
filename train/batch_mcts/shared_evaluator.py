@@ -63,7 +63,7 @@ class SharedEvaluator:
 
     def _infer_one(self, state):
         obs = np.asarray(state.observation_tensor(), dtype=np.float32)
-        mask = np.asarray(state.legal_actions_mask(), dtype=bool)
+        mask = fast_legal_mask(state, self._game.num_distinct_actions())
         obs_b = obs.reshape(1, -1)
         mask_b = mask.reshape(1, -1)
         self._send((obs_b, mask_b))
@@ -77,8 +77,8 @@ class SharedEvaluator:
 
         obs_list = [np.asarray(s.observation_tensor(), dtype=np.float32)
                     for s in states]
-        mask_list = [np.asarray(s.legal_actions_mask(), dtype=bool)
-                     for s in states]
+        num_act = self._game.num_distinct_actions()
+        mask_list = [fast_legal_mask(s, num_act) for s in states]
         obs_b = np.stack(obs_list, axis=0)
         mask_b = np.stack(mask_list, axis=0)
 
