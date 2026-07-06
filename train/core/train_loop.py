@@ -60,11 +60,11 @@ def compute_alpha(step_index: int, game_length: int, offset: int,
     """
     if step_index == game_length - 1:
         return 1.0
-    denom = max(offset + game_length - 1 - temperature_drop, 1)
+    denom = max(offset + game_length - 1, 1)
     step_pos = offset + step_index
     if step_pos < temperature_drop:
         return 0.0
-    return min((step_pos - temperature_drop) / denom, 1.0)
+    return min(step_pos / denom, 1.0)
 
 
 def _mcts_wdl(q_value, draw_rate):
@@ -305,6 +305,15 @@ def run_training(
         server.register_model("best", best_sd, cfg.nn_width, cfg.nn_depth)
         server.register_model("random_opp", model._model.state_dict(),
                               cfg.nn_width, cfg.nn_depth)
+        server.register_model("m0", model._model.state_dict(),
+                              cfg.nn_width, cfg.nn_depth)
+        server.register_model("m1", model._model.state_dict(),
+                              cfg.nn_width, cfg.nn_depth)
+        # GPU0: reserve eval actor slots (shared server, no extra GPU process)
+        if gpu_id == 0:
+            eval_n = getattr(cfg, 'eval_num_actors', 10)
+            server.reserve_eval_actors(eval_n, cfg.mcts_batch_size,
+                                       obs_flat, mask_flat, mask_flat)
         server.start(cfg.game, cfg.inference_batch_size)
         servers.append((server, a_start, a_end, gpu_id))
 
@@ -326,6 +335,7 @@ def run_training(
             actors.append((p, state_q))
     _log(f"[train] {len(actors)} actors on {len(servers)} GPU(s)"
          f" ({actors_per_gpu} each)")
+    run_training._eval_server = servers[0][0] if servers else None
 
     # ── Opening book ────────────────────────────────────────────────────
     opening_book = None
@@ -453,7 +463,7 @@ def run_training(
             train_time = time.time() - train_t0
 
             elapsed = time.time() - t0
-            states_per_s = total_states / max(selfplay_time, 0.001)
+            states_per_s = total_states / max(elapsed, 0.001)
 
             # ── Logging ────────────────────────────────────────────────
             log_line = (
