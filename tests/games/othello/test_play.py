@@ -203,6 +203,11 @@ def _fake_root(q=0.5, outcome=None, draw_rate=0.0):
     r.q_value = q
     r.outcome = outcome
     r.draw_rate = draw_rate
+    r.children = []       # triggers _stable_qdr fallback path
+    r.explore_count = 10
+    r.total_reward = q * r.explore_count
+    r.state = None        # so outcome branch uses root.player
+    r.player = 0
     return r
 
 

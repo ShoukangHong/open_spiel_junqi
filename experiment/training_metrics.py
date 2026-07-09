@@ -71,6 +71,9 @@ class StepRecord:
     p0_pct: float = 0.0
     p1_pct: float = 0.0
     draw_pct: float = 0.0
+    diag_total: float = 0.0       # total rows sampled this step
+    diag_smin: int = 0            # earliest training step sampled
+    diag_smax: int = 0            # latest training step sampled
 
 
 # ---------------------------------------------------------------------------
@@ -90,9 +93,15 @@ _LINE1_RE = re.compile(
     r"\(\d+d games\)\s+\|\s+"
     r"rare/g=(?P<rare_g>[\d.]+)\s+(rf/g=(?P<rf_g>[\d.]+)\s+)?"
     r"wf/g=(?P<wf_g>[\d.]+)\s+weak/g=(?P<weak_g>[\d.]+)\s+"
+    r"(?:diag=\S+(?:\s+\S+)*\s+)?"
     r"states/s=(?P<sps>[\d.]+)\s+"
     r"selfplay=(?P<selfplay>[\d.]+)s\s+"
     r"train=(?P<train>[\d.]+)s"
+)
+
+_DIAG_RE = re.compile(
+    r"diag=\(step\[(?P<diag_smin>\d+)-(?P<diag_smax>\d+)\]\s+"
+    r"files:\s+(?P<files>[^)]+)\)"
 )
 
 # First line: buffer replay training
@@ -132,9 +141,13 @@ _LINE2_RE = re.compile(
 _CKPT_RE = re.compile(r"\[checkpoint\]\s+Saved.*checkpoint-(?P<step>\d+)\.pt")
 
 
-def parse_training_log(log_path: str) -> List[StepRecord]:
-    """Parse a train.log file, returning one StepRecord per step."""
+def parse_training_log(log_path: str) -> tuple:
+    """Parse a train.log file, returning (records, file_data).
+
+    file_data: dict step → list of (filename, count) per step.
+    """
     records: List[StepRecord] = []
+    file_data: dict = {}   # step → [(fname, count), ...]
     pending: Optional[dict] = None  # step line waiting for its loss line
 
     with open(log_path, encoding="utf-8", errors="replace") as f:
@@ -207,6 +220,24 @@ def parse_training_log(log_path: str) -> List[StepRecord]:
                     "selfplay_s": float(d["selfplay"]),
                     "train_s": float(d["train"]),
                 }
+                # Extract diag data from same line
+                dm = _DIAG_RE.search(line)
+                if dm:
+                    fd = dm.groupdict()
+                    pending["diag_smin"] = int(fd["diag_smin"])
+                    pending["diag_smax"] = int(fd["diag_smax"])
+                    step = int(d["step"])
+                    file_list = []
+                    for part in fd["files"].split():
+                        if "=" in part:
+                            fname, cnt = part.split("=")
+                            file_list.append((fname, int(cnt)))
+                    file_data[step] = file_list
+                    pending["diag_total"] = sum(c for _, c in file_list)
+                else:
+                    pending["diag_smin"] = 0
+                    pending["diag_smax"] = 0
+                    pending["diag_total"] = 0.0
                 continue
 
             m2 = _LINE2_RE.search(line)
@@ -237,7 +268,7 @@ def parse_training_log(log_path: str) -> List[StepRecord]:
                 records.append(r)
                 pending = None
 
-    return records
+    return records, file_data
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +293,8 @@ def moving_average(values: np.ndarray, window: int) -> np.ndarray:
 
 def plot_metrics(records: List[StepRecord], smooth: int = 1,
                  output_path: Optional[str] = None,
-                 elo_pairs: Optional[list] = None):
+                 elo_pairs: Optional[list] = None,
+                 file_data: Optional[dict] = None):
     """Produce a 3x4 multi-panel dashboard of training metrics."""
     steps = np.array([r.step for r in records])
     if len(steps) < 2:
@@ -452,6 +484,32 @@ def plot_metrics(records: List[StepRecord], smooth: int = 1,
                 transform=ax.transAxes, color="gray")
         ax.set_title("Elo Rating")
 
+    # ── (2,3) Diag: per-file sample counts ──────────────────────────────
+    ax = axes[2, 3]
+    if file_data:
+        all_files = sorted(set(
+            f for files in file_data.values() for f, _ in files))
+        colors = plt.cm.tab20(np.linspace(0, 1, max(len(all_files), 1)))
+        file_colors = dict(zip(all_files, colors))
+        for fname in all_files:
+            xs, ys = [], []
+            for r in sorted(records, key=lambda r: r.step):
+                if r.step in file_data:
+                    for f, c in file_data[r.step]:
+                        if f == fname:
+                            xs.append(r.step)
+                            ys.append(c / 1000)
+                            break
+            if ys and max(ys) > 0:
+                ax.plot(xs, ys, label=fname.replace("buffer", ""),
+                        color=file_colors[fname], linewidth=1.0, alpha=0.8)
+        ax.legend(fontsize=6, ncol=1, loc="upper left")
+        ax.set_title("DB rows sampled (k)")
+    else:
+        ax.text(0.5, 0.5, "no diag data", ha="center", va="center",
+                transform=ax.transAxes, color="gray")
+        ax.set_title("DB rows sampled")
+
     for ax_row in axes.flat:
         ax_row.set_xlabel("step")
         ax_row.set_xlim(steps[0], steps[-1])
@@ -551,7 +609,7 @@ def main():
         print("[metrics] No log file found. Specify --log PATH.")
         sys.exit(1)
 
-    records = parse_training_log(log_path)
+    records, file_data = parse_training_log(log_path)
     if not records:
         print("[metrics] No training step lines found in log.")
         sys.exit(1)
@@ -586,14 +644,14 @@ def main():
 
         output_path = args.output or str(Path(log_path).with_suffix("")) + "_metrics.png"
         plot_metrics(records, smooth=args.smooth, output_path=output_path,
-                     elo_pairs=elo_pairs)
+                     elo_pairs=elo_pairs, file_data=file_data)
 
     import pandas as pd
     xlsx_path = args.excel or str(Path(log_path).with_suffix("")) + "_data.xlsx"
     pd.DataFrame([r.__dict__ for r in records]).to_excel(xlsx_path, index=False)
     print(f"[metrics] Data saved to {xlsx_path}")
 
-DEFAULT_LOG = r"C:\Users\shouk\xiangqi_train\cloud_new\train.log"
+DEFAULT_LOG = r"C:\Users\shouk\xiangqi_train\cloud_buf\train.log"
 DEFAULT_SMOOTH = 1
 DEFAULT_NO_PLOT = False
 

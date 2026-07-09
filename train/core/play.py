@@ -60,26 +60,32 @@ def assign_players(rng, mcts_main, mcts_best, mcts_opp=None,
 
 
 def _stable_qdr(root):
-    """Q and draw_rate from children with >1 visit, excluding forced-explore noise.
+    """Q and draw_rate from well-explored children only.
 
-    Root children that were visited only once (e.g. uniform-expand coverage)
-    add noise to the value target.  Filtering them out gives a stabler V.
-    If the node is proven (outcome set), use that directly.
+    Children below 10% of the max visit count are treated as noise and excluded.
+    Falls back to root.q_value / root.draw_rate when no child qualifies.
     """
     if root.outcome is not None:
         s = root.state
         p = s.current_player() if s is not None and not s.is_terminal() else root.player
         q = root.outcome[p]
         return q, 1.0 if q == 0 else 0.0
-    valid = [c for c in root.children if c.explore_count > 1]
+    if not root.children:
+        return root.q_value, root.draw_rate
+    max_n = max(c.explore_count for c in root.children)
+    if max_n == 0:
+        return root.q_value, root.draw_rate
+    threshold = max_n * 0.1
+    if max_n > 1:
+        threshold = max(threshold, 1.0)
+    valid = [c for c in root.children if c.explore_count > threshold]
     if valid:
         total_n = sum(c.explore_count for c in valid)
-        q = sum(c.total_reward for c in valid) / total_n
-        dr = sum(c.draw_reward for c in valid) / total_n
-    else:
-        q = root.q_value
-        dr = root.draw_rate
-    return q, dr
+        if total_n > 0:
+            q = sum(c.total_reward for c in valid) / total_n
+            dr = sum(c.draw_reward for c in valid) / total_n
+            return q, dr
+    return root.q_value, root.draw_rate
 
 
 def _should_prune(pruned, root, cur_player, config, max_utility, dice):
@@ -92,9 +98,9 @@ def _should_prune(pruned, root, cur_player, config, max_utility, dice):
         return pruned, False
 
     proven_win = root.outcome is not None and root.outcome[cur_player] > 0
-    high_q = root.q_value >= config.prune_threshold * max_utility
-    draw_rate = getattr(root, 'draw_rate', 0.0) or 0.0
-    high_draw = draw_rate >= config.prune_threshold
+    q, dr = _stable_qdr(root)
+    high_q = q >= config.prune_threshold * max_utility
+    high_draw = dr >= config.prune_threshold
 
     qualifies = proven_win or high_q or high_draw
     if not qualifies:

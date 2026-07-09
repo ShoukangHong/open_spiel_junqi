@@ -268,23 +268,14 @@ def test_stable_qdr():
 
 
 def test_stable_qdr_fallback():
-    """_stable_qdr falls back to root values when no child has >1 visit."""
+    """_stable_qdr falls back to root values when no child qualifies."""
     root = Node(None, 0, 1.0)
     root.explore_count = 5
     root.total_reward = 2.0
     root.draw_reward = 0.5
 
-    c1 = Node(1, 0, 0.5)
-    c1.explore_count = 1
-    c1.total_reward = 0.0
-    root.children.append(c1)
-
-    c2 = Node(2, 0, 0.5)
-    c2.explore_count = 0
-    root.children.append(c2)
-
+    # max_n=0 → immediate fallback before threshold check
     q, dr = _stable_qdr(root)
-    # No valid child → fallback to root
     assert q == root.q_value and dr == root.draw_rate, \
         f"expected fallback to root Q/DR, got q={q} dr={dr}"
 

@@ -309,7 +309,7 @@ def main():
     plot_elo(trajectories, args.rounds, output_path)
 
 
-DEFAULT_LOG = r"C:\Users\shouk\othello_train\cloud_wdl_128\train.log"
+DEFAULT_LOG = r"C:\Users\shouk\xiangqi_train\cloud_new\train.log"
 DEFAULT_ROUNDS = 5000
 DEFAULT_GAMES_PER_PAIR = 100
 DEFAULT_K = 16

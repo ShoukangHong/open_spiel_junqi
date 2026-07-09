@@ -341,10 +341,18 @@ class ReplayBuffer:
                 conn.close()
                 continue
             conn.execute("DELETE FROM states WHERE step > ?", (target_step,))
+            # Reset autoincrement so subsequent inserts don't leave a gap
+            max_id = conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM states").fetchone()[0]
+            conn.execute(
+                "UPDATE sqlite_sequence SET seq = ? WHERE name = 'states'",
+                (max_id,))
             conn.commit()
             conn.close()
         if self._recent_conn:
             self._recent_conn.execute("DELETE FROM states")
+            self._recent_conn.execute(
+                "UPDATE sqlite_sequence SET seq = 0 WHERE name = 'states'")
             self._recent_conn.commit()
         self._sync_total()
 

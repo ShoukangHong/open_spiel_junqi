@@ -220,14 +220,12 @@ def run_eval_background(cfg_path, current_step, ref_steps, num_games,
                         num_actors=10, temperature=None, temp_drop=None,
                         inference_batch_size=128):
     """Run model-vs-model eval against multiple references (background)."""
-    import platform
-    if platform.system() == "Windows":
-        from train.eval_match import run_match as _run
-        _kwargs = {}
-    else:
-        from train.eval_match import run_match_parallel as _run
-        _kwargs = {"num_actors": num_actors,
-                   "inference_batch_size": inference_batch_size}
+    from train.eval_match import run_match_parallel as _run
+    from train.core.train_loop import run_training
+    existing = getattr(run_training, '_eval_server', None)
+    _kwargs = {"num_actors": num_actors,
+               "inference_batch_size": inference_batch_size,
+               "existing_server": existing}
 
     # Read training config to match MCTS settings
     import json
@@ -240,6 +238,7 @@ def run_eval_background(cfg_path, current_step, ref_steps, num_games,
         temperature = tc.get("temperature", 0.1)
     if temp_drop is None:
         temp_drop = tc.get("temperature_drop", 25)
+    temp_drop = 5  # eval: short warmup, switch to deterministic early
     mcts_cfg = {"strategy": "mcts",
                 "checkpoint_dir": cfg_path,
                 "mcts_simulations": tc.get("max_simulations", 128),
@@ -288,6 +287,12 @@ def run_eval_background(cfg_path, current_step, ref_steps, num_games,
                                  f"(WR={wr:.1%} vs old step{old_best})")
             except (ValueError, OSError):
                 pass
+
+    # Release cached models from this eval run (avoid OOM from stale checkpoints)
+    from train.eval_match import _models, _mcts_bots, _mcts_evaluators
+    _models.clear()
+    _mcts_bots.clear()
+    _mcts_evaluators.clear()
 
 
 def _load_config(path, config_class):

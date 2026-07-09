@@ -408,3 +408,20 @@ Python import 优先级 `dist-packages` > 当前目录。
 **教训**：编译型 Python 模块（.so/.pyd）可能存在多份副本。排查 shape 不匹配问题时，
 首先检查 `pyspiel.__file__` 而不是 `pyspiel.load_game().observation_tensor_shape()`——
 后者在同一个模块里内部一致，不会暴露加载了错误副本的问题。
+
+### 45. Eval 动作选择未使用 compute_solved_policy（严重）
+
+`_act_parallel` 和 `_act` 中 MCTS 搜索后直接用 `select_action_with_adv(root, ...)`，
+该函数基于 raw visit count 构建 policy。Solver 已证明某走法必胜时，该走法可能
+visit 不高（solver 停止探索子节点），导致绝杀走法不被优先选择。
+
+训练代码（`play.py`）使用 `compute_solved_policy()` 构建 solver-aware policy：
+被证明必胜/必败的走法获得加权，绝杀不会漏掉。Eval 长期未同步此逻辑。
+
+**影响**：eval 中 MCTS 不走绝杀，模型胜率差异被稀释。即便模型实力差距大，
+eval 结果也接近 55:45。
+**修复**：`_act_parallel` 和 `_act` 中添加 `compute_solved_policy()` 调用，
+将 `solved` 作为 `base_policy` 传入 `select_action_with_adv`。
+**教训**：任何基于 MCTS 根节点选动作的代码路径，都必须使用
+`compute_solved_policy` 而非裸 visit count。这个函数是 solver 信息和
+动作选择的唯一正确桥梁。

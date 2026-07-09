@@ -142,18 +142,30 @@ class SharedEvaluator:
 
 # ── GPU Inference Server ────────────────────────────────────────────────────
 
-_MAX_WAIT = 0.010  # unused, kept for reference
+_MAX_WAIT = 0.010
 
 
 def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
                build_model_fn=None, actor_shms=None, server_shm=None,
-               gpu_id=0):
+               gpu_id=0, pin_cpu=True, log_dir=None):
     """GPU inference process with multi-model support.
 
     *actor_shms*: dict actor_id → ActorShm (input buffers).
     *server_shm*: ServerShm — single shared output buffer for all actors.
     """
     import os as _os
+
+    # ── Log file ────────────────────────────────────────────────────────────
+    _log_f = None
+    if log_dir:
+        _log_f = open(_os.path.join(log_dir, f"server_gpu{gpu_id}.log"), "a",
+                       buffering=1)  # line-buffered
+
+    def _srv_log(msg):
+        print(msg, flush=True)
+        if _log_f is not None:
+            _log_f.write(msg + "\n")
+            _log_f.flush()
 
     # ── Bind to specific GPU ────────────────────────────────────────────────
     import torch as _torch
@@ -175,16 +187,16 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
     except Exception:
         pass  # non-root — try CPU affinity fallback
 
-    try:
-        allowed = sorted(_os.sched_getaffinity(0))
-        if len(allowed) >= 4:
-            # Pin to distinct core per GPU (high end; actors use the rest)
-            core = allowed[-(1 + gpu_id)]
-            _os.sched_setaffinity(0, {core})
-            print(f"[inf-srv GPU{gpu_id}] CPU affinity: core {core} "
-                  f"(of {len(allowed)} available)", flush=True)
-    except Exception as _e:
-        print(f"[inf-srv GPU{gpu_id}] CPU affinity failed: {_e}", flush=True)
+    if pin_cpu:
+        try:
+            allowed = sorted(_os.sched_getaffinity(0))
+            if len(allowed) >= 4:
+                core = allowed[-(1 + gpu_id)]
+                _os.sched_setaffinity(0, {core})
+                print(f"[inf-srv GPU{gpu_id}] CPU affinity: core {core} "
+                      f"(of {len(allowed)} available)", flush=True)
+        except Exception as _e:
+            print(f"[inf-srv GPU{gpu_id}] CPU affinity failed: {_e}", flush=True)
 
     import pyspiel
     if build_model_fn is None:
@@ -233,17 +245,17 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
     _srv_proc = psutil.Process() if _has_psutil else None
     if _srv_proc:
         _srv_proc.cpu_percent()  # warmup: first call returns 0
+    # Per-model pending queues + stats
+    from collections import defaultdict
+    pending = defaultdict(list)
     int_batches = 0
     int_states = 0
     int_fwd_ms = 0.0
     int_collect_ms = 0.0
     int_scatter_ms = 0.0
+    _mdl_states = defaultdict(int)
     last_report = time.time()
     report_interval = 15.0  # seconds, doubles each report up to 32 min
-
-    # Per-model pending queues with arrival timestamps
-    from collections import defaultdict
-    pending = defaultdict(list)
 
     def _req_n(req):
         return req[4] if req[4] is not None else len(req[2])
@@ -262,6 +274,22 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
         if msg == "__STOP__":
             return True
 
+        # Eval: server loads checkpoint from disk
+        if isinstance(msg, tuple) and len(msg) == 4 \
+                and msg[1] == "load":
+            mid, _, ckpt_path, mb = msg
+            if mid in models:
+                ckpt = _torch.load(ckpt_path, map_location="cuda",
+                                   weights_only=False)
+                target = getattr(models[mid], '_model', models[mid])
+                if hasattr(target, 'load_state_dict'):
+                    target.load_state_dict(ckpt["model_state_dict"])
+            if mb != _cfg["max_batch"]:
+                _cfg["max_batch"] = mb
+                _cfg["obs_buf"] = np.empty((mb, obs_dim), dtype=np.float32)
+            return False
+
+        # Training: state_dict passed directly
         if isinstance(msg, tuple) and len(msg) == 3 \
                 and isinstance(msg[1], dict):
             mid, sd, mb = msg
@@ -334,7 +362,7 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
             wait_ms = (now - reqs[0][0]) * 1000
             n_s = sum(_req_n(r) for r in reqs)
             fill = min(n_s / _cfg["max_batch"], 1.0)
-            score = wait_ms * (fill ** 0.5)
+            score = wait_ms * (fill ** 0.25)
             if score > best_score:
                 best_score = score
                 best_mid = mid
@@ -404,6 +432,7 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
 
         int_batches += 1
         int_states += total_states
+        _mdl_states[best_mid] += total_states
         int_fwd_ms += fwd_ms
         int_collect_ms += concat_ms
         int_scatter_ms += scatter_ms
@@ -414,10 +443,17 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
             n = max(int_batches, 1)
             hw = ""
             if _has_nvml:
-                util = _nvml_lib.nvmlDeviceGetUtilizationRates(_nvml_handle)
-                import torch
-                vram = torch.cuda.memory_allocated() / (1024 ** 3)
-                hw += f"  gpu={util.gpu}% vram={vram:.1f}GB"
+                try:
+                    util = _nvml_lib.nvmlDeviceGetUtilizationRates(_nvml_handle)
+                    hw += f"  gpu={util.gpu}%"
+                except Exception:
+                    pass
+                try:
+                    import torch
+                    vram = torch.cuda.memory_allocated() / (1024 ** 3)
+                    hw += f"  vram={vram:.1f}GB"
+                except Exception:
+                    pass
             if _has_psutil:
                 srv_cpu = _srv_proc.cpu_percent() or 0.0
                 # Collect + cache actor Process objects (lazy, first report)
@@ -455,17 +491,23 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
                 hw += (f"  cpu_srv={srv_cpu:.0f}%"
                        f"  cpu_act={act_cpu:.0f}%(@{act_count})"
                        f"  mem={psutil.virtual_memory().percent}%")
-            print(f"[inf-srv GPU{gpu_id}] batches={int_batches}  "
-                  f"states={int_states}  "
-                  f"avg_batch={int_states/n:.1f}  "
-                  f"avg_fwd={int_fwd_ms/n:.1f}ms  "
-                  f"avg_ipc={int_collect_ms/n:.1f}ms  "
-                  f"avg_scatter={int_scatter_ms/n:.1f}ms  "
-                  f"states/s={int_states/max(elapsed,0.001):.0f}"
-                  f"{hw}",
-                  flush=True)
+            model_parts = []
+            for mid in sorted(_mdl_states.keys()):
+                s = _mdl_states[mid]
+                model_parts.append(f"{mid}={s}({s / max(elapsed, 0.001):.0f}/s)")
+            report = (f"[inf-srv GPU{gpu_id}] batches={int_batches}  "
+                      f"states={int_states}  "
+                      f"avg_batch={int_states/n:.1f}  "
+                      f"avg_fwd={int_fwd_ms/n:.1f}ms  "
+                      f"avg_ipc={int_collect_ms/n:.1f}ms  "
+                      f"avg_scatter={int_scatter_ms/n:.1f}ms  "
+                      f"states/s={int_states/max(elapsed,0.001):.0f}  "
+                      f"by_model: {'  '.join(model_parts)}"
+                      f"{hw}")
+            _srv_log(report)
             int_batches = 0
             int_states = 0
+            _mdl_states.clear()
             int_fwd_ms = 0.0
             int_collect_ms = 0.0
             int_scatter_ms = 0.0
@@ -477,18 +519,22 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
 
 class InferenceServer:
 
-    def __init__(self, build_model_fn=None, gpu_id=0):
+    def __init__(self, build_model_fn=None, gpu_id=0, pin_cpu=True,
+                 log_dir=None):
         self._incoming = mp.Queue(maxsize=500)
         self._result_qs = {}
         self._model_specs = {}
         self._proc = None
         self._build_model_fn = build_model_fn
         self._gpu_id = gpu_id
+        self._pin_cpu = pin_cpu
+        self._log_dir = log_dir
         self._shm_bufs = {}      # actor_id → ActorShm (input)
         self._shm_names = {}     # actor_id → name
         self._server_shm = None  # ServerShm (output, shared by all actors)
         self._server_shm_name = None
         self._pol_flat = None    # stored from first register_actor
+        self._eval_ids = []       # actor IDs reserved for eval
 
     @property
     def incoming_queue(self):
@@ -509,6 +555,32 @@ class InferenceServer:
             if self._pol_flat is None:
                 self._pol_flat = pol_flat
         return q
+
+    def reserve_eval_actors(self, n: int, max_states: int,
+                            obs_flat: int, mask_flat: int, pol_flat: int):
+        """Pre-register eval actor slots (before start()).
+
+        Returns list of (actor_id, shm_name) for eval actors to open.
+        """
+        from train.batch_mcts.shm import ActorShm
+        import os as _os, time as _time
+        if self._pol_flat is None:
+            self._pol_flat = pol_flat
+        ids = []
+        for i in range(n):
+            aid = 100000 + i  # large offset to avoid collision with train actors
+            self._result_qs[aid] = mp.Queue(maxsize=100)
+            name = f"jq_ev_{_os.getpid()}_{int(_time.monotonic()*1e6)}_{self._gpu_id}_{i}"
+            shm = ActorShm(name, max_states, obs_flat, mask_flat, create=True)
+            self._shm_bufs[aid] = shm
+            self._shm_names[aid] = name
+            ids.append((aid, name))
+        self._eval_ids = [aid for aid, _ in ids]
+        return ids
+
+    @property
+    def eval_actor_ids(self):
+        return self._eval_ids
 
     def actor_shm_name(self, actor_id: int):
         return self._shm_names.get(actor_id)
@@ -545,7 +617,8 @@ class InferenceServer:
             target=_run_server,
             args=(self._incoming, self._result_qs, self._model_specs,
                   game_name, max_batch, self._build_model_fn,
-                  self._shm_bufs, self._server_shm, self._gpu_id),
+                  self._shm_bufs, self._server_shm, self._gpu_id,
+                  self._pin_cpu, self._log_dir),
             daemon=True,
         )
         self._proc.start()

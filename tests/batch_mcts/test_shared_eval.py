@@ -550,6 +550,9 @@ def main():
         test_best_model_prob_selection,
         test_multi_server_isolation,
         test_multi_server_weight_broadcast,
+        test_eval_slot_reservation,
+        test_eval_slot_multi_model,
+        test_eval_model_update_via_existing_server,
     ]
     failed = 0
     for fn in tests:
@@ -729,6 +732,169 @@ def test_multi_server_weight_broadcast():
     finally:
         _stop_server(s0)
         _stop_server(s1)
+
+
+def test_eval_slot_reservation():
+    """Reserved eval actor slots work through the shared training server."""
+    import threading
+    game = pyspiel.load_game("tic_tac_toe")
+    mm = _MockModel("main")
+    server = InferenceServer()
+    try:
+        # Register a normal training actor
+        rq_train = server.register_actor(0, max_states=8, obs_flat=27,
+                                          mask_flat=9, pol_flat=9)
+        server.register_model("main", {}, 8, 1)
+        specs = {"main": {"model": mm}}
+        # Reserve eval slots
+        eval_ids = server.reserve_eval_actors(2, max_states=8, obs_flat=27,
+                                              mask_flat=9, pol_flat=9)
+        assert len(eval_ids) == 2
+        assert server.eval_actor_ids == [100000, 100001]
+        assert server.actor_shm_name(100000) is not None
+
+        server._thread = threading.Thread(
+            target=_run_server,
+            args=(server.incoming_queue, server._result_qs, specs,
+                  "tic_tac_toe", 128, None, server._shm_bufs,
+                  None, 0, True),
+            daemon=True)
+        server._thread.start()
+        time.sleep(0.1)
+        if not server._thread.is_alive():
+            raise RuntimeError("Server thread crashed on startup")
+
+        # Train actor: works as usual
+        ev_train = SharedEvaluator(game, server.incoming_queue,
+                                   server.result_queue(0), actor_id=0,
+                                   model_id="main")
+        s = _make_state([0, 4])
+        v_train, _ = ev_train._inference(s)
+        assert abs(sum(v_train) - 1.0) < 0.01
+
+        # Eval actor (slot 100000): uses non-SHM path by default
+        ev_eval = SharedEvaluator(game, server.incoming_queue,
+                                  server.result_queue(100000), actor_id=100000,
+                                  model_id="main")
+        v_eval, _ = ev_eval._inference(s)
+        assert abs(sum(v_eval) - 1.0) < 0.01
+        assert np.allclose(np.asarray(v_train), np.asarray(v_eval), atol=0.01)
+    finally:
+        _stop_server(server)
+
+
+def test_eval_slot_multi_model():
+    """Reserved eval slots with distinct model_id get correct results."""
+    import threading
+    game = pyspiel.load_game("tic_tac_toe")
+    mm = _MockModel("main")
+    me = _MockModel("eval")
+    server = InferenceServer()
+    try:
+        rq = server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9,
+                                    pol_flat=9)
+        server.register_model("main", {}, 8, 1)
+        specs = {"main": {"model": mm}, "eval": {"model": me}}
+        eval_ids = server.reserve_eval_actors(1, max_states=8, obs_flat=27,
+                                              mask_flat=9, pol_flat=9)
+        server._thread = threading.Thread(
+            target=_run_server,
+            args=(server.incoming_queue, server._result_qs, specs,
+                  "tic_tac_toe", 128, None, server._shm_bufs,
+                  None, 0, True),
+            daemon=True)
+        server._thread.start()
+        time.sleep(0.1)
+        if not server._thread.is_alive():
+            raise RuntimeError("Server thread crashed on startup")
+
+        # Eval actor with "eval" model — different from main
+        ev = SharedEvaluator(game, server.incoming_queue,
+                             server.result_queue(100000), actor_id=100000,
+                             model_id="eval")
+        s = _make_state([0, 4])
+        obs = np.asarray(s.observation_tensor(), dtype=np.float32)
+        v_eval, _ = ev._inference(s)
+        assert np.allclose(np.asarray(v_eval), _expected_wdl("eval", 0, obs),
+                           atol=0.01)
+    finally:
+        _stop_server(server)
+
+
+def test_eval_model_update_via_existing_server():
+    """Eval models (m0/m1) on training server: pre-registered & updatable."""
+    import threading
+    game = pyspiel.load_game("tic_tac_toe")
+    mm_main = _MockModel("main", num_actions=9)
+    mm_m0 = _MockModel("m0", num_actions=9)
+    mm_m1 = _MockModel("m1", num_actions=9)
+
+    from train.batch_mcts.shm import ServerShm
+    server = InferenceServer()
+    srv_shm = None
+    try:
+        server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9,
+                              pol_flat=9)
+        server.register_model("main", {}, 8, 1)
+        server.register_model("m0", {}, 8, 1)
+        server.register_model("m1", {}, 8, 1)
+        server.reserve_eval_actors(2, max_states=8, obs_flat=27,
+                                   mask_flat=9, pol_flat=9)
+
+        specs = {"main": {"model": mm_main},
+                 "m0": {"model": mm_m0}, "m1": {"model": mm_m1}}
+        srv_shm = ServerShm(f"test_evm_{id(server)}", 128, 9, create=True)
+        server._thread = threading.Thread(
+            target=_run_server,
+            args=(server.incoming_queue, server._result_qs, specs,
+                  "tic_tac_toe", 128, None, server._shm_bufs,
+                  srv_shm, 0, True),
+            daemon=True)
+        server._thread.start()
+        time.sleep(0.1)
+        if not server._thread.is_alive():
+            raise RuntimeError("Server thread crashed on startup")
+
+        s = _make_state([0, 4])
+        obs = np.asarray(s.observation_tensor(), dtype=np.float32)
+
+        # Actor 100000 uses "m0" — should match _MockModel("m0")
+        ev0 = SharedEvaluator(game, server.incoming_queue,
+                              server.result_queue(100000), actor_id=100000,
+                              model_id="m0", server_shm=srv_shm)
+        v0, _ = ev0._inference(s)
+        assert np.allclose(np.asarray(v0), _expected_wdl("m0", 0, obs),
+                           atol=0.01)
+
+        # Actor 100001 uses "m1" — different mock, different output
+        ev1 = SharedEvaluator(game, server.incoming_queue,
+                              server.result_queue(100001), actor_id=100001,
+                              model_id="m1", server_shm=srv_shm)
+        v1, _ = ev1._inference(s)
+        assert np.allclose(np.asarray(v1), _expected_wdl("m1", 0, obs),
+                           atol=0.01)
+        assert not np.allclose(np.asarray(v0), np.asarray(v1), atol=0.01)
+
+        # Update m0 to a new model — simulates eval switching checkpoint
+        mm_m0.step_up()
+        server.update_weights("m0", {}, 128)
+        time.sleep(0.1)
+        v0_new, _ = ev0._inference(s)
+        assert np.allclose(np.asarray(v0_new), _expected_wdl("m0", 1, obs),
+                           atol=0.01)
+        assert not np.allclose(np.asarray(v0), np.asarray(v0_new), atol=0.01)
+
+        # m1 unchanged
+        v1_unchanged, _ = ev1._inference(s)
+        assert np.allclose(np.asarray(v1_unchanged), _expected_wdl("m1", 0, obs),
+                           atol=0.01)
+    finally:
+        _stop_server(server)
+        if srv_shm:
+            try: srv_shm.close()
+            except Exception: pass
+            try: srv_shm.unlink()
+            except Exception: pass
 
 
 def test_shared_eval():

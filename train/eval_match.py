@@ -5,6 +5,7 @@ Usage:  python eval_match.py
 Also importable:  from train.eval_match import run_match
 """
 
+import logging
 import json
 import sys
 import os
@@ -58,14 +59,14 @@ def _model_for(player_cfg):
         step = player_cfg.get("checkpoint_step", 0)
         if step > 0:
             m.load_checkpoint(step)
-            print(f"  [eval] loaded {player_cfg['checkpoint_dir'].rsplit(chr(92),1)[-1].rsplit('/',1)[-1]}:{step}"
-                  f"  params={m.num_trainable_variables}")
+            logging.info(f"  [eval] loaded {player_cfg['checkpoint_dir'].rsplit(chr(92),1)[-1].rsplit('/',1)[-1]}:{step}"
+                         f"  params={m.num_trainable_variables}")
         _models[key] = m
     return _models[key]
 
 
 def _mcts_for(player_cfg):
-    key = id(player_cfg)
+    key = (player_cfg["checkpoint_dir"], player_cfg.get("checkpoint_step", 0))
     if key not in _mcts_bots:
         # Read game name from train_config.json
         config_path = os.path.join(player_cfg["checkpoint_dir"], "train_config.json")
@@ -118,14 +119,15 @@ def _act(player_cfg, state, move_num, temperature, temp_drop):
 
     if strategy == "mcts":
         from train.core.policy import select_action_with_adv
+        from train.batch_mcts.mcts import compute_solved_policy
         root = _mcts_for(player_cfg).mcts_search(state)
+        solved = compute_solved_policy(
+            root.children, state.current_player(),
+            state.get_game().max_utility(),
+            root_visits=root.explore_count)
         tau = 2/3 if move_num < temp_drop else temperature
-        if move_num < temp_drop:
-            a, _ = select_action_with_adv(root, state, alpha=0.3, adv_t=0.2,
-                                          temperature=tau)
-        else:
-            a, _ = select_action_with_adv(root, state, alpha=0.0,
-                                          temperature=tau)
+        a, _ = select_action_with_adv(root, state, alpha=0.0,
+                                      temperature=tau, base_policy=solved)
         return a
 
     raise ValueError(f"Unknown strategy: {strategy}")
@@ -233,11 +235,15 @@ def run_match(cfg0, cfg1, num_games=100, temperature=0.1, temp_drop=5,
 
 def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
                        temp_drop=5, num_actors=4, quiet=True,
-                       inference_batch_size=128):
+                       inference_batch_size=128, existing_server=None):
     """Parallel eval using shared GPU inference server.
 
     Spawns N game processes sharing one GPU process for batched inference.
     Uses multiprocessing.Process to bypass GIL on MCTS search.
+
+    If *existing_server* is an InferenceServer, eval actors connect to it
+    instead of spawning a new GPU process.  Pre-reserved actor slots and
+    models are registered via weight-update messages.
     """
     import multiprocessing as mp
     from train.batch_mcts.shared_evaluator import (
@@ -254,27 +260,50 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
 
     # Read game name from the first NN-based player config
     game_name = "othello"  # fallback
-    model_specs = {}
-    for mid, pcfg in [("m0", cfg0), ("m1", cfg1)]:
-        if pcfg["strategy"] not in ("mcts", "model"):
-            continue
-        config_path = os.path.join(pcfg["checkpoint_dir"],
-                                    "train_config.json")
-        with open(config_path) as f:
-            tc = json.load(f)
-        game_name = tc.get("game", "othello")
-        model_objs = _model_for(pcfg)
-        model_specs[mid] = (model_objs._model.state_dict(),
-                            tc.get("nn_width", 32), tc.get("nn_depth", 6))
+    tc = {}
+    for _, pcfg in [("m0", cfg0), ("m1", cfg1)]:
+        if pcfg["strategy"] in ("mcts", "model"):
+            config_path = os.path.join(pcfg["checkpoint_dir"],
+                                        "train_config.json")
+            with open(config_path) as f:
+                tc = json.load(f)
+            game_name = tc.get("game", "othello")
+            break
+    _game_obj(game_name)  # ensure cached game matches the eval game
 
-    server = InferenceServer(build_model_fn=_get_build_fn(game_name))
-    for mid, (sd, w, d) in model_specs.items():
-        server.register_model(mid, sd, w, d)
-
-    # Register all actor queues BEFORE start (fork/spawn copies _result_qs)
-    actor_rqs = [server.register_actor(i) for i in range(num_actors)]
-
-    server.start(game_name, inference_batch_size)
+    if existing_server is not None:
+        # Reuse training server — let server load checkpoints from disk
+        srv = existing_server
+        for mid, pcfg in [("m0", cfg0), ("m1", cfg1)]:
+            step = pcfg.get("checkpoint_step", 0)
+            if pcfg["strategy"] in ("mcts", "model") and step > 0:
+                ckpt_path = os.path.join(pcfg["checkpoint_dir"],
+                                         f"checkpoint-{step}.pt")
+                srv._incoming.put((mid, "load", ckpt_path,
+                                   inference_batch_size))
+        actor_ids = srv.eval_actor_ids
+        if len(actor_ids) < num_actors:
+            raise RuntimeError(
+                f"Need {num_actors} eval slots, got {len(actor_ids)}. "
+                f"Increase eval_num_actors in config.")
+        actor_ids = actor_ids[:num_actors]
+        actor_rqs = [srv.result_queue(aid) for aid in actor_ids]
+        shm_names = [srv.actor_shm_name(aid) for aid in actor_ids]
+        srv_shm_name = srv.server_shm_name
+    else:
+        srv = InferenceServer(build_model_fn=_get_build_fn(game_name),
+                              pin_cpu=False)
+        for mid, pcfg in [("m0", cfg0), ("m1", cfg1)]:
+            if pcfg["strategy"] not in ("mcts", "model"):
+                continue
+            model_objs = _model_for(pcfg)
+            srv.register_model(mid, model_objs._model.state_dict(),
+                               tc.get("nn_width", 32), tc.get("nn_depth", 6))
+        actor_rqs = [srv.register_actor(i) for i in range(num_actors)]
+        actor_ids = list(range(num_actors))
+        shm_names = [srv.actor_shm_name(i) for i in range(num_actors)]
+        srv_shm_name = srv.server_shm_name
+        srv.start(game_name, inference_batch_size)
 
     score = {name0: 0, name1: 0, "draw": 0}
     sequences = []
@@ -291,8 +320,9 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
         gs = w * games_per
         ge = num_games if w == num_actors - 1 else gs + games_per
         p = mp.Process(target=_eval_actor_process, args=(
-            w, gs, ge, cfg0, cfg1, name0, name1, temperature, temp_drop,
-            server.incoming_queue, actor_rqs[w], stats_q, game_name))
+            actor_ids[w], gs, ge, cfg0, cfg1, name0, name1, temperature,
+            temp_drop, srv.incoming_queue, actor_rqs[w], stats_q, game_name,
+            shm_names[w], srv_shm_name))
         p.start()
         procs.append(p)
 
@@ -310,13 +340,16 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
         if p.is_alive():
             p.terminate()
 
-    server.stop()
+    if existing_server is None:
+        srv.stop()
+        srv.shutdown()
     return score, sequences
 
 
 def _eval_actor_process(worker_id, g_start, g_end, cfg0, cfg1,
                         name0, name1, temperature, temp_drop,
-                        incoming_q, result_q, stats_out, game_name):
+                        incoming_q, result_q, stats_out, game_name,
+                        shm_name=None, server_shm_name=None):
     """Actor process body — runs at module level for Windows spawn compatibility."""
     import numpy as np
     import pyspiel
@@ -324,11 +357,22 @@ def _eval_actor_process(worker_id, g_start, g_end, cfg0, cfg1,
 
     game = pyspiel.load_game(game_name)
 
+    actor_shm = None
+    server_shm = None
+    if shm_name is not None and server_shm_name is not None:
+        from train.batch_mcts.shm import ActorShm, ServerShm
+        obs_flat = int(np.prod(game.observation_tensor_shape()))
+        act_flat = game.num_distinct_actions()
+        mcts_bs = cfg0.get('mcts_batch_size', 8) or cfg1.get('mcts_batch_size', 8)
+        actor_shm = ActorShm(shm_name, mcts_bs, obs_flat, act_flat, create=False)
+        server_shm = ServerShm(server_shm_name, 128, act_flat, create=False)
+
     evals = {}
     for mid, pcfg in [("m0", cfg0), ("m1", cfg1)]:
         if pcfg["strategy"] in ("mcts", "model"):
             evals[mid] = SharedEvaluator(
-                game, incoming_q, result_q, actor_id=worker_id, model_id=mid)
+                game, incoming_q, result_q, actor_id=worker_id, model_id=mid,
+                actor_shm=actor_shm, server_shm=server_shm)
         else:
             evals[mid] = None
 
@@ -350,7 +394,7 @@ def _eval_actor_process(worker_id, g_start, g_end, cfg0, cfg1,
     local_seqs = []
 
     for i in range(g_start, g_end):
-        if i % 2 == 0:
+        if rng.random() < 0.5:
             cfg_b, cfg_w = cfg0, cfg1
             label_b, label_w = name0, name1
             ev_b, ev_w = evals["m0"], evals["m1"]
@@ -433,20 +477,24 @@ def _act_parallel(player_cfg, state, move_num, temperature, temp_drop,
                 uct_c=player_cfg.get("mcts_uct_c", 1.41),
                 draw_penalty=tc.get("draw_penalty", 0.0),
                 repeat_penalty=tc.get("repeat_penalty", 0.1),
+                fpu_lambda=tc.get("fpu_lambda", 0.2),
+                probe_depth=tc.get("probe_depth", 0),
+                probe_surprise=tc.get("probe_surprise", 0.3),
                 policy_epsilon=0, verbose=False)
             _act_parallel._mcts_cache[key] = BatchMCTS(
                 pyspiel.load_game(tc["game"]), cfg, shared_eval,
                 random_state=np.random.RandomState(worker_id * 1000))
         mcts = _act_parallel._mcts_cache[key]
         from train.core.policy import select_action_with_adv
+        from train.batch_mcts.mcts import compute_solved_policy
         root = mcts.mcts_search(state)
+        solved = compute_solved_policy(
+            root.children, state.current_player(),
+            state.get_game().max_utility(),
+            root_visits=root.explore_count)
         tau = 2/3 if move_num < temp_drop else temperature
-        if move_num < temp_drop:
-            a, _ = select_action_with_adv(root, state, alpha=0.3, adv_t=0.2,
-                                          temperature=tau)
-        else:
-            a, _ = select_action_with_adv(root, state, alpha=0.0,
-                                          temperature=tau)
+        a, _ = select_action_with_adv(root, state, alpha=0.0,
+                                      temperature=tau, base_policy=solved)
         return a
 
     raise ValueError(f"Unknown strategy: {strategy}")
@@ -459,7 +507,7 @@ def main():
         num_games=DEFAULT_NUM_GAMES,
         temperature=DEFAULT_TEMPERATURE,
         temp_drop=DEFAULT_TEMP_DROP,
-        num_actors=10,
+        num_actors=20,
         quiet=False)
 
     n = DEFAULT_NUM_GAMES
@@ -547,9 +595,9 @@ PLAYER = {
 
 PLAYER = {
     0: {"strategy": "mcts",
-        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud_fpu",
-        "checkpoint_step": 160,
-        "mcts_simulations": 400, "mcts_batch_size": 16, "mcts_uct_c": 1.41},
+        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud_buf",
+        "checkpoint_step": 165,
+        "mcts_simulations": 128, "mcts_batch_size": 10, "mcts_uct_c": 4.0},
     # 1: {"strategy": "mcts", # 早期的benchmark
     #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_argmax", # argmax 240 us benchmark
     #     "checkpoint_step": 240,
@@ -558,10 +606,10 @@ PLAYER = {
     #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_b",
     #     "checkpoint_step": 990,
     #     "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
-    1: {"strategy": "model",
-        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud_fpu",
-        "checkpoint_step": 160,
-        "mcts_simulations": 401, "mcts_batch_size": 1, "mcts_uct_c": 1.41},
+    1: {"strategy": "mcts",
+        "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud_buf",
+        "checkpoint_step": 85,
+        "mcts_simulations": 128, "mcts_batch_size": 10, "mcts_uct_c": 4.0},
 }
 
 if __name__ == "__main__":

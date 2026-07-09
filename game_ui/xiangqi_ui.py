@@ -20,9 +20,9 @@ from game_ui.xiangqi_render import (
 from train.core.model_builder import build_xiangqi_model
 
 # ── Config ──────────────────────────────────────────────────────────────────
-CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_new"
-CHECKPOINT_STEP = 295
-MCTS_SIMULATIONS = 2000
+CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_buf"
+CHECKPOINT_STEP = 5
+MCTS_SIMULATIONS = 1000
 HINT_MAX_SIM = 10000
 INFERENCE_BATCH_SIZE = 10  # shared by MCTS and AlphaBeta
 UCT_C = 4.0

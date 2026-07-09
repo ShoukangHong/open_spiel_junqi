@@ -9,23 +9,31 @@ from train.batch_mcts.mcts import compute_solved_policy
 
 
 def _stable_qdr(node):
-    """Q and draw_rate from children with >1 visit, excluding noise.
-    If the node is proven (outcome set), use that directly.
+    """Q and draw_rate from well-explored children only (≥10% of max visits).
+
+    Falls back to node.q_value / node.draw_rate when no child qualifies.
     """
     if node.outcome is not None:
         s = node.state
         p = s.current_player() if s is not None and not s.is_terminal() else node.player
         q = node.outcome[p]
         return q, 1.0 if q == 0 else 0.0
-    valid = [c for c in node.children if c.explore_count > 1]
+    if not node.children:
+        return node.q_value, node.draw_rate
+    max_n = max(c.explore_count for c in node.children)
+    if max_n == 0:
+        return node.q_value, node.draw_rate
+    threshold = max_n * 0.1
+    if max_n > 1:
+        threshold = max(threshold, 1.0)
+    valid = [c for c in node.children if c.explore_count > threshold]
     if valid:
         total_n = sum(c.explore_count for c in valid)
-        q = sum(c.total_reward for c in valid) / total_n
-        dr = sum(c.draw_reward for c in valid) / total_n
-    else:
-        q = node.q_value
-        dr = node.draw_rate
-    return q, dr
+        if total_n > 0:
+            q = sum(c.total_reward for c in valid) / total_n
+            dr = sum(c.draw_reward for c in valid) / total_n
+            return q, dr
+    return node.q_value, node.draw_rate
 
 
 def _wdl_from_qdr(q, draw_rate):
@@ -50,43 +58,61 @@ def _kl(p, q):
     return float(np.sum(p * np.log(p / q)))
 
 
+def _node_val_kl(node, nn_q, nn_draw):
+    """Value KL for a single node (works with or without children)."""
+    mcts_q, mcts_draw = _stable_qdr(node)
+    _draw = nn_draw if nn_draw is not None else 0.0
+    nn_wdl = _wdl_from_qdr(nn_q, _draw)
+    mcts_wdl = _wdl_from_qdr(mcts_q, mcts_draw)
+    return _kl(mcts_wdl, nn_wdl)
+
+
+def _node_pol_val_kl(node, player, nn_q, nn_draw, nn_prior_arr,
+                     game_max_utility):
+    """(pol_kl, val_kl) for a node that has children.
+
+    nn_prior_arr: normalized array aligned with node.children order.
+    Applies outcome-based pol_kl adjustments:
+      - proven loss for *player* → pol_kl = 0
+      - proven win/draw → scale by avg visits per branch
+    """
+    actions = [c.action for c in node.children]
+    solved = compute_solved_policy(
+        node.children, player, game_max_utility,
+        root_visits=node.explore_count)
+    mcts_pol = np.array([solved.get(a, 0.0) for a in actions],
+                        dtype=np.float64)
+    mcts_pol /= mcts_pol.sum()
+    pol_kl = _kl(mcts_pol, nn_prior_arr)
+
+    if node.outcome is not None:
+        if node.outcome[player] < 0:
+            pol_kl = 0.0
+        else:
+            n = len(node.children)
+            if n > 0:
+                avg = node.explore_count / n
+                scale = 0.2 + 0.8 * min(avg / 5.0, 1.0)
+                pol_kl *= scale
+
+    val_kl = _node_val_kl(node, nn_q, nn_draw)
+    return pol_kl, val_kl
+
+
 def detect_surprise(state, root, config, game_max_utility=1.0):
     """Return (root_tag, child_tags) based on MCTS vs NN KL divergence.
 
     Policy surprise: KL(MCTS_pol || NN_prior) > surprise_pol_kl.
     Value surprise:  KL(MCTS_WDL || NN_WDL) > surprise_val_kl.
 
-    root_tag: "" | "surprise" | "strong_surprise"
-    child_tags: {action: "child_surprise"}
+    root_tag: "" | "surprise" | "super_surprise"
+    child_tags: {action: ("child_surprise"|"child_super_surprise", combined_kl)}
     """
     if root.nn_q is None or not root.children:
         return "", {}, 0.0
 
     cur = state.current_player()
-    mcts_q, mcts_draw = _stable_qdr(root)
-    nn_q = root.nn_q
 
-    # ── Policy KL ─────────────────────────────────────────────────────
-    actions = [c.action for c in root.children]
-    nn_prior = np.array([max(c.prior, 0.0) for c in root.children],
-                        dtype=np.float64)
-    nn_prior /= nn_prior.sum()
-    solved = compute_solved_policy(
-        root.children, cur, game_max_utility,
-        root_visits=root.explore_count)
-    mcts_pol = np.array([solved.get(a, 0.0) for a in actions],
-                        dtype=np.float64)
-    mcts_pol /= mcts_pol.sum()
-    # KL(search || prior): how much MCTS diverges from NN expectation
-    pol_kl = _kl(mcts_pol, nn_prior)
-
-    # ── Value KL ──────────────────────────────────────────────────────
-    nn_draw = root.nn_draw if root.nn_draw is not None else 0.0
-    nn_wdl = _wdl_from_qdr(nn_q, nn_draw)
-    mcts_wdl = _wdl_from_qdr(mcts_q, mcts_draw)
-    val_kl = _kl(mcts_wdl, nn_wdl)
-
-    # ── Tag helper ─────────────────────────────────────────────────────
     def _surprise_tag(p_kl, v_kl, prefix=""):
         combined = p_kl + v_kl
         if combined > config.surprise_pol_kl + config.surprise_val_kl:
@@ -95,38 +121,38 @@ def detect_surprise(state, root, config, game_max_utility=1.0):
             return prefix + "surprise", combined
         return "", combined
 
+    # ── Root ──────────────────────────────────────────────────────────
+    root_nn_prior = np.array([max(c.prior, 0.0) for c in root.children],
+                             dtype=np.float64)
+    root_nn_prior /= root_nn_prior.sum()
+    pol_kl, val_kl = _node_pol_val_kl(
+        root, cur, root.nn_q, root.nn_draw, root_nn_prior, game_max_utility)
+
     root_tag, combined = _surprise_tag(pol_kl, val_kl)
 
-    # ── Child tags ─────────────────────────────────────────────────────
+    # ── Children ──────────────────────────────────────────────────────
     child_tags = {}
     min_n = config.surprise_child_min_n
     for c in root.children:
         if c.nn_q is None or c.nn_prior is None:
             continue
         if c.outcome is not None or c.explore_count >= min_n:
+            c_player = (c.state.current_player()
+                        if c.state is not None else c.player)
             if c.children:
-                c_actions = [cc.action for cc in c.children]
                 c_nn_prior = np.array(
-                    [max(dict(c.nn_prior).get(a, 0.0), 0.0) for a in c_actions],
+                    [max(dict(c.nn_prior).get(cc.action, 0.0), 0.0)
+                     for cc in c.children],
                     dtype=np.float64)
                 c_nn_prior /= c_nn_prior.sum()
-                c_player = c.state.current_player() if c.state is not None else c.player
-                c_solved = compute_solved_policy(
-                    c.children, c_player, game_max_utility,
-                    root_visits=c.explore_count)
-                c_mcts_pol = np.array(
-                    [c_solved.get(a, 0.0) for a in c_actions],
-                    dtype=np.float64)
-                c_mcts_pol /= c_mcts_pol.sum()
-                c_pol_kl = _kl(c_mcts_pol, c_nn_prior)
+                c_pol_kl, c_val_kl = _node_pol_val_kl(
+                    c, c_player, c.nn_q, c.nn_draw, c_nn_prior,
+                    game_max_utility)
             else:
                 c_pol_kl = 0.0
-            c_nn_draw = c.nn_draw if c.nn_draw is not None else 0.0
-            c_nn_wdl = _wdl_from_qdr(c.nn_q, c_nn_draw)
-            c_mcts_q, c_mcts_draw = _stable_qdr(c)
-            c_mcts_wdl = _wdl_from_qdr(c_mcts_q, c_mcts_draw)
-            c_val_kl = _kl(c_mcts_wdl, c_nn_wdl)
-            ctag, c_combined = _surprise_tag(c_pol_kl, c_val_kl, prefix="child_")
+                c_val_kl = _node_val_kl(c, c.nn_q, c.nn_draw)
+            ctag, c_combined = _surprise_tag(c_pol_kl, c_val_kl,
+                                             prefix="child_")
             if ctag:
                 child_tags[c.action] = (ctag, c_combined)
 

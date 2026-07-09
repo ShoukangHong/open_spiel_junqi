@@ -31,12 +31,13 @@
 
     "num_actors": 26,
     "max_steps": 300,
-    "checkpoint_freq": 10,
+    "checkpoint_freq": 5,
 
-    "evaluation_window": 5,
+    "evaluation_window": 10,
     "eval_reference_count": 2,
     "best_model_prob": 0.0,
     "eval_min_interval": 1,
+    "eval_num_actors": 10,
 
     "prune_enabled": true,
     "prune_threshold": 0.99,
@@ -49,7 +50,7 @@
     "weak_max_per_game": 3,
     "weak_move_max_step": 200,
 
-    "path": "C:\\Users\\shouk\\xiangqi_train\\fast",
+    "path": "/hy-tmp/fast",
     "seed": 42,
     "device": "cuda"
 }

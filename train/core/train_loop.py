@@ -291,7 +291,8 @@ def run_training(
 
     actors_per_gpu = (cfg.num_actors + num_gpus - 1) // num_gpus
     for gpu_id in range(num_gpus):
-        server = InferenceServer(build_model_fn=build_model_fn, gpu_id=gpu_id)
+        server = InferenceServer(build_model_fn=build_model_fn, gpu_id=gpu_id,
+                                 log_dir=cfg.path)
         a_start = gpu_id * actors_per_gpu
         a_end = min(a_start + actors_per_gpu, cfg.num_actors)
         if a_start >= a_end:
