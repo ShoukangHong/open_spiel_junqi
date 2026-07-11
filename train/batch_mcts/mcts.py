@@ -1179,9 +1179,12 @@ class BatchMCTS:
             for child in node.children:
                 if child.outcome is None:
                     all_solved = False
-                elif (best_child is None
-                      or child.outcome[player] > best_child.outcome[player]):
-                    best_child = child
+                else:
+                    if child.outcome[player] == 0:
+                        node.drawable = True  # at least a draw is achievable
+                    if (best_child is None
+                            or child.outcome[player] > best_child.outcome[player]):
+                        best_child = child
             if best_child is not None and (
                     all_solved or best_child.outcome[player] == self.max_utility):
                 node.outcome = best_child.outcome

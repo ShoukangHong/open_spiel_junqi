@@ -32,7 +32,7 @@ from game_ui.xiangqi_render import (
     compute_top_moves)
 
 # ── Config ──────────────────────────────────────────────────────────────────
-BUFFER_FILE = r"C:\Users\shouk\Github\open_spiel_junqi\temp\eval_2026-07-09-213907_game019.db"
+BUFFER_FILE = r"C:\Users\shouk\xiangqi_train\cloud_sov\buffer_recent.db"
 
 
 # ── Side panel ──────────────────────────────────────────────────────────────

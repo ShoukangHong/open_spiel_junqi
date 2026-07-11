@@ -15,8 +15,11 @@ class OpeningBook:
     def __init__(self, game, dir_path: str):
         self._game = game
         self._serials = []  # raw serialized strings (compact, ~100 bytes each)
-        if not dir_path or not os.path.isdir(dir_path):
+        if not dir_path:
             return
+        if not os.path.isdir(dir_path):
+            raise FileNotFoundError(
+                f"Opening book directory not found: {dir_path}")
         # Recursively scan all .txt files in the directory tree
         files = sorted(glob.glob(os.path.join(dir_path, "**", "*.txt"),
                                  recursive=True))

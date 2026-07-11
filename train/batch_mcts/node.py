@@ -55,6 +55,7 @@ class Node:
         self.draw_reward = 0.0
         self.virtual_visits = 0
         self.outcome = None
+        self.drawable = False   # at least one child is a proven draw
         self.children = []
         self.state = None
         self.noise_applied = False

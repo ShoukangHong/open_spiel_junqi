@@ -7,6 +7,7 @@ Also importable:  from train.eval_match import run_match
 
 import logging
 import json
+import queue
 import sys
 import os
 _sys_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -340,6 +341,15 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
         if p.is_alive():
             p.terminate()
 
+    # Drain stale results from eval actor queues (prevent cross-iteration
+    # contamination when the same actor_id/result_q is reused).
+    for rq in actor_rqs:
+        while True:
+            try:
+                rq.get_nowait()
+            except queue.Empty:
+                break
+
     if existing_server is None:
         srv.stop()
         srv.shutdown()
@@ -407,6 +417,7 @@ def _eval_actor_process(worker_id, g_start, g_end, cfg0, cfg1,
             state = obook.sample(rng)
         else:
             state = game.new_initial_state()
+        init_state = state.clone()  # for replay (may differ from initial state)
         move_num = 0
         moves = []
         while not state.is_terminal():
@@ -419,7 +430,7 @@ def _eval_actor_process(worker_id, g_start, g_end, cfg0, cfg1,
             state.apply_action(action)
             moves.append(action)
             move_num += 1
-        local_seqs.append((label_b, tuple(moves)))
+        local_seqs.append((label_b, tuple(moves), init_state))
         r = state.returns()[0]
         if r > 0:
             local_score[label_b] += 1
@@ -518,9 +529,9 @@ def main():
 
     # Move diversity
     print("\n[PREFIX OVERLAP]  unique prefixes / games  (most-common count)")
-    max_len = max(len(m) for _, m in sequences)
+    max_len = max(len(item[1]) for item in sequences)
     for L in range(1, min(max_len + 1, 61), 5):
-        prefs = [m[:L] for _, m in sequences if len(m) >= L]
+        prefs = [item[1][:L] for item in sequences if len(item[1]) >= L]
         if not prefs:
             continue
         arr = np.array(prefs, dtype=int)
@@ -549,8 +560,13 @@ def _write_eval_games(f, sequences, score):
     n = len(sequences)
     frame_names = [k for k in score if k != "draw"]
     name0, name1 = frame_names[0], frame_names[1]
-    for gi, (label, moves) in enumerate(sequences):
-        state = game.new_initial_state()
+    for gi, item in enumerate(sequences):
+        label, moves = item[0], item[1]
+        init_state = item[2] if len(item) > 2 else None
+        if init_state is not None:
+            state = init_state.clone()
+        else:
+            state = game.new_initial_state()
         f.write(f"\n{'=' * 60}\nGame {gi + 1}/{n}  label={label}\n{'=' * 60}\n")
         for mi, a in enumerate(moves):
             cur = state.current_player()
@@ -570,9 +586,9 @@ def _write_eval_games(f, sequences, score):
                 f"Result: {winner} wins  Returns: {r[0]:+.0f}/{r[1]:+.0f}\n")
 
 
-DEFAULT_NUM_GAMES = 100
+DEFAULT_NUM_GAMES = 40
 DEFAULT_TEMPERATURE = 0.03
-DEFAULT_TEMP_DROP = 15
+DEFAULT_TEMP_DROP = 5
 
 PLAYER = {
     0: {"strategy": "mcts",
@@ -596,7 +612,7 @@ PLAYER = {
 PLAYER = {
     0: {"strategy": "mcts",
         "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud_buf",
-        "checkpoint_step": 165,
+        "checkpoint_step": 245,
         "mcts_simulations": 128, "mcts_batch_size": 10, "mcts_uct_c": 4.0},
     # 1: {"strategy": "mcts", # 早期的benchmark
     #     "checkpoint_dir": r"C:\Users\shouk\othello_train\cloud_wdl_argmax", # argmax 240 us benchmark
@@ -608,9 +624,11 @@ PLAYER = {
     #     "mcts_simulations": 128, "mcts_batch_size": 8, "mcts_uct_c": 1.41},
     1: {"strategy": "mcts",
         "checkpoint_dir": r"C:\Users\shouk\xiangqi_train\cloud_buf",
-        "checkpoint_step": 85,
+        "checkpoint_step": 5,
         "mcts_simulations": 128, "mcts_batch_size": 10, "mcts_uct_c": 4.0},
 }
 
 if __name__ == "__main__":
+    import multiprocessing as _mp
+    _mp.set_start_method("spawn", force=True)
     main()

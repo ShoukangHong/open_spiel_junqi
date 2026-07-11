@@ -115,57 +115,61 @@ def select_eval_references(ckpts, step, output_dir, ref_count):
     """Build a diverse set of reference checkpoints for evaluation.
 
     Priority order:
-      1. Historical best model (1 slot, from best_step.txt)
-      2. Evenly-spaced milestones: (ref_count-1) equal segments across
-         [0, step), nearest checkpoint per segment boundary
+      1. Current best model (1 slot, last line of best_step.txt)
+      2. Evenly-spaced historical bests: (ref_count-1) equal segments
+         across all historical best steps (excluding current best)
       3. Most recent unmatched checkpoints
       4. At most one random opponent
+
+    best_step.txt stores all historical best steps, one per line,
+    newest last.  Auto-init from newest checkpoint if missing.
 
     Returns list of step numbers (-1 = random).
     """
     ckpts = sorted([s for s in ckpts if s < step], reverse=True)
     refs = []
 
-    # 1. Best model — auto-init if missing
+    # Read historical bests
     best_file = os.path.join(output_dir, "best_step.txt")
     if not os.path.exists(best_file) and ckpts:
         with open(best_file, "w") as f:
-            f.write(str(ckpts[-1]))
+            f.write(f"{ckpts[-1]}\n")
+    bests = []
     if os.path.exists(best_file):
         try:
             with open(best_file) as f:
-                best = int(f.read().strip())
-            if best > 0 and best < step:
-                refs.append(best)
+                for line in f:
+                    s = int(line.strip())
+                    if 0 < s < step:
+                        bests.append(s)
         except (ValueError, OSError):
             pass
 
-    # 2. Milestones: evenly divide [0, step) into (ref_count-1) segments,
-    #    pick the nearest checkpoint to each boundary
+    # 1. Current best (last entry)
+    if bests:
+        refs.append(bests[-1])
+
+    # 2. Milestones: evenly divide historical bests (excluding current)
+    history = bests[:-1]  # all bests except current
     n_segments = max(ref_count - 1, 1)
     for i in range(1, n_segments + 1):
-        if len(refs) >= ref_count:
+        if len(refs) >= ref_count or not history:
             break
-        target = step * i // (n_segments + 1)
-        pick = None
-        best_dist = step
+        idx = i * len(history) // (n_segments + 1)
+        idx = min(idx, len(history) - 1)
+        s = history[idx]
+        if s not in refs:
+            refs.append(s)
+
+    # 3. Fill remaining slots with most recent unmatched checkpoints.
+    #    Skip when using historical bests — let step 4 pad with random.
+    if not history:
         for s in ckpts:
+            if len(refs) >= ref_count:
+                break
             if s in refs:
                 continue
-            d = abs(s - target)
-            if d < best_dist or (d == best_dist and (pick is None or s > pick)):
-                best_dist = d
-                pick = s
-        if pick is not None:
-            refs.append(pick)
-
-    # 3. Fill remaining slots with most recent unmatched checkpoints
-    for s in ckpts:
-        if len(refs) >= ref_count:
-            break
-        if s in refs:
-            continue
-        refs.append(s)
+            refs.append(s)
 
     # 4. Pad with at most one random
     if len(refs) < ref_count and -1 not in refs:
@@ -221,11 +225,8 @@ def run_eval_background(cfg_path, current_step, ref_steps, num_games,
                         inference_batch_size=128):
     """Run model-vs-model eval against multiple references (background)."""
     from train.eval_match import run_match_parallel as _run
-    from train.core.train_loop import run_training
-    existing = getattr(run_training, '_eval_server', None)
     _kwargs = {"num_actors": num_actors,
-               "inference_batch_size": inference_batch_size,
-               "existing_server": existing}
+               "inference_batch_size": inference_batch_size}
 
     # Read training config to match MCTS settings
     import json
@@ -279,10 +280,11 @@ def run_eval_background(cfg_path, current_step, ref_steps, num_games,
         if os.path.exists(best_file):
             try:
                 with open(best_file) as f:
-                    old_best = int(f.read().strip())
+                    lines = [line.strip() for line in f if line.strip()]
+                old_best = int(lines[-1]) if lines else 0
                 if ref_step == old_best and wr >= 0.55:
-                    with open(best_file, "w") as f:
-                        f.write(str(current_step))
+                    with open(best_file, "a") as f:
+                        f.write(f"{current_step}\n")
                     logging.info(f"    [eval] → new best model: step{current_step} "
                                  f"(WR={wr:.1%} vs old step{old_best})")
             except (ValueError, OSError):

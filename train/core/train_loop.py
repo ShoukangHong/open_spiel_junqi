@@ -269,7 +269,8 @@ def run_training(
     if os.path.exists(best_file):
         try:
             with open(best_file) as f:
-                best_step = int(f.read().strip())
+                lines = [line.strip() for line in f if line.strip()]
+            best_step = int(lines[-1]) if lines else 0
             ckpt = os.path.join(cfg.path, f"checkpoint-{best_step}.pt")
             if os.path.exists(ckpt):
                 best_sd = torch.load(
@@ -285,7 +286,7 @@ def run_training(
                                        f"checkpoint-{start_step}.pt")
         if os.path.exists(best_file_init):
             with open(best_file, "w") as f:
-                f.write(str(start_step))
+                f.write(f"{start_step}\n")
             run_training._last_best_step = start_step
             _log(f"[train] Best model initialised: step {start_step}")
 
@@ -509,7 +510,8 @@ def run_training(
                 if os.path.exists(best_file):
                     try:
                         with open(best_file) as f:
-                            cur_best = int(f.read().strip())
+                            cur_lines = [line.strip() for line in f if line.strip()]
+                        cur_best = int(cur_lines[-1]) if cur_lines else 0
                         if cur_best != _last_best:
                             ckpt = os.path.join(
                                 cfg.path, f"checkpoint-{cur_best}.pt")

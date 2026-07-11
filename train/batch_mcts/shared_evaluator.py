@@ -13,6 +13,7 @@ Architecture:
 
 import multiprocessing as mp
 import queue
+import threading
 import time
 
 import numpy as np
@@ -278,12 +279,16 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
         if isinstance(msg, tuple) and len(msg) == 4 \
                 and msg[1] == "load":
             mid, _, ckpt_path, mb = msg
-            if mid in models:
-                ckpt = _torch.load(ckpt_path, map_location="cuda",
-                                   weights_only=False)
-                target = getattr(models[mid], '_model', models[mid])
-                if hasattr(target, 'load_state_dict'):
-                    target.load_state_dict(ckpt["model_state_dict"])
+            if mid not in models:
+                raise RuntimeError(
+                    f"[inf-srv] eval-load failed: model '{mid}' not registered. "
+                    f"Available: {list(models.keys())}")
+            ckpt = _torch.load(ckpt_path, map_location="cuda",
+                               weights_only=False)
+            target = getattr(models[mid], '_model', models[mid])
+            target.load_state_dict(ckpt["model_state_dict"])
+            _srv_log(f"[inf-srv] eval-load: {mid} "
+                     f"from {ckpt_path.rsplit('/',1)[-1]}")
             if mb != _cfg["max_batch"]:
                 _cfg["max_batch"] = mb
                 _cfg["obs_buf"] = np.empty((mb, obs_dim), dtype=np.float32)
@@ -293,10 +298,12 @@ def _run_server(incoming_q, result_qs, model_specs, game_name, max_batch,
         if isinstance(msg, tuple) and len(msg) == 3 \
                 and isinstance(msg[1], dict):
             mid, sd, mb = msg
-            if mid in models:
-                target = getattr(models[mid], '_model', models[mid])
-                if hasattr(target, 'load_state_dict'):
-                    target.load_state_dict(sd)
+            if mid not in models:
+                raise RuntimeError(
+                    f"[inf-srv] weight update failed: model '{mid}' not "
+                    f"registered. Available: {list(models.keys())}")
+            target = getattr(models[mid], '_model', models[mid])
+            target.load_state_dict(sd)
             if mb != _cfg["max_batch"]:
                 _cfg["max_batch"] = mb
                 _cfg["obs_buf"] = np.empty((mb, obs_dim), dtype=np.float32)

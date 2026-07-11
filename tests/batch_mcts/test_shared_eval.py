@@ -897,6 +897,221 @@ def test_eval_model_update_via_existing_server():
             except Exception: pass
 
 
+def test_eval_load_msg_switches_weights():
+    """Server "load" message actually changes model weights for eval."""
+    import os, tempfile, json, threading
+    import torch
+    game = pyspiel.load_game("othello")
+    from train.core.model_builder import build_othello_model
+
+    cfg = {"nn_width": 8, "nn_depth": 2, "device": "cpu",
+           "learning_rate": 1e-3, "weight_decay": 1e-4, "game": "othello"}
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg["path"] = tmpdir
+        with open(os.path.join(tmpdir, "train_config.json"), "w") as f:
+            json.dump(cfg, f)
+
+        # Save checkpoint 100 (seed 42) and 200 (seed 99)
+        for step, seed in [(100, 42), (200, 99)]:
+            torch.manual_seed(seed)
+            m = build_othello_model(game, cfg)
+            torch.save({"model_state_dict": m._model.state_dict(),
+                        "optimizer_state_dict": m._optimizer.state_dict(),
+                        "step": step},
+                       os.path.join(tmpdir, f"checkpoint-{step}.pt"))
+
+        server = InferenceServer(pin_cpu=False)
+        rq = server.register_actor(0, max_states=8, obs_flat=4*8*8, mask_flat=65,
+                                    pol_flat=65)
+        server.register_model("m0", {}, 8, 2)
+        server.register_model("m1", {}, 8, 2)
+
+        # Start server with _mock models to track weight updates
+        class _Tracker:
+            def __init__(self): self.loaded = []
+            def load_state_dict(self, sd):
+                self.loaded.append(sum(p.numel() for p in sd.values()))
+            def batch_forward_raw(self, obs): raise NotImplementedError
+            def eval(self): pass
+            def to(self, d): return self
+
+        t0, t1 = _Tracker(), _Tracker()
+        specs = {"m0": {"model": type("M",(),{"_model":t0})()},
+                 "m1": {"model": type("M",(),{"_model":t1})()}}
+        server._model_specs = specs
+        server._thread = threading.Thread(
+            target=_run_server,
+            args=(server.incoming_queue, server._result_qs, specs,
+                  "tic_tac_toe", 128, None, {}, None, 0, True, None),
+            daemon=True)
+        server._thread.start()
+        time.sleep(1.0)
+        if not server._thread.is_alive():
+            raise RuntimeError("Server thread crashed on startup")
+
+        try:
+            # Send load messages
+            ckpt_100 = os.path.join(tmpdir, "checkpoint-100.pt")
+            ckpt_200 = os.path.join(tmpdir, "checkpoint-200.pt")
+            server._incoming.put(("m0", "load", ckpt_100, 128))
+            server._incoming.put(("m1", "load", ckpt_200, 128))
+            time.sleep(2.0)
+            if not server._thread.is_alive():
+                raise RuntimeError("Server thread crashed during load")
+
+            assert len(t0.loaded) == 1, f"m0 not loaded: {t0.loaded}"
+            assert len(t1.loaded) == 1, f"m1 not loaded: {t1.loaded}"
+            # Same architecture, same param count
+            assert t0.loaded[0] == t1.loaded[0] > 0
+        finally:
+            _stop_server(server)
+
+
+def test_eval_iteration_no_cross_contamination():
+    """Stale results from a previous eval iteration don't leak into next."""
+    import threading
+    game = pyspiel.load_game("tic_tac_toe")
+    mm = _MockModel("main")
+    me = _MockModel("eval", num_actions=9)
+    server = InferenceServer()
+    try:
+        rq = server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9,
+                                    pol_flat=9)
+        server.register_model("main", {}, 8, 1)
+        specs = {"main": {"model": mm}}
+        eval_ids = server.reserve_eval_actors(1, max_states=8, obs_flat=27,
+                                              mask_flat=9, pol_flat=9)
+        server._thread = threading.Thread(
+            target=_run_server,
+            args=(server.incoming_queue, server._result_qs, specs,
+                  "tic_tac_toe", 128, None, server._shm_bufs,
+                  None, 0, True),
+            daemon=True)
+        server._thread.start()
+        time.sleep(0.3)
+        if not server._thread.is_alive():
+            raise RuntimeError("Server thread crashed")
+
+        # ── Simulate iteration 1: actor sends request, gets killed ──
+        ev = SharedEvaluator(game, server.incoming_queue,
+                             server.result_queue(100000), actor_id=100000,
+                             model_id="main")
+        s = _make_state([0, 4])
+        obs = np.asarray(s.observation_tensor(), dtype=np.float32)
+        # Send request
+        ev._send((obs.reshape(1, -1),
+                  np.ones((1, 9), dtype=bool)))
+        # Kill actor WITHOUT reading result → stale entry in result_q
+        # Wait for server to process the request and put result in queue
+        stale_q = server.result_queue(100000)
+        for _ in range(20):  # poll up to 2 seconds
+            stale_count = 0
+            while True:
+                try:
+                    stale_q.get_nowait()
+                    stale_count += 1
+                except Exception:
+                    break
+            if stale_count > 0:
+                break
+            time.sleep(0.1)
+        assert stale_count > 0, \
+            f"No stale results after 2s — server may not have processed request"
+
+        # ── Iteration 2: new actor with same id, should work after drain ──
+        ev2 = SharedEvaluator(game, server.incoming_queue,
+                              server.result_queue(100000), actor_id=100000,
+                              model_id="main")
+        ev2._send((obs.reshape(1, -1),
+                   np.ones((1, 9), dtype=bool)))
+        data = ev2._recv()
+        val, prior = ev2._process_batch(data,
+                                         np.ones((1, 9), dtype=bool))
+        expected = _expected_wdl("main", 0, obs)
+        assert np.allclose(np.asarray(val[0]), expected, atol=0.01), \
+            f"Got {val[0]}, expected {expected} — stale contamination?"
+    finally:
+        _stop_server(server)
+
+
+def test_eval_no_drain_causes_wrong_result():
+    """Without drain, stale m1 results leak to next iteration's m1 actor."""
+    import threading
+    game = pyspiel.load_game("tic_tac_toe")
+    # Swappable mock: changes output when step_up() is called
+    class _SwappableMock:
+        def __init__(self, mid):
+            self.mid = mid
+            self._ver = 0
+        def step_up(self): self._ver = 1
+        def load_state_dict(self, sd): pass
+        def eval(self): pass
+        def to(self, d): return self
+        def batch_forward_raw(self, obs):
+            n = obs.shape[0]
+            na = 9
+            pl = np.zeros((n, na), dtype=np.float32)
+            vl = np.zeros((n, 3), dtype=np.float32)
+            vid = f"{self.mid}_v{self._ver}"
+            for i in range(n):
+                wdl = _expected_wdl(vid, 0, obs[i])
+                vl[i] = np.log(np.clip(wdl, 1e-6, 1.0))
+            return pl, vl
+
+    mm = _SwappableMock("m1")
+    server = InferenceServer()
+    try:
+        server.register_actor(0, max_states=8, obs_flat=27, mask_flat=9,
+                              pol_flat=9)
+        server.register_model("m1", {}, 8, 1)
+        server.reserve_eval_actors(1, max_states=8, obs_flat=27,
+                                   mask_flat=9, pol_flat=9)
+        srv_specs = {"m1": {"model": mm}}
+        server._thread = threading.Thread(
+            target=_run_server,
+            args=(server.incoming_queue, server._result_qs, srv_specs,
+                  "tic_tac_toe", 128, None, server._shm_bufs,
+                  None, 0, True),
+            daemon=True)
+        server._thread.start()
+        time.sleep(0.5)
+        if not server._thread.is_alive():
+            raise RuntimeError("Server thread crashed")
+
+        s = _make_state([0, 4])
+        obs = np.asarray(s.observation_tensor(), dtype=np.float32)
+
+        # Iteration 1: eval with m1 (v0)
+        ev1 = SharedEvaluator(game, server.incoming_queue,
+                              server.result_queue(100000), actor_id=100000,
+                              model_id="m1")
+        ev1._send((obs.reshape(1, -1), np.ones((1, 9), dtype=bool)))
+        del ev1  # killed before _recv → stale v0 result in result_q
+        time.sleep(0.5)
+
+        # Update m1 to v1 (simulating server weight update between iterations)
+        mm.step_up()
+
+        # Iteration 2: new actor, same actor_id+model_id
+        ev2 = SharedEvaluator(game, server.incoming_queue,
+                              server.result_queue(100000), actor_id=100000,
+                              model_id="m1")
+        ev2._send((obs.reshape(1, -1), np.ones((1, 9), dtype=bool)))
+        data = ev2._recv()  # ← gets STALE v0 result!
+        val, _ = ev2._process_batch(data, np.ones((1, 9), dtype=bool))
+
+        # Must match v0 (stale), not v1 (current)
+        expected_v0 = _expected_wdl("m1_v0", 0, obs)
+        expected_v1 = _expected_wdl("m1_v1", 0, obs)
+        assert np.allclose(np.asarray(val[0]), expected_v0, atol=0.01), \
+            f"Expected stale v0={expected_v0}, got {val[0]}"
+        assert not np.allclose(np.asarray(val[0]), expected_v1, atol=0.01), \
+            f"Should NOT get v1={expected_v1}, got {val[0]}"
+    finally:
+        _stop_server(server)
+
+
 def test_shared_eval():
     main()
 

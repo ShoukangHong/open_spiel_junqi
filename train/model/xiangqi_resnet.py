@@ -106,7 +106,7 @@ class XiangqiResNet(nn.Module):
         """
         if self.training:
             self.eval()
-        with torch.no_grad(), torch.cuda.amp.autocast(
+        with torch.no_grad(), torch.amp.autocast("cuda",
                 enabled=(self.device.type == "cuda")):
             obs_t = torch.from_numpy(
                 np.ascontiguousarray(observation, dtype=np.float32)).to(self.device)
@@ -143,7 +143,7 @@ class XiangqiResNet(nn.Module):
         """
         if self.training:
             self.eval()
-        with torch.no_grad(), torch.cuda.amp.autocast(
+        with torch.no_grad(), torch.amp.autocast("cuda",
                 enabled=(self.device.type == "cuda")):
             obs_t = torch.from_numpy(
                 np.ascontiguousarray(observations, dtype=np.float32)).to(self.device)
@@ -173,7 +173,7 @@ class XiangqiResNet(nn.Module):
         """
         if self.training:
             self.eval()
-        with torch.no_grad(), torch.cuda.amp.autocast(
+        with torch.no_grad(), torch.amp.autocast("cuda",
                 enabled=(self.device.type == "cuda")):
             obs_t = torch.from_numpy(
                 np.ascontiguousarray(observations, dtype=np.float32)).to(self.device)

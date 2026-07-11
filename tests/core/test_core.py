@@ -133,34 +133,41 @@ def test_eval_refs_one_ckpt():
     assert len(refs) == 2
 
 
-def test_eval_refs_evenly_spaced():
-    """ckpts=[10..60], step=65, ref_count=3 → best + 2 evenly-spaced."""
+def test_eval_refs_historical_bests():
+    """Milestones picked evenly from historical bests in best_step.txt."""
     import os
     best_file = os.path.join(".", "best_step.txt")
-    if os.path.exists(best_file):
+    # best_step.txt: accumulated historical bests, newest last
+    with open(best_file, "w") as f:
+        for s in [10, 20, 35, 50, 65]:
+            f.write(f"{s}\n")
+    try:
+        # current best=65, history=[10,20,35,50]
+        # ref_count=3 → 1 best + 2 milestones from history
+        # n_segments=2, i=1: idx=1*4//3=1→20, i=2: idx=2*4//3=2→35
+        refs = select_eval_references([10, 20, 35, 50, 65], 70, ".", ref_count=3)
+        assert refs[0] == 65      # current best (last line)
+        assert 20 in refs          # milestone from history
+        assert 35 in refs          # milestone from history
+        assert len(refs) == 3
+    finally:
         os.remove(best_file)
-    ckpts = list(range(10, 61, 10))
-    refs = select_eval_references(ckpts, 65, ".", ref_count=3)
-    assert refs[0] == 10   # best
-    # targets: 65//3≈21 → 20, 65*2//3≈43 → 40
-    assert 20 in refs
-    assert 40 in refs
-    assert len(refs) == 3
-    os.remove(best_file)
 
 
 def test_eval_refs_best_not_duplicated():
-    """When best == a milestone candidate, don't duplicate."""
-    ckpts = [50, 40, 30, 20, 10]
+    """Milestones from history exclude current best."""
     import os
     best_file = os.path.join(".", "best_step.txt")
     with open(best_file, "w") as f:
-        f.write("50")
+        for s in [20, 50]:
+            f.write(f"{s}\n")
     try:
-        refs = select_eval_references(ckpts, 55, ".", ref_count=3)
-        assert refs[0] == 50
-        assert 50 not in refs[1:]
-        assert len(refs) >= 2
+        # best_step.txt lines=[20,50], current best=50, history=[20]
+        refs = select_eval_references([50, 40, 30, 20, 10], 55, ".", ref_count=3)
+        assert refs[0] == 50      # current best
+        assert refs[1] == 20      # only history entry
+        assert refs[2] == -1      # padded with random (history too short)
+        assert len(refs) == 3
     finally:
         os.remove(best_file)
 
@@ -180,37 +187,63 @@ def test_eval_refs_no_best_file():
             os.remove(best_file)
 
 
-def test_eval_refs_spread_across_history():
-    """Larger ref_count covers more of the training history."""
-    ckpts = list(range(10, 101, 10))
-    refs = select_eval_references(ckpts, 105, ".", ref_count=5)
-    # best=10, targets: 105//6≈17→20, 105*2//6=35→30 or 40, 105*3//6=52→50, 105*4//6=70→70
-    assert refs[0] == 10
-    assert len(refs) >= 4
+def test_eval_refs_history_spread():
+    """Larger ref_count covers more of the historical bests."""
+    import os
+    best_file = os.path.join(".", "best_step.txt")
+    with open(best_file, "w") as f:
+        for s in [20, 40, 60, 80, 100, 120, 140, 160, 180, 200]:
+            f.write(f"{s}\n")
+    try:
+        # current best=200, history=[20,40,...,180] (9 entries)
+        # ref_count=5 → 1 best + 4 milestones
+        # n_segments=4, i=1..4: indices 1,3,4,6 = [40, 80, 100, 140]
+        ckpts = list(range(20, 201, 20))
+        refs = select_eval_references(ckpts, 210, ".", ref_count=5)
+        assert refs[0] == 200     # current best
+        assert len(refs) >= 4
+        # All refs from historical bests (not arbitrary checkpoints)
+        for r in refs[1:]:
+            assert r in [20, 40, 60, 80, 100, 120, 140, 160, 180]
+    finally:
+        os.remove(best_file)
 
 
 def test_equal_spacing_ref_count_4():
-    """ref_count=4 → 3 milestones, boundaries at step/5 fractions."""
-    ckpts = list(range(10, 91, 10))  # [10..90]
-    # step=95, ref_count=4, n_segments=3, step//(n_segments+1)=95//4=23
-    # targets: 23, 47, 71 → nearest: 20, 50, 70
-    refs = select_eval_references(ckpts, 95, ".", ref_count=4)
-    assert refs[0] == 10   # best
-    assert refs[1] == 20   # nearest to 23
-    assert refs[2] == 50   # nearest to 47 (40=7, 50=3)
-    assert refs[3] == 70   # nearest to 71 (70=1, 80=9)
-    assert len(refs) == 4
+    """ref_count=4 → 3 milestones from history."""
+    import os
+    best_file = os.path.join(".", "best_step.txt")
+    with open(best_file, "w") as f:
+        for s in [10, 20, 35, 50, 70, 90]:
+            f.write(f"{s}\n")
+    try:
+        # current best=90, history=[10,20,35,50,70] (5 entries)
+        # n_segments=3, i=1: idx=1*5//4=1→20, i=2: idx=2*5//4=2→35, i=3: idx=3*5//4=3→50
+        refs = select_eval_references(list(range(10, 100, 10)), 95, ".", ref_count=4)
+        assert refs[0] == 90     # current best
+        assert refs[1] == 20
+        assert refs[2] == 35
+        assert refs[3] == 50
+        assert len(refs) == 4
+    finally:
+        os.remove(best_file)
 
 
 def test_equal_spacing_early_training():
-    """Early training with few checkpoints: still evenly distributed."""
-    ckpts = [5, 10]
-    refs = select_eval_references(ckpts, 15, ".", ref_count=2)
-    # best=5, 1 milestone: target=15//3=5, nearest=5 but 5 is best → fallback=10
-    # Actually best=5 (oldest), then target=15//3=5 → 5 is best (in refs) →
-    # no exact match, nearest unchecked is 10 (|10-5|=5). refs=[5, 10]
-    assert 5 in refs and 10 in refs
-    assert len(refs) == 2
+    """Early training with few historical bests."""
+    import os
+    best_file = os.path.join(".", "best_step.txt")
+    with open(best_file, "w") as f:
+        for s in [5, 10]:
+            f.write(f"{s}\n")
+    try:
+        # current best=10, history=[5] (1 entry)
+        # 1 milestone → idx = 1*1//2 = 0 → history[0]=5
+        refs = select_eval_references([5, 10], 15, ".", ref_count=2)
+        assert 10 in refs and 5 in refs
+        assert len(refs) == 2
+    finally:
+        os.remove(best_file)
 
 
 def test_equal_spacing_ref_count_1():
@@ -218,7 +251,8 @@ def test_equal_spacing_ref_count_1():
     ckpts = list(range(10, 51, 10))
     refs = select_eval_references(ckpts, 55, ".", ref_count=1)
     assert len(refs) == 1
-    assert 10 in refs  # best = oldest
+    assert 10 in refs  # best = oldest (auto-init)
+
 
 def test_eval_refs_count_never_exceeds():
     """refs count never exceeds ref_count."""
@@ -231,6 +265,26 @@ def test_eval_refs_count_never_exceeds():
         refs = select_eval_references(ckpts, 205, ".", ref_count=n)
         assert len(refs) <= n
     if os.path.exists(best_file):
+        os.remove(best_file)
+
+
+def test_eval_refs_history_too_short_pads_random():
+    """When history is shorter than ref_count-1, pad with random."""
+    import os
+    best_file = os.path.join(".", "best_step.txt")
+    with open(best_file, "w") as f:
+        for s in [20, 50]:
+            f.write(f"{s}\n")
+    try:
+        # current best=50, history=[20] (1 entry)
+        # ref_count=3 → 1 best + 1 history milestone = 2 → pad random
+        ckpts = [50, 40, 30, 20, 10]
+        refs = select_eval_references(ckpts, 55, ".", ref_count=3)
+        assert refs[0] == 50     # current best
+        assert 20 in refs         # history milestone
+        assert -1 in refs         # padded with random
+        assert len(refs) == 3
+    finally:
         os.remove(best_file)
 
 
@@ -377,8 +431,8 @@ def main():
         test_assign_players_colour_swap,
         test_assign_players_explicit_use,
         test_eval_refs_empty, test_eval_refs_one_ckpt,
-        test_eval_refs_evenly_spaced, test_eval_refs_best_not_duplicated,
-        test_eval_refs_no_best_file, test_eval_refs_spread_across_history,
+        test_eval_refs_historical_bests, test_eval_refs_best_not_duplicated,
+        test_eval_refs_no_best_file, test_eval_refs_history_spread,
         test_equal_spacing_ref_count_4, test_equal_spacing_early_training,
         test_equal_spacing_ref_count_1,
         test_eval_refs_count_never_exceeds,
