@@ -1142,6 +1142,7 @@ class BatchMCTS:
         Skips nodes that already have a proven outcome — their value is
         settled and extra visits only inflate counts.
         """
+        clamped = False
         for i in range(len(path) - 1, -1, -1):
             node = path[i]
             # Always clean up virtual loss, even for proven nodes
@@ -1153,6 +1154,14 @@ class BatchMCTS:
             while path[decision_idx].player == pyspiel.PlayerId.CHANCE:
                 decision_idx -= 1
             target = returns[path[decision_idx].player]
+
+            # drawable: a proven-draw child exists, so this node can't be
+            # worse than draw.  Clamp Q to 0, set draw=1, and propagate
+            # upward so parent nodes also see the clamped value.
+            clamped = clamped or (node.drawable and target < 0)
+            if clamped:
+                target = 0.0
+                draw_prob = 1.0
 
             node.total_reward += target
             node.draw_reward += draw_prob

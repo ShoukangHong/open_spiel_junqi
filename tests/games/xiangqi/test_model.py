@@ -128,6 +128,31 @@ def test_model_update_wdl():
     assert loss.value > 0
 
 
+def test_value_loss_skips_zero_targets():
+    """Zero-target samples (child_surprise) don't affect value loss."""
+    net = _make_net()
+    model = Model(net, device="cpu")
+    # Batch: 2 normal samples + 2 zero-target
+    obs = np.random.randn(4, 1530).astype(np.float32)
+    mask = np.ones((4, 8100), dtype=bool)
+    pol = np.random.rand(4, 8100).astype(np.float32)
+    pol /= pol.sum(axis=-1, keepdims=True)
+    val = np.array([[1, 0, 0], [0, 0, 1], [0, 0, 0], [0, 0, 0]],
+                   dtype=np.float32)
+    batch = TrainInput(observation=obs, legals_mask=mask, policy=pol, value=val)
+    loss_mixed = model.update(batch)
+
+    # Same batch without zero-targets — should have ~same value loss
+    val2 = np.array([[1, 0, 0], [0, 0, 1]], dtype=np.float32)
+    batch2 = TrainInput(observation=obs[:2], legals_mask=mask[:2],
+                        policy=pol[:2], value=val2)
+    loss_clean = model.update(batch2)
+
+    # Value loss should be similar (not diluted by 2/4 factor)
+    assert abs(loss_mixed.value - loss_clean.value) < 0.05, \
+        f"mixed={loss_mixed.value:.4f} clean={loss_clean.value:.4f}"
+
+
 # ── MCTS evaluator ───────────────────────────────────────────────────────────
 
 def test_evaluator_wdl_returns_triple():
@@ -207,7 +232,7 @@ def test_play_game_xiangqi():
     cfg.prune_enabled = False
     cfg.policy_mix_alpha = 0
 
-    states_info, returns, rare_games, wstats = play_game(
+    states_info, returns, rare_games, wstats, _ = play_game(
         game, mcts, mcts, cfg, np.random.RandomState(42), allow_weak=False)
 
     assert len(states_info) > 0

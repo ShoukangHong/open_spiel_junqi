@@ -64,7 +64,7 @@ def compute_alpha(step_index: int, game_length: int, offset: int,
     step_pos = offset + step_index
     if step_pos < temperature_drop:
         return 0.0
-    return min(step_pos / denom, 1.0)
+    return min(step_pos / denom, 1.0) * 0.7 + 0.3
 
 
 def _mcts_wdl(q_value, draw_rate):
@@ -187,7 +187,7 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
             mcts_p0, mcts_p1, use_best, use_opp = assign_players(
                 rng, mcts_main, mcts_best, mcts_opp,
                 cfg.best_model_prob, cfg.random_opponent_prob)
-        states_info, returns, rare_games, wstats = play_game_fn(
+        states_info, returns, rare_games, wstats, eff_td = play_game_fn(
             game, mcts_p0, mcts_p1, cfg, rng, logger=logger,
             init_state=init_state, allow_weak=allow_weak)
         for rs in rare_games:
@@ -210,7 +210,8 @@ def actor_process(config_class, cfg_dict, incoming_q, result_q, state_queue,
                                   new_tag, *item[5:])
         rare_at = len(init_state.history()) if init_state is not None else 0
         try:
-            state_queue.put((states_info, returns, wstats, rare_at), timeout=1)
+            state_queue.put((states_info, returns, wstats, rare_at, eff_td),
+                            timeout=1)
         except queue.Full:
             print("[actor] WARNING: queue full, dropping game", flush=True)
 
@@ -367,9 +368,13 @@ def run_training(
             while total_states < samples_per_step:
                 for _, q in actors:
                     try:
-                        states_info, returns, wstats, rare_at = q.get_nowait()
+                        states_info, returns, wstats, rare_at, eff_td = q.get_nowait()
                     except queue.Empty:
                         continue
+                    cfg._td_cnt = getattr(cfg, '_td_cnt', 0) + 1
+                    cfg._td_sum = getattr(cfg, '_td_sum', 0) + eff_td
+                    if eff_td == 0:
+                        cfg._td_zero = getattr(cfg, '_td_zero', 0) + 1
                     accum_wstats(cfg, wstats)
                     game_outcome_p0 = returns[0]
 
@@ -386,11 +391,15 @@ def run_training(
                         q_value = item[5] if len(item) > 5 else 0.0
                         draw_rate = item[6] if len(item) > 6 else 0.0
                         if "child_" in tag:
-                            val = _mcts_wdl(q_value, draw_rate)
+                            # child_surprise: skip value unless proven
+                            if abs(q_value) == 1.0 or draw_rate == 1.0:
+                                val = _mcts_wdl(q_value, draw_rate)
+                            else:
+                                val = np.zeros(3, dtype=np.float32)
                         else:
                             step_i = item[8] if len(item) > 8 and item[8] >= 0 else i
                             alpha = compute_alpha(
-                                step_i, game_length, offset, cfg.temperature_drop)
+                                step_i, game_length, offset, eff_td)
                             val = _mixed_target(returns[cur_player], q_value,
                                                 draw_rate, alpha)
                         buffer.append(obs, mask, policy, val, tag,
@@ -474,7 +483,9 @@ def run_training(
                 f"buffer={len(buffer):5d}/{buffer.total_seen:5d}"
                 f" uniq_ratio={buffer.recent_unique_ratio:.1%}"
                 f"  tags={buffer.tag_counts()}"
-                f"  weak={wstats_summary(cfg)}  "
+                f"  td0={getattr(cfg, '_td_zero', 0)/max(getattr(cfg, '_td_cnt', 1), 1):.0%}"
+                            f" td_avg={getattr(cfg, '_td_sum', 0)/max(getattr(cfg, '_td_cnt', 1), 1):.1f}  "
+                            f"weak={wstats_summary(cfg)}  "
                 f"{buffer.sample_diag()}  "
                 f"states/s={states_per_s:.1f}  "
                 f"selfplay={selfplay_time:.1f}s  train={train_time:.1f}s"
@@ -492,6 +503,9 @@ def run_training(
                          f"  draw={outcomes['draw']/g:.1%}")
             _log(log_line)
             reset_wstats(cfg)
+            cfg._td_cnt = 0
+            cfg._td_sum = 0
+            cfg._td_zero = 0
 
             # ── Checkpoint ─────────────────────────────────────────────
             if step % cfg.checkpoint_freq == 0:

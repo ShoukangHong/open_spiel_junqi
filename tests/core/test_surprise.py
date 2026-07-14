@@ -168,14 +168,13 @@ def test_stable_qdr_outcome():
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def test_child_surprise_value():
+    """Non-proven child: value surprise skipped, no tag despite value mismatch."""
     cfg = _FakeConfig()
     game = pyspiel.load_game("tic_tac_toe")
     state = game.new_initial_state()
 
-    # Child where MCTS found Q≈-0.8 while NN says Q≈0.8 → value surprise
-    # c.state.current_player() = 1 (root player=0 made a move), so both
-    # c.nn_q and _stable_qdr(c) are from player 1's perspective
-    cc = _make_child(0, 15, -12, prior=0.5, player=1)  # Q=-0.8 from player 1
+    cc = _make_child(0, 15, -12, prior=0.5, player=1)
+    # outcome=None (non-proven) → value KL forced to 0
     c = _make_child(0, 200, -160, prior=0.5, player=1,
                     nn_q=0.8, nn_draw=0.0,
                     nn_prior=[(0, 0.5), (1, 0.5)],
@@ -186,11 +185,30 @@ def test_child_surprise_value():
     root.draw_reward = 0.1
 
     _, child_tags, _ = detect_surprise(state, root, cfg, game.max_utility())
-    assert 0 in child_tags, f"Expected child_surprise, got {child_tags}"
-    ctag, _ = child_tags[0]
-    assert ctag in ("child_surprise", "child_super_surprise"), \
-        f"Expected child_surprise or child_super_surprise, got {ctag}"
-    print(f"  Test G PASSED (tag={ctag})")
+    assert 0 not in child_tags, \
+        f"Non-proven child should not trigger value surprise, got {child_tags}"
+
+
+def test_child_surprise_value_proven():
+    """Proven child (outcome set) still triggers value surprise."""
+    cfg = _FakeConfig()
+    game = pyspiel.load_game("tic_tac_toe")
+    state = game.new_initial_state()
+
+    cc = _make_child(0, 15, -12, prior=0.5, player=1)
+    c = _make_child(0, 200, -160, prior=0.5, player=1,
+                    nn_q=0.8, nn_draw=0.0,
+                    nn_prior=[(0, 0.5), (1, 0.5)],
+                    draw_reward=0.0, children=[cc])
+    c.outcome = np.array([0.0, 0.0])  # proven draw
+
+    root = _make_root(nn_q=0.3, nn_draw=0.1, children=[c])
+    root.total_reward = 60
+    root.draw_reward = 0.1
+
+    _, child_tags, _ = detect_surprise(state, root, cfg, game.max_utility())
+    assert 0 in child_tags, \
+        f"Proven child should trigger value surprise, got {child_tags}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

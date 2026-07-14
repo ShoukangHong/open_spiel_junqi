@@ -56,7 +56,7 @@ def test_temperature_sampling_not_argmax():
     # Channel 1 = player 0 pieces.  Find which position got a piece.
     first_actions = []
     for _ in range(200):
-        states_info, _, _, _ = play_game(
+        states_info, _, _, _, _ = play_game(
             game, mcts, mcts, _TestCfg(), np.random.RandomState(), allow_weak=False)
         obs1 = states_info[1][0]  # observation before second move
         # Tic-tac-toe CHW: ch0=empty, ch1=p1(O), ch2=p0(X)
@@ -278,6 +278,62 @@ def test_draw_truncate_not_when_also_winning():
         p, _fake_root(1.0, draw_rate=0.99), 0, _FakeCfg(), 1.0, 0.5)
     assert br
     assert not p2["draw_truncate"]
+
+
+def _make_play_cfg(temperature_drop=0):
+    """Config stub with all attributes play_game expects."""
+    return type("_Cfg", (), dict(
+        temperature=0.01, temperature_drop=temperature_drop,
+        policy_mix_alpha=0, adv_temperature=0.2,
+        prune_enabled=False, prune_threshold=0.99, prune_prob=0.9,
+        weak_side_prob=0, weak_move_prob=0,
+        weak_max_per_game=0, weak_move_max_step=200,
+        rare_case_threshold=0, weak_move_threshold=0,
+        surprise_pol_kl=0.3, surprise_val_kl=0.3,
+        surprise_child_min_n=150,
+    ))()
+
+
+def test_eff_td_tracking():
+    """eff_td tracks last deviating step in [0, temperature_drop]."""
+    import pyspiel
+    from train.batch_mcts.config import MCTSConfig
+    from train.batch_mcts.evaluator import BatchRandomRolloutEvaluator
+    from train.batch_mcts.mcts import BatchMCTS
+    from train.core.play import play_game
+
+    game = pyspiel.load_game("tic_tac_toe")
+    ev = BatchRandomRolloutEvaluator(n_rollouts=1)
+    cfg = MCTSConfig(max_simulations=32, batch_size=8,
+                     temperature_drop=10, policy_epsilon=0,
+                     solve=False, verbose=False)
+    mcts = BatchMCTS(game, cfg, ev)
+    rng = np.random.RandomState(42)
+
+    _, _, _, _, eff_td = play_game(game, mcts, mcts,
+                                    _make_play_cfg(10), rng)
+    assert 0 <= eff_td <= 10, f"eff_td={eff_td}"
+
+
+def test_eff_td_zero_with_zero_td():
+    """With temperature_drop=0, eff_td always 0."""
+    import pyspiel
+    from train.batch_mcts.config import MCTSConfig
+    from train.batch_mcts.evaluator import BatchRandomRolloutEvaluator
+    from train.batch_mcts.mcts import BatchMCTS
+    from train.core.play import play_game
+
+    game = pyspiel.load_game("tic_tac_toe")
+    ev = BatchRandomRolloutEvaluator(n_rollouts=1)
+    cfg = MCTSConfig(max_simulations=32, batch_size=8,
+                     temperature_drop=0, policy_epsilon=0,
+                     solve=False, verbose=False)
+    mcts = BatchMCTS(game, cfg, ev)
+    rng = np.random.RandomState(42)
+
+    _, _, _, _, eff_td = play_game(game, mcts, mcts,
+                                    _make_play_cfg(0), rng)
+    assert eff_td == 0, f"With td=0: {eff_td}"
 
 
 def test_play():

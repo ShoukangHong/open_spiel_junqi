@@ -44,6 +44,7 @@ class Node:
         "nn_prior",        # NN prior distribution (list of (action, prob))
         "nn_prior_max",    # NN's max prior among legal actions
         "nn_argmax",       # NN's argmax action
+        "drawable",        # at least one child is a proven draw
     )
 
     def __init__(self, action: Optional[int], player: int, prior: float):

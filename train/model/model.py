@@ -119,14 +119,19 @@ class Model:
             p_kl = ((p_weights * (p_ce - p_ent)).sum()
                     / p_weights.sum().clamp(min=1)).item()
 
-        # Value loss: cross-entropy with soft WDL target
+        # Value loss: cross-entropy with soft WDL target.
+        # Zero-target samples (child_surprise without proven outcome)
+        # carry v_weight=0 so they don't dilute gradients.
+        v_weights = torch.ones(target_value.shape[0], device=dev)
+        v_weights[target_value.sum(dim=-1) < 0.001] = 0.0
         log_val = F.log_softmax(value_pred, dim=-1)
-        value_loss = -(target_value * log_val).sum(dim=-1).mean()
+        v_ce = -(target_value * log_val).sum(dim=-1)
+        value_loss = (v_weights * v_ce).sum() / v_weights.sum().clamp(min=1)
 
         with torch.no_grad():
-            v_ce = -(target_value * log_val).sum(dim=-1)
             v_ent = -(target_value * torch.log(target_value + eps)).sum(dim=-1)
-            v_kl = (v_ce - v_ent).mean().item()
+            v_kl = ((v_weights * (v_ce - v_ent)).sum()
+                    / v_weights.sum().clamp(min=1)).item()
 
         l2_reg = sum(
             (p ** 2).sum()

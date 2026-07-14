@@ -23,7 +23,7 @@ def _stable_qdr(node):
     max_n = max(c.explore_count for c in node.children)
     if max_n == 0:
         return node.q_value, node.draw_rate
-    threshold = max_n * 0.1
+    threshold = max_n * 0.05
     if max_n > 1:
         threshold = max(threshold, 1.0)
     valid = [c for c in node.children if c.explore_count > threshold]
@@ -32,6 +32,9 @@ def _stable_qdr(node):
         if total_n > 0:
             q = sum(c.total_reward for c in valid) / total_n
             dr = sum(c.draw_reward for c in valid) / total_n
+            if node.drawable and q < 0:
+                q = 0.0
+                dr = max(dr, 1.0)
             return q, dr
     return node.q_value, node.draw_rate
 
@@ -128,6 +131,13 @@ def detect_surprise(state, root, config, game_max_utility=1.0):
     pol_kl, val_kl = _node_pol_val_kl(
         root, cur, root.nn_q, root.nn_draw, root_nn_prior, game_max_utility)
 
+    # Scale by position balance: decisive positions (max WDL ≈ 1)
+    # get little surprise credit; balanced positions get full weight.
+    mcts_q, mcts_draw = _stable_qdr(root)
+    wdl_scale = 2.0 - max(_wdl_from_qdr(mcts_q, mcts_draw)) ** 2
+    pol_kl *= wdl_scale
+    val_kl *= wdl_scale
+
     root_tag, combined = _surprise_tag(pol_kl, val_kl)
 
     # ── Children ──────────────────────────────────────────────────────
@@ -151,6 +161,13 @@ def detect_surprise(state, root, config, game_max_utility=1.0):
             else:
                 c_pol_kl = 0.0
                 c_val_kl = _node_val_kl(c, c.nn_q, c.nn_draw)
+            # Non-proven children: skip value surprise (MCTS value is noisy)
+            if c.outcome is None:
+                c_val_kl = 0.0
+            # Scale by decisiveness
+            c_wdl_scale = 2.0 - max(_wdl_from_qdr(*_stable_qdr(c))) ** 2
+            c_pol_kl *= c_wdl_scale
+            c_val_kl *= c_wdl_scale
             ctag, c_combined = _surprise_tag(c_pol_kl, c_val_kl,
                                              prefix="child_")
             if ctag:

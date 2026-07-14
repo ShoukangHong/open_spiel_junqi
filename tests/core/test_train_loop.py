@@ -132,3 +132,43 @@ class TestComputeAlpha:
             alpha = compute_alpha(step_i, length, offset, td)
             assert 0.0 <= alpha <= 1.0, \
                 f"alpha={alpha} out of bounds for ({step_i}, {length}, {offset}, {td})"
+
+
+def test_child_surprise_value_zero_unless_proven():
+    """child_surprise with unproven q_value → zero value target."""
+    from train.core.train_loop import _mcts_wdl
+    # Proven: q=1.0 (exact) → should compute normal WDL
+    val_p = _mcts_wdl(1.0, 0.0)
+    assert val_p[0] > 0.9  # nearly certain win
+    # Unproven: q=0.7 → should be zeros (the caller handles this)
+    # (tested in the caller logic below)
+
+
+def test_child_surprise_proven_detection():
+    """Only child_surprise with abs(q)==1.0 or dr==1.0 gets non-zero value."""
+    import numpy as np
+    from train.core.train_loop import _mcts_wdl
+
+    def child_val(q, dr):
+        if abs(q) == 1.0 or dr == 1.0:
+            return _mcts_wdl(q, dr)
+        return np.zeros(3, dtype=np.float32)
+
+    # Proven win
+    v = child_val(-1.0, 0.0)
+    assert v[2] > 0.9, f"proven loss should have high loss prob, got {v}"
+
+    # Proven draw
+    v = child_val(0.0, 1.0)
+    assert v[1] > 0.9, f"proven draw should have high draw prob, got {v}"
+
+    # Unproven — should be zero
+    v = child_val(0.7, 0.1)
+    assert v.sum() == 0.0, f"unproven should be all zeros, got {v}"
+
+    v = child_val(0.0, 0.3)
+    assert v.sum() == 0.0, f"unproven should be all zeros, got {v}"
+
+    # Edge: q=1.0 IS proven (solver sets outcome)
+    v = child_val(1.0, 0.0)
+    assert v[0] > 0.9, f"proven win should have high win prob, got {v}"

@@ -166,10 +166,10 @@ class ReplayBuffer:
         return self.sample_weighted(n)
 
     def sample_weighted(self, n: int) -> TrainInput:
-        """Linear-weighted random sample — newer rows have higher probability.
+        """Sqrt-weighted random sample — newer rows have higher probability.
 
-        Weight ∝ position within the window (0 = oldest, w-1 = newest).
-        Samples via inverse-CDF of pos² distribution.
+        Weight ∝ sqrt(position), so the probability density grows as √x.
+        Inverse CDF: pos = w · u^(2/3).
         """
         if self._conn is None:
             raise RuntimeError("sample() requires a DB-backed buffer")
@@ -177,8 +177,7 @@ class ReplayBuffer:
         if w == 0:
             raise RuntimeError("buffer is empty")
         u = self._sample_rng.random(n).astype(np.float64)
-        pos = np.clip((np.sqrt(u * w * (w + 1) + 0.25) - 0.5).astype(np.int64),
-                       0, w - 1)
+        pos = np.clip((u ** (2.0 / 3.0) * w).astype(np.int64), 0, w - 1)
         start_abs = max(0, self._total - w)
         abs_ids = (start_abs + pos + 1).tolist()
         return self._sample_by_ids(abs_ids)

@@ -75,7 +75,7 @@ def _stable_qdr(root):
     max_n = max(c.explore_count for c in root.children)
     if max_n == 0:
         return root.q_value, root.draw_rate
-    threshold = max_n * 0.1
+    threshold = max_n * 0.05
     if max_n > 1:
         threshold = max(threshold, 1.0)
     valid = [c for c in root.children if c.explore_count > threshold]
@@ -84,6 +84,9 @@ def _stable_qdr(root):
         if total_n > 0:
             q = sum(c.total_reward for c in valid) / total_n
             dr = sum(c.draw_reward for c in valid) / total_n
+            if root.drawable and q < 0:
+                q = 0.0
+                dr = max(dr, 1.0)
             return q, dr
     return root.q_value, root.draw_rate
 
@@ -150,6 +153,7 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
     wstats = {"rare": 0, "weak": 0, "weak_final": 0, "rare_flip": 0}
     state = game.new_initial_state() if init_state is None else init_state.clone()
     move_num = len(state.history())
+    eff_td = move_num  # rare fork: temp_drop already passed in parent game
     weak_enabled = allow_weak  # only forks pass False
 
     weak_side, weak_max, weak_steps = _setup_weak_moves(
@@ -308,6 +312,9 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
         else:
             action = rng.choice(len(sel_probs), p=sel_probs)
 
+        if not after_drop and action != mcts_action:
+            eff_td = move_num + 1  # last step where tau sampling overrode MCTS
+
         if logger is not None:
             children_sorted = sorted(
                 root.children, key=lambda c: c.explore_count, reverse=True)
@@ -355,4 +362,4 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
     if len(copies) > max_copies:
         copies = copies[:max_copies]
     states_info.extend(copies)
-    return states_info, returns, rare_games, wstats
+    return states_info, returns, rare_games, wstats, eff_td

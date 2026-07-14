@@ -292,11 +292,11 @@ def test_tag_counts_sql():
         except: pass
 
 
-def test_linear_weighted_distribution():
-    """Linear weight ∝ (pos+1): newer rows sampled proportionally more.
+def test_sqrt_weighted_distribution():
+    """Sqrt weight ∝ √(pos+1): newer rows sampled more, but softly.
 
-    1000 rows, 20000 samples.  Theoretical: newer half ≈ 75% of weight,
-    newest 10% ≈ 19× oldest 10%, each decile strictly > previous.
+    1000 rows, 20000 samples.  Theoretical: newer half ≈ 65% of weight,
+    newest 10% ≈ 4.6× oldest 10%, each decile strictly > previous.
     """
     import sqlite3
     from collections import Counter
@@ -319,14 +319,14 @@ def test_linear_weighted_distribution():
     total = sum(id_counts.values())
     assert total > 1000
 
-    # Newer half (indices 500-999) should dominate — theoretical ≈ 75%
+    # Newer half (indices 500-999) — theoretical ≈ 64.6%
     newer = sum(c for rid, c in id_counts.items() if rid >= 500)
-    assert newer / total > 0.65, f"Newer half too low: {newer/total:.1%}"
+    assert newer / total > 0.55, f"Newer half too low: {newer/total:.1%}"
 
-    # Newest 10% (900-999) >> oldest 10% (0-99) — theoretical ~19×
+    # Newest 10% vs oldest 10% — theoretical ~4.6×
     newest10 = sum(c for rid, c in id_counts.items() if rid >= 900)
     oldest10 = sum(c for rid, c in id_counts.items() if rid < 100)
-    assert newest10 >= 10 * oldest10, \
+    assert newest10 >= 3 * oldest10, \
         f"Newest10={newest10}  Oldest10={oldest10}  ratio={newest10/max(oldest10,1):.1f}"
 
     # Strict monotonic deciles — each later decile strictly > previous

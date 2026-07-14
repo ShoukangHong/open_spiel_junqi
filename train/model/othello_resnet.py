@@ -48,8 +48,8 @@ class OthelloResNet(nn.Module):
 
         # Value head — WDL: 3 output classes (win, draw, loss)
         self.value_conv = nn.Conv2d(nn_width, 4, 1, bias=False)
-        self.value_bn = nn.BatchNorm2d(4)
         self.value_fc1 = nn.Linear(4 * board_size * board_size, nn_width)
+        self.value_ln = nn.LayerNorm(nn_width)
         self.value_fc2 = nn.Linear(nn_width, 3)
 
         self._init_weights()
@@ -93,9 +93,9 @@ class OthelloResNet(nn.Module):
         policy_logits = self.policy_fc(p)
 
         # Value head
-        v = F.relu(self.value_bn(self.value_conv(x)))
-        v = v.reshape(batch, -1)
-        v = F.relu(self.value_fc1(v))
+        v = self.value_conv(x)
+        v = self.value_fc1(v.reshape(batch, -1))             # (batch, nn_width)
+        v = F.relu(self.value_ln(v))                         # norm → activate
         value = self.value_fc2(v)  # (batch, 3) logits
 
         return policy_logits, value

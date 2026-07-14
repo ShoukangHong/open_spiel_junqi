@@ -71,6 +71,8 @@ class StepRecord:
     p0_pct: float = 0.0
     p1_pct: float = 0.0
     draw_pct: float = 0.0
+    td0: float = 0.0              # fraction of games with zero deviation
+    td_avg: float = 0.0           # average effective temp_drop steps
     diag_total: float = 0.0       # total rows sampled this step
     diag_smin: int = 0            # earliest training step sampled
     diag_smax: int = 0            # latest training step sampled
@@ -88,6 +90,7 @@ _LINE1_RE = re.compile(
     r"buffer=\s*(?P<buf_cur>\d+)/\s*(?P<buf_total>\d+)\s+"
     r"(?:unique=\s*(?P<unique>\d+)\s+|uniq_ratio=\s*(?P<unique_perc>[\d.]+)%\s+)"
     r"tags=\{(?P<tags>[^}]*)\}\s+"
+    r"(?:td0=(?P<td0>[\d.]+)%\s+td_avg=(?P<td_avg>[\d.]+)\s+)?"
     r"weak=rare=(?P<rare>\d+)\s+(rf=(?P<rf>\d+)\s+)?"
     r"wf=(?P<wf>\d+)\s+weak=(?P<weak>\d+)\s+"
     r"\(\d+d games\)\s+\|\s+"
@@ -175,6 +178,8 @@ def parse_training_log(log_path: str) -> tuple:
                         "states_per_s": 0.0,
                         "selfplay_s": 0.0,
                         "train_s": float(d["train"]),
+                        "td0": 0.0,
+                        "td_avg": 0.0,
                     }
                     continue
 
@@ -219,6 +224,8 @@ def parse_training_log(log_path: str) -> tuple:
                     "states_per_s": float(d["sps"]),
                     "selfplay_s": float(d["selfplay"]),
                     "train_s": float(d["train"]),
+                    "td0": float(d.get("td0") or 0) / 100,
+                    "td_avg": float(d.get("td_avg") or 0),
                 }
                 # Extract diag data from same line
                 dm = _DIAG_RE.search(line)
@@ -434,14 +441,17 @@ def plot_metrics(records: List[StepRecord], smooth: int = 1,
     ax = axes[2, 0]
     buf_cur = arr("buffer_current")
     unique = arr("unique_states")
+    td0 = arr("td0")
     ax.plot(steps, buf_cur, color="#607D8B", linewidth=1.2, label="buffer")
     ax2 = ax.twinx()
-    ax2.plot(steps, unique, color="#FF9800", linewidth=1.0, alpha=0.7)
-    ax2.set_ylabel("Unique %", color="#FF9800")
+    ax2.plot(steps, unique / 100, color="#FF9800", linewidth=1.0, alpha=0.7, label="unique%")
+    ax2.plot(steps, td0, color="#4CAF50", linewidth=1.0, alpha=0.7, label="td0")
+    ax2.set_ylabel("Unique% / td0", color="#FF9800")
     ax2.tick_params(axis="y", colors="#FF9800")
-    ax2.set_ylim(0, 105)
-    ax.set_title("Buffer Health")
+    ax2.set_ylim(0, 1.05)
+    ax.set_title("Buffer Health & Diversity")
     ax.legend(fontsize=7, loc="upper left")
+    ax2.legend(fontsize=6, loc="upper right")
     ax.grid(True, alpha=0.25)
 
     # ── (2,1) Value quality ────────────────────────────────────────────
@@ -546,6 +556,8 @@ def print_summary(records: List[StepRecord]):
         ("top1", "Top1 acc", "{:.1%} → {:.1%}"),
         ("entropy", "Entropy", "{:.3f} → {:.3f}"),
         ("states_per_s", "States/s", "{:.0f} → {:.0f}"),
+        ("td0", "td0", "{:.1%} → {:.1%}"),
+        ("td_avg", "td_avg", "{:.1f} → {:.1f}"),
         ("p0_pct", "p0 win%", "{:.1f} → {:.1f}"),
         ("p1_pct", "p1 win%", "{:.1f} → {:.1f}"),
         ("draw_pct", "Draw%", "{:.1f} → {:.1f}"),

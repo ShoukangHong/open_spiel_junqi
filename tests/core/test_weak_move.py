@@ -84,7 +84,7 @@ def test_weak_max_zero():
     m = BatchMCTS(g, MCTSConfig(max_simulations=8, batch_size=4), ev,
                   random_state=np.random.RandomState(42))
     c = _cfg(weak_max_per_game=0, game="tic_tac_toe")
-    si, ret, rg, _ws = play_game(g, m, m, c, np.random.RandomState(42))
+    si, ret, rg, _ws, _ = play_game(g, m, m, c, np.random.RandomState(42))
     assert len(rg) == 0
     for it in si:
         assert (it[4] if len(it) > 4 else "") == ""
@@ -192,8 +192,8 @@ def test_fork_no_weak():
     st.apply_action(0); st.apply_action(4); st.apply_action(8)
     c = _cfg(game="tic_tac_toe", weak_max_per_game=3, weak_move_prob=1.0,
              weak_side_prob=1.0)
-    si, _, _, _ws2 = play_game(g, m, m, c, np.random.RandomState(42),
-                               init_state=st, allow_weak=False)
+    si, _, _, _ws2, _ = play_game(g, m, m, c, np.random.RandomState(42),
+                                 init_state=st, allow_weak=False)
     for it in si:
         assert (it[4] if len(it) > 4 else "") == ""
     print("PASSED")
