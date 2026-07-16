@@ -144,6 +144,109 @@ def test_child_surprise_value_zero_unless_proven():
     # (tested in the caller logic below)
 
 
+def test_dedup_child_surprise():
+    """Child_surprise duplicating a regular state is removed."""
+    from train.core.train_loop import _dedup_child_surprise
+    # 3-plane fake obs (piece counts don't matter, hash_obs uses game_name)
+    obs_a = np.ones(3, dtype=np.float32)
+    obs_b = obs_a.copy() + 1
+    obs_c = obs_a.copy() + 2
+    child_a = (obs_a, None, None, 0, "child_surprise", 0.0, 0.0)
+    child_b = (obs_b, None, None, 0, "child_surprise", 0.0, 0.0)
+    normal_a = (obs_a, None, None, 0, "", 0.0, 0.0)  # same as child_a
+    super_s = (obs_c, None, None, 0, "super_surprise", 0.0, 0.0, 0.0, 3)
+
+    # child_a dupes normal_a → removed
+    result = _dedup_child_surprise(
+        [normal_a, child_a, child_b, super_s], "othello")
+    tags = {item[4] for item in result}
+    assert "child_surprise" in tags     # child_b kept
+    assert len(result) == 3             # child_a removed
+
+
+def test_dedup_child_surprise_removes_dup():
+    """child_surprise duplicating a non-child state is removed."""
+    from train.core.train_loop import _dedup_child_surprise
+    # Xiangqi: planes 0-14 static, 15-16 dynamic
+    obs1 = np.zeros(17, dtype=np.float32)
+    obs1[0] = 1.0; obs1[14] = 1.0; obs1[15] = 0.2; obs1[16] = 0.1
+    obs2 = obs1.copy()
+    obs2[15] = 0.8; obs2[16] = 0.5  # same board, different counters
+
+    n = (obs1, None, None, 0, "", 0.3, 0.1)
+    c = (obs2, None, None, 0, "child_surprise", 0.3, 0.1)
+
+    result = _dedup_child_surprise([n, c], "xiangqi")
+    assert len(result) == 1
+    assert result[0][4] == ""               # normal survives
+    assert np.array_equal(result[0][0], obs1)
+
+
+def test_dedup_child_surprise_different_player_kept():
+    """Same board but different current player → different hash → both kept."""
+    from train.core.train_loop import _dedup_child_surprise
+    obs_red = np.zeros(17, dtype=np.float32)
+    obs_red[0] = 1.0; obs_red[14] = 1.0     # red to move
+    obs_black = obs_red.copy()
+    obs_black[14] = 0.0                      # black to move
+
+    n = (obs_red, None, None, 0, "", 0.3, 0.1)
+    c = (obs_black, None, None, 0, "child_surprise", -0.3, 0.1)
+
+    result = _dedup_child_surprise([n, c], "xiangqi")
+    assert len(result) == 2
+    assert result[0][4] == ""
+    assert result[1][4] == "child_surprise"
+
+
+def test_dedup_child_surprise_no_non_child():
+    """All child_surprise with no non-child to match → all kept."""
+    from train.core.train_loop import _dedup_child_surprise
+    obs_a = np.zeros(17, dtype=np.float32)
+    obs_b = obs_a.copy(); obs_b[0] = 1.0
+    items = [(obs_a, None, None, 0, "child_surprise", 0.0, 0.0),
+             (obs_b, None, None, 0, "child_surprise", 0.0, 0.0)]
+    result = _dedup_child_surprise(items, "xiangqi")
+    assert len(result) == 2
+
+
+def test_dedup_child_surprise_complex():
+    """6 states: 2 regular + 2 super_surprise + 2 child — one child dups."""
+    from train.core.train_loop import _dedup_child_surprise
+
+    def _obs(vals):
+        obs = np.zeros(17, dtype=np.float32)
+        for i, v in enumerate(vals):
+            obs[i] = v
+        return obs
+
+    # 2 regular states (different positions)
+    r0 = (_obs([1, 0, 0]), 0, 0, None, "", 0.3, 0.1)
+    r1 = (_obs([2, 0, 0]), 0, 0, None, "", -0.1, 0.2)
+
+    # 2 super_surprise states
+    s0 = (_obs([3, 0, 0]), 0, 0, None, "super_surprise", 0.5, 0.1, 0.2, 0)
+    s1 = (_obs([4, 0, 0]), 0, 0, None, "super_surprise", -0.5, 0.3, 0.1, 2)
+
+    # 2 child_surprise — c0 dups r0 (same static obs), c1 is unique
+    c0_obs = r0[0].copy()
+    c0_obs[15] = 0.9  # different counters, same board
+    c0 = (c0_obs, 0, 0, None, "child_surprise", 0.4, 0.2)
+
+    c1 = (_obs([5, 0, 0]), 0, 0, None, "child_surprise", 0.0, 0.5)
+
+    items = [r0, r1, s0, c0, s1, c1]
+    result = _dedup_child_surprise(items, "xiangqi")
+
+    # c0 removed (dups r0), everything else kept in order
+    expected = [r0, r1, s0, s1, c1]
+    assert len(result) == len(expected), \
+        f"expected {len(expected)}, got {len(result)}"
+    for i, (got, exp) in enumerate(zip(result, expected)):
+        assert tuple(got) == tuple(exp), \
+            f"index {i}: got {tuple(got)[:2]+(tuple(got)[4],)}, expected {tuple(exp)[:2]+(tuple(exp)[4],)}"
+
+
 def test_child_surprise_proven_detection():
     """Only child_surprise with abs(q)==1.0 or dr==1.0 gets non-zero value."""
     import numpy as np

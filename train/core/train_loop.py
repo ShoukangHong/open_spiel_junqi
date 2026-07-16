@@ -51,6 +51,25 @@ _LATEST = -999
 
 # ── WDL value target helpers ────────────────────────────────────────────────
 
+def _dedup_child_surprise(states_info, game_name):
+    """Remove child_surprise entries whose state already appears as a
+    regular or root/super-surprise sample in the same game."""
+    from train.core.position_hash import hash_obs
+    seen = set()
+    keep = []
+    for item in states_info:
+        tag = item[4] if len(item) > 4 else ""
+        if "child_" not in tag:
+            seen.add(hash_obs(item[0], game_name))
+            keep.append(item)
+            continue
+        if hash_obs(item[0], game_name) in seen:
+            continue  # duplicate — drop
+        seen.add(hash_obs(item[0], game_name))
+        keep.append(item)
+    return keep
+
+
 def compute_alpha(step_index: int, game_length: int, offset: int,
                   temperature_drop: int) -> float:
     """Outcome mixing weight for step i of a game.
@@ -385,6 +404,7 @@ def run_training(
                             game_length = i
                             break
                     offset = rare_at
+                    states_info = _dedup_child_surprise(states_info, game_name)
                     for i, item in enumerate(states_info):
                         obs, mask, policy, cur_player = item[:4]
                         tag = item[4] if len(item) > 4 else ""
