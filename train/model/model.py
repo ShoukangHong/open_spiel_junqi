@@ -105,7 +105,7 @@ class Model:
 
         with torch.no_grad():
             p_weights = torch.ones(target_value.shape[0], device=dev)
-            p_weights[target_value[:, 2] > 0.99999] = 0.2
+            p_weights[target_value[:, 2] > 0.99999] = 0.25
         per_sample = -(target_policy * log_probs).sum(dim=-1)
         policy_loss = (p_weights * per_sample).sum() / p_weights.sum().clamp(min=1)
 

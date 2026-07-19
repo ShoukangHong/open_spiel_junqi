@@ -20,6 +20,7 @@ def _make_mock_root(state, visits_list):
         c.player = 1 - state.current_player()
         c.outcome = None
         c.q_value = 0.0
+        c.children = []  # leaf mock: no subtree, prevents reparent
         children.append(c)
     root.children = children
     root.explore_count = sum(visits_list)  # needed by compute_solved_policy
@@ -34,6 +35,7 @@ class _TestCfg:
     weak_side_prob = 0
     max_moves = 200
     max_steps = 1000
+    max_simulations = 32
     prune_enabled = False
     policy_mix_alpha = 0
     adv_temperature = 0.2
@@ -288,6 +290,7 @@ def _make_play_cfg(temperature_drop=0):
         prune_enabled=False, prune_threshold=0.99, prune_prob=0.9,
         weak_side_prob=0, weak_move_prob=0,
         weak_max_per_game=0, weak_move_max_step=200,
+        max_simulations=32,
         rare_case_threshold=0, weak_move_threshold=0,
         surprise_pol_kl=0.3, surprise_val_kl=0.3,
         surprise_child_min_n=150,
@@ -306,7 +309,7 @@ def test_eff_td_tracking():
     ev = BatchRandomRolloutEvaluator(n_rollouts=1)
     cfg = MCTSConfig(max_simulations=32, batch_size=8,
                      temperature_drop=10, policy_epsilon=0,
-                     solve=False, verbose=False)
+                     solve=True, verbose=False)
     mcts = BatchMCTS(game, cfg, ev)
     rng = np.random.RandomState(42)
 
@@ -327,7 +330,7 @@ def test_eff_td_zero_with_zero_td():
     ev = BatchRandomRolloutEvaluator(n_rollouts=1)
     cfg = MCTSConfig(max_simulations=32, batch_size=8,
                      temperature_drop=0, policy_epsilon=0,
-                     solve=False, verbose=False)
+                     solve=True, verbose=False)
     mcts = BatchMCTS(game, cfg, ev)
     rng = np.random.RandomState(42)
 

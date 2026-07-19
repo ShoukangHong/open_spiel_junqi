@@ -599,6 +599,54 @@ def main():
     return 0 if failed == 0 else 1
 
 
+def test_enhanced_search_equals_4x():
+    """Enhanced search (N + 3N persistent) == single 4x search."""
+    from train.batch_mcts.evaluator import BatchRandomRolloutEvaluator
+    game = pyspiel.load_game("tic_tac_toe")
+    state = game.new_initial_state()
+    seed = 42
+
+    ev1 = BatchRandomRolloutEvaluator(n_rollouts=1,
+                                       random_state=np.random.RandomState(seed))
+    ev2 = BatchRandomRolloutEvaluator(n_rollouts=1,
+                                       random_state=np.random.RandomState(seed))
+    cfg = MCTSConfig(max_simulations=32, batch_size=8,
+                     policy_epsilon=0, solve=True, verbose=False)
+    mcts1 = BatchMCTS(game, cfg, ev1, random_state=np.random.RandomState(seed))
+    mcts2 = BatchMCTS(game, cfg, ev2, random_state=np.random.RandomState(seed))
+
+    # Enhanced: 32 + 96 = 128 total
+    root1 = mcts1.mcts_search(state)
+    root1 = mcts1.mcts_search(state, root=root1, sim_override=96)
+
+    # Straight 4x: 128
+    root2 = mcts2.mcts_search(state, sim_override=128)
+
+    # Policies should be similar via KL
+    def _visit_policy(root):
+        total = sum(c.explore_count for c in root.children)
+        return np.array([c.explore_count / total for c in root.children])
+
+    p1 = _visit_policy(root1)
+    p2 = _visit_policy(root2)
+    print(f"\n  enhanced N_dist: {[c.explore_count for c in root1.children]}")
+    print(f"  straight  N_dist: {[c.explore_count for c in root2.children]}")
+    eps = 1e-12
+    p1c = np.clip(p1, eps, 1.0)
+    p2c = np.clip(p2, eps, 1.0)
+    kl = 0.5 * (np.sum(p1c * np.log(p1c / p2c)) + np.sum(p2c * np.log(p2c / p1c)))
+    # Value WDL should also match
+    from train.core.surprise import _wdl_from_qdr
+    wdl1 = _wdl_from_qdr(root1.q_value, root1.draw_rate)
+    wdl2 = _wdl_from_qdr(root2.q_value, root2.draw_rate)
+    print(f"  enhanced WDL: {wdl1}")
+    print(f"  straight  WDL: {wdl2}")
+    w1 = np.clip(wdl1, eps, 1.0); w2 = np.clip(wdl2, eps, 1.0)
+    wkl = 0.5 * (np.sum(w1 * np.log(w1 / w2)) + np.sum(w2 * np.log(w2 / w1)))
+    print(f"  WDL symmetric KL = {wkl:.6f}")
+    assert wkl < 0.1, f"WDL KL too high: {wkl:.4f}"
+
+
 def test_draw_penalty():
     """draw_penalty > 0 lowers PUCT Q for draw-heavy nodes."""
     from train.batch_mcts.node import Node

@@ -1,6 +1,6 @@
 {
   "game": "xiangqi",
-  "path": "/hy-tmp/cloud_sov",
+  "path": "/hy-tmp/cloud_re",
   "seed": 42,
   "device": "cuda",
 
@@ -28,6 +28,10 @@
 
   "probe_depth": 1,
   "probe_surprise": 1.0,
+
+  "enhanced_prob": 0.3,
+  "enhanced_multiplier": 4,
+  "enhanced_max_wdl": 0.95,
 
   "surprise_pol_kl": 0.5,
   "surprise_val_kl": 0.5,

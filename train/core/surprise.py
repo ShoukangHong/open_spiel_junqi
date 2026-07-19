@@ -95,7 +95,7 @@ def _node_pol_val_kl(node, player, nn_q, nn_draw, nn_prior_arr,
             n = len(node.children)
             if n > 0:
                 avg = node.explore_count / n
-                scale = 0.2 + 0.8 * min(avg / 5.0, 1.0)
+                scale = 0.4 + 0.6 * min(avg / 5.0, 1.0)
                 pol_kl *= scale
 
     val_kl = _node_val_kl(node, nn_q, nn_draw)
@@ -125,8 +125,14 @@ def detect_surprise(state, root, config, game_max_utility=1.0):
         return "", combined
 
     # ── Root ──────────────────────────────────────────────────────────
-    root_nn_prior = np.array([max(c.prior, 0.0) for c in root.children],
-                             dtype=np.float64)
+    if root.nn_prior is not None:
+        pd = dict(root.nn_prior)
+        root_nn_prior = np.array(
+            [max(pd.get(c.action, 0.0), 0.0) for c in root.children],
+            dtype=np.float64)
+    else:
+        root_nn_prior = np.array([max(c.prior, 0.0) for c in root.children],
+                                 dtype=np.float64)
     root_nn_prior /= root_nn_prior.sum()
     pol_kl, val_kl = _node_pol_val_kl(
         root, cur, root.nn_q, root.nn_draw, root_nn_prior, game_max_utility)
@@ -134,26 +140,32 @@ def detect_surprise(state, root, config, game_max_utility=1.0):
     # Scale by position balance: decisive positions (max WDL ≈ 1)
     # get little surprise credit; balanced positions get full weight.
     mcts_q, mcts_draw = _stable_qdr(root)
-    wdl_scale = 2.0 - max(_wdl_from_qdr(mcts_q, mcts_draw)) ** 2
+    wdl_scale = 1.33 - max(_wdl_from_qdr(mcts_q, mcts_draw))/3
     pol_kl *= wdl_scale
     val_kl *= wdl_scale
 
+    root_tag, combined = _surprise_tag(pol_kl, val_kl)
     root_tag, combined = _surprise_tag(pol_kl, val_kl)
 
     # ── Children ──────────────────────────────────────────────────────
     child_tags = {}
     min_n = config.surprise_child_min_n
     for c in root.children:
-        if c.nn_q is None or c.nn_prior is None:
+        if c.nn_q is None:
             continue
         if c.outcome is not None or c.explore_count >= min_n:
             c_player = (c.state.current_player()
                         if c.state is not None else c.player)
             if c.children:
-                c_nn_prior = np.array(
-                    [max(dict(c.nn_prior).get(cc.action, 0.0), 0.0)
-                     for cc in c.children],
-                    dtype=np.float64)
+                if c.nn_prior is not None:
+                    c_nn_prior = np.array(
+                        [max(dict(c.nn_prior).get(cc.action, 0.0), 0.0)
+                         for cc in c.children],
+                        dtype=np.float64)
+                else:
+                    c_nn_prior = np.array(
+                        [cc.prior for cc in c.children],
+                        dtype=np.float64)
                 c_nn_prior /= c_nn_prior.sum()
                 c_pol_kl, c_val_kl = _node_pol_val_kl(
                     c, c_player, c.nn_q, c.nn_draw, c_nn_prior,
@@ -165,7 +177,7 @@ def detect_surprise(state, root, config, game_max_utility=1.0):
             if c.outcome is None:
                 c_val_kl = 0.0
             # Scale by decisiveness
-            c_wdl_scale = 2.0 - max(_wdl_from_qdr(*_stable_qdr(c))) ** 2
+            c_wdl_scale = 1.33 - max(_wdl_from_qdr(*_stable_qdr(c)))/3
             c_pol_kl *= c_wdl_scale
             c_val_kl *= c_wdl_scale
             ctag, c_combined = _surprise_tag(c_pol_kl, c_val_kl,

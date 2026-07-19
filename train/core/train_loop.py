@@ -81,8 +81,8 @@ def compute_alpha(step_index: int, game_length: int, offset: int,
         return 1.0
     denom = max(offset + game_length - 1, 1)
     step_pos = offset + step_index
-    if step_pos < temperature_drop:
-        return 0.0
+    if step_pos <= temperature_drop:
+        return 0.1 + 0.2 * step_pos/temperature_drop
     return min(step_pos / denom, 1.0) * 0.7 + 0.3
 
 
@@ -411,11 +411,12 @@ def run_training(
                         q_value = item[5] if len(item) > 5 else 0.0
                         draw_rate = item[6] if len(item) > 6 else 0.0
                         if "child_" in tag:
+                            val = _mcts_wdl(q_value, draw_rate)
                             # child_surprise: skip value unless proven
-                            if abs(q_value) == 1.0 or draw_rate == 1.0:
-                                val = _mcts_wdl(q_value, draw_rate)
-                            else:
-                                val = np.zeros(3, dtype=np.float32)
+                            # if abs(q_value) == 1.0 or draw_rate == 1.0:
+                            #     val = _mcts_wdl(q_value, draw_rate)
+                            # else:
+                            #     val = np.zeros(3, dtype=np.float32)
                         else:
                             step_i = item[8] if len(item) > 8 and item[8] >= 0 else i
                             alpha = compute_alpha(
@@ -503,7 +504,7 @@ def run_training(
                 f"buffer={len(buffer):5d}/{buffer.total_seen:5d}"
                 f" uniq_ratio={buffer.recent_unique_ratio:.1%}"
                 f"  tags={buffer.tag_counts()}"
-                f"  td0={getattr(cfg, '_td_zero', 0)/max(getattr(cfg, '_td_cnt', 1), 1):.0%}"
+                f"  td0={getattr(cfg, '_td_zero', 0)/max(getattr(cfg, '_td_cnt', 1), 1):.1%}"
                             f" td_avg={getattr(cfg, '_td_sum', 0)/max(getattr(cfg, '_td_cnt', 1), 1):.1f}  "
                             f"weak={wstats_summary(cfg)}  "
                 f"{buffer.sample_diag()}  "
@@ -569,9 +570,11 @@ def run_training(
                          and f != f"checkpoint-{_LATEST}.pt"
                          and f != f"checkpoint-{step}.pt"],
                         key=lambda f: int(f.split("-")[1].split(".")[0]))
-                    # Only pick opponents from the second half of training
+                    # Only from the second half, at most the recent 16
                     ckpts = [f for f in ckpts
                              if int(f.split("-")[1].split(".")[0]) > step // 2]
+                    if len(ckpts) > 16:
+                        ckpts = ckpts[-16:]
                     if ckpts:
                         ckpt_file = global_rng.choice(ckpts)
                         ckpt_path = os.path.join(cfg.path, ckpt_file)

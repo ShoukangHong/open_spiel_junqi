@@ -663,7 +663,7 @@ def main():
     pd.DataFrame([r.__dict__ for r in records]).to_excel(xlsx_path, index=False)
     print(f"[metrics] Data saved to {xlsx_path}")
 
-DEFAULT_LOG = r"C:\Users\shouk\xiangqi_train\cloud_sov\train.log"
+DEFAULT_LOG = r"C:\Users\shouk\xiangqi_train\cloud_re\train.log"
 DEFAULT_SMOOTH = 1
 DEFAULT_NO_PLOT = False
 

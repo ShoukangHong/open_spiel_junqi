@@ -22,6 +22,7 @@ Contains:
 
 import math
 import time
+import warnings
 
 import numpy as np
 
@@ -515,43 +516,27 @@ class MCTSBot(pyspiel.Bot):
         solved = False
 
       while visit_path:
-        # For chance nodes, walk up the tree to find the decision-maker.
-        decision_node_idx = -1
-        while visit_path[decision_node_idx].player == pyspiel.PlayerId.CHANCE:
-          decision_node_idx -= 1
-        # Chance node targets are for the respective decision-maker.
-        target_return = returns[visit_path[decision_node_idx].player]
         node = visit_path.pop()
+        target_return = returns[node.player]
         node.total_reward += target_return
         node.explore_count += 1
 
         if solved and node.children:
           player = node.children[0].player
-          if player == pyspiel.PlayerId.CHANCE:
-            # Only back up chance nodes if all have the same outcome.
-            # An alternative would be to back up the weighted average of
-            # outcomes if all children are solved, but that is less clear.
-            outcome = node.children[0].outcome
-            if (outcome is not None and
-                all(np.array_equal(c.outcome, outcome) for c in node.children)):
-              node.outcome = outcome
-            else:
-              solved = False
+          # If any have max utility (won?), or all children are solved,
+          # choose the one best for the player choosing.
+          best = None
+          all_solved = True
+          for child in node.children:
+            if child.outcome is None:
+              all_solved = False
+            elif best is None or child.outcome[player] > best.outcome[player]:
+              best = child
+          if (best is not None and
+              (all_solved or best.outcome[player] == self.max_utility)):
+            node.outcome = best.outcome
           else:
-            # If any have max utility (won?), or all children are solved,
-            # choose the one best for the player choosing.
-            best = None
-            all_solved = True
-            for child in node.children:
-              if child.outcome is None:
-                all_solved = False
-              elif best is None or child.outcome[player] > best.outcome[player]:
-                best = child
-            if (best is not None and
-                (all_solved or best.outcome[player] == self.max_utility)):
-              node.outcome = best.outcome
-            else:
-              solved = False
+            solved = False
       if root.outcome is not None:
         break
 
@@ -602,12 +587,19 @@ class BatchMCTS:
 
     # ── Public API ──────────────────────────────────────────────────────
 
-    def mcts_search(self, state, root=None):
+    def mcts_search(self, state, root=None, sim_override=None):
         """Run batch MCTS from `state`, returning the root Node.
 
         If *root* is given, simulations are ADDED to the existing tree
         (persistent search).  Otherwise a fresh tree is created.
+        If *sim_override* is given, use it as the simulation budget
+        instead of self.config.max_simulations.
         """
+        if root is not None and (root.state is None
+                or hash_state(root.state) != hash_state(state)):
+            warnings.warn("mcts_search: inherited root state mismatch, falling back to fresh")
+            root = None
+
         if root is None:
             root = Node(None, state.current_player(), 1)
             root.state = state.clone()
@@ -634,7 +626,7 @@ class BatchMCTS:
         # ── Speculative probe: pre-expand along NN-prior-best path ──────
         if self.config.probe_depth > 0 and not root.children:
             self._speculative_probe(root, state)
-        max_sim = self.config.max_simulations
+        max_sim = sim_override if sim_override is not None else self.config.max_simulations
         batch_size = self.config.batch_size
 
         sims_done = 0
@@ -678,6 +670,8 @@ class BatchMCTS:
                 w, d, l = float(out[0]), float(out[1]), float(out[2])
                 value = (w - l) * self.max_utility
                 values_map[node] = (value, prior, d)
+                node.nn_q = value
+                node.nn_draw = d
 
         # ── Phase 3: Expand + Backprop ───────────────────────────────
         expanded_this_batch = set()
@@ -699,6 +693,8 @@ class BatchMCTS:
 
             if leaf_state.is_terminal():
                 leaf_node.outcome = returns
+                if all(r == 0 for r in returns):
+                    leaf_node.drawable = True
 
             for node in reversed(path_nodes):
                 if self._check_solved(node):
@@ -883,6 +879,8 @@ class BatchMCTS:
                                   dict(paths[p_idx][2]).get(best_a, 0.01))
                 child_node.state = ns
                 child_node.outcome = np.array(ns.returns(), dtype=np.float64)
+                if all(r == 0 for r in ns.returns()):
+                    child_node.drawable = True
                 ret = ns.returns()
                 # Convert returns to root perspective
                 q = ret[0] * max_u  # p0 perspective
@@ -964,7 +962,7 @@ class BatchMCTS:
 
     def compute_root_policy(self, root, state=None):
         """Return {action: probability} from MCTS visit distribution."""
-        player = root.children[0].player if root.children else 0
+        player = root.cur_player
         return compute_solved_policy(
             root.children, player, self.max_utility,
             root_visits=root.explore_count)
@@ -1059,12 +1057,12 @@ class BatchMCTS:
             # Dynamic exploration: scale U and FPU by root Q.  In decisive
             # positions both the exploration bonus and FPU's inherited Q
             # benefit shrink — PUCT becomes Q-dominated.
-            dyn_c = max(0.05, 1.0 - 0.8 * abs(root.q_value))
+            dyn_c = 1  # max(0.05, 1.0 - 0.8 * abs(root.q_value))
             uct_c = self.config.uct_c * dyn_c
             vloss = self.config.virtual_loss
             candidates = node.children
             if self.config.solve:
-                player = node.children[0].player
+                player = node.cur_player
                 best_proven = -float("inf")
                 for c in node.children:
                     if c.outcome is not None and c.outcome[player] > best_proven:
@@ -1095,6 +1093,26 @@ class BatchMCTS:
             _fpu_lambda = self.config.fpu_lambda * dyn_c
             _q_parent = node.q_value
             _p_max = max((c.prior for c in candidates), default=1.0)
+            # === DEBUG ===
+            if node is not root:
+                n_term = sum(1 for c in candidates if c.outcome is not None)
+                n_unv = sum(1 for c in candidates
+                           if c.explore_count == 0 and c.outcome is None)
+                if n_term > 0 and n_unv > 0 and n_unv + n_term == len(candidates):
+                    import random as _random
+                    if _random.random() < 0.02:
+                        dbg = []
+                        for _c in candidates:
+                            _sc = _c.puct_with_virtual(
+                                node.visit_count, uct_c, vloss, _repeat_pen(_c),
+                                q_parent=_q_parent, fpu_lambda=_fpu_lambda,
+                                prior_max=_p_max)
+                            dbg.append((_c.action, _c.explore_count,
+                                        _c.outcome is not None, round(_sc, 4)))
+                        print(f"[_select] ALL_TERM_OR_UNV "
+                              f"n_term={n_term} n_unv={n_unv} "
+                              f"scores={dbg}", flush=True)
+            # === END DEBUG ===
             best_child = max(
                 candidates,
                 key=lambda c: c.puct_with_virtual(
@@ -1123,7 +1141,7 @@ class BatchMCTS:
         Child states are created lazily when _select reaches a leaf.
         """
         player = state.current_player()
-        self._random_state.shuffle(prior)
+        node.nn_prior = prior  # cache raw NN prior (before noise) for surprise detection
         children = []
         for action, prob in prior:
             child = Node(action, player, prob)
@@ -1150,15 +1168,11 @@ class BatchMCTS:
                 node.virtual_visits -= 2
             if node.outcome is not None:
                 continue
-            decision_idx = i
-            while path[decision_idx].player == pyspiel.PlayerId.CHANCE:
-                decision_idx -= 1
-            target = returns[path[decision_idx].player]
+            target = returns[node.player]
 
-            # drawable: a proven-draw child exists, so this node can't be
-            # worse than draw.  Clamp Q to 0, set draw=1, and propagate
-            # upward so parent nodes also see the clamped value.
-            clamped = clamped or (node.drawable and target < 0)
+            # drawable: player-to-move (cur_player) can force ≥ draw, so
+            # clamp if this simulation says they got worse than draw.
+            clamped = clamped or (node.drawable and returns[node.cur_player] < 0)
             if clamped:
                 target = 0.0
                 draw_prob = 1.0
@@ -1174,31 +1188,25 @@ class BatchMCTS:
         """
         if not node.children:
             return False
-        player = node.children[0].player
-        if player == pyspiel.PlayerId.CHANCE:
-            outcome = node.children[0].outcome
-            if outcome is not None and all(
-                    np.array_equal(c.outcome, outcome) for c in node.children):
-                node.outcome = outcome
-                self._clamp_draw(node)
-                return True
-        else:
-            best_child = None
-            all_solved = True
-            for child in node.children:
-                if child.outcome is None:
-                    all_solved = False
-                else:
-                    if child.outcome[player] == 0:
-                        node.drawable = True  # at least a draw is achievable
-                    if (best_child is None
-                            or child.outcome[player] > best_child.outcome[player]):
-                        best_child = child
-            if best_child is not None and (
-                    all_solved or best_child.outcome[player] == self.max_utility):
-                node.outcome = best_child.outcome
-                self._clamp_draw(node)
-                return True
+        player = node.cur_player
+        best_child = None
+        all_solved = True
+        for child in node.children:
+            if child.outcome is None:
+                all_solved = False
+            else:
+                if child.outcome[player] == 0:
+                    node.drawable = True  # at least a draw is achievable
+                if (best_child is None
+                        or child.outcome[player] > best_child.outcome[player]):
+                    best_child = child
+        if best_child is not None and (
+                all_solved or best_child.outcome[player] == self.max_utility):
+            node.outcome = best_child.outcome
+            if best_child.outcome[player] == 0:
+                node.drawable = True
+            self._clamp_draw(node)
+            return True
         return False
 
     def _clamp_draw(self, node):

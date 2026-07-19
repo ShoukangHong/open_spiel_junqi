@@ -124,6 +124,8 @@ class AlphaBetaHintEngine:
         return self._extract_hints(self._root)
 
     def compute_root_policy(self, root, state=None):
+        if not root.children:
+            return {}
         return self._ab.compute_root_policy(root, state)
 
     def freeze(self):
@@ -207,13 +209,16 @@ class MCTSHintEngine:
                 return self._extract_hints(self._frozen_root)
             return self._extract_hints(self._frozen_root)
 
-        # Reset if state changed
-        if self._root is None or self._state_key != key:
-            self._cfg.max_simulations = 64
+        if self._root is None:
             self._mcts = BatchMCTS(self._game, self._cfg, self._evaluator,
                                   random_state=np.random.RandomState())
             self._root = self._mcts.mcts_search(state)
             self._state_key = key
+        elif self._state_key != key:
+            # State changed: use reparented root from subtree_inherit
+            self._cfg.max_simulations = 64
+            self._state_key = key
+            self._root = self._mcts.mcts_search(state, root=self._root)
         elif self._root.visit_count < self._max_sims:
             self._cfg.max_simulations = 64
             self._root = self._mcts.mcts_search(state, root=self._root)
@@ -235,17 +240,20 @@ class MCTSHintEngine:
 
     def compute_root_policy(self, root, state=None):
         from train.batch_mcts.mcts import compute_solved_policy
-        player = root.children[0].player if root.children else 0
+        if not root.children:
+            return {}
+        player = root.children[0].player
         return compute_solved_policy(
             root.children, player, self._game.max_utility(),
             root_visits=root.explore_count)
 
     def subtree_inherit(self, action):
-        """After a move, try to reuse the child subtree."""
+        """After a move, reparent the chosen child as the new root."""
         if self._root is None:
             return
         for c in self._root.children:
             if c.action == action:
+                c.reparent_as_root(scale=None)
                 self._root = c
                 return
         self._root = None
@@ -302,7 +310,7 @@ def choose_color_menu(screen, width, height):
 
 def game_over_screen(screen, width, height, result_text, board_draw_fn,
                      board_data):
-    """Show game result. Returns True to restart, False to quit."""
+    """Show game result. Returns True to restart, "undo" to undo, False to quit."""
     font = pygame.font.Font(None, 50)
     small = pygame.font.Font(None, 30)
 
@@ -317,7 +325,7 @@ def game_over_screen(screen, width, height, result_text, board_draw_fn,
         txt = font.render(result_text, True, YELLOW)
         screen.blit(txt, (width // 2 - txt.get_width() // 2, height // 2 - 40))
 
-        r_txt = small.render("R - restart   Q - quit", True, WHITE)
+        r_txt = small.render("R - restart   U - undo   Q - quit", True, WHITE)
         screen.blit(r_txt, (width // 2 - r_txt.get_width() // 2, height // 2 + 20))
 
         for event in pygame.event.get():
@@ -326,6 +334,8 @@ def game_over_screen(screen, width, height, result_text, board_draw_fn,
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_r:
                     return True
+                if event.key == pygame.K_u:
+                    return "undo"
                 if event.key == pygame.K_q:
                     return False
         pygame.display.flip()

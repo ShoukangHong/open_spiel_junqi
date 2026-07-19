@@ -64,6 +64,11 @@ class BaseTrainConfig:
     probe_depth: int = 0               # probe layers (0=off, 1=NN cache only)
     probe_surprise: float = 0.3        # Q-drop threshold for probe termination
 
+    # Enhanced search: occasionally run deeper MCTS on balanced positions
+    enhanced_prob: float = 0.0          # probability of triggering (0=off)
+    enhanced_multiplier: int = 4        # max_simulations × multiplier
+    enhanced_max_wdl: float = 0.95      # only trigger if max(w,d,l) ≤ this
+
     # Surprise detection (KL-based)
     surprise_pol_kl: float = 0.3       # KL(search_pol || NN_prior) threshold
     surprise_val_kl: float = 0.3       # KL(search_WDL || NN_WDL) threshold

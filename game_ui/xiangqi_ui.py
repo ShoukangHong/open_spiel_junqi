@@ -20,9 +20,9 @@ from game_ui.xiangqi_render import (
 from train.core.model_builder import build_xiangqi_model
 
 # ── Config ──────────────────────────────────────────────────────────────────
-CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_sov"
-CHECKPOINT_STEP = 325
-MCTS_SIMULATIONS = 2000
+CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_re"
+CHECKPOINT_STEP = 80
+MCTS_SIMULATIONS = 1000
 HINT_MAX_SIM = 10000
 INFERENCE_BATCH_SIZE = 10  # shared by MCTS and AlphaBeta
 UCT_C = 4.0
@@ -47,8 +47,8 @@ _tc = {}
 if _os.path.exists(_config_path):
     with open(_config_path) as _f:
         _tc = _json.load(_f)
-DRAW_PENALTY = _tc.get("draw_penalty", 0.3)
-REPEAT_PENALTY = _tc.get("repeat_penalty", 0.1)
+DRAW_PENALTY = _tc.get("draw_penalty", 0.15)
+REPEAT_PENALTY = _tc.get("repeat_penalty", 0.15)
 
 WIDTH = BOARD_W
 HEIGHT = BOARD_H
@@ -126,6 +126,18 @@ def main():
         return bot, evaluator, hint_engine
 
     bot, evaluator, hint_engine = _make_bot_and_hint()
+    bot_tree = None  # reparented root for the bot, reused across turns
+
+    def advance_bot_tree(action):
+        nonlocal bot_tree
+        if bot_tree is None:
+            return
+        for c in bot_tree.children:
+            if c.action == action:
+                c.reparent_as_root(scale=None)
+                bot_tree = c
+                return
+        bot_tree = None
 
     pygame.init()
     screen = pygame.display.set_mode((WIDTH, SCREEN_HEIGHT))
@@ -149,14 +161,19 @@ def main():
         show_hints = False
         message = ""
         restart = False
+        quit_to_menu = False
         hvh = (human_color == -1)
 
-        while not state.is_terminal() and not restart:
-            board_data = obs_to_board(state.observation_tensor())
-            cur = state.current_player()
-            legal = state.legal_actions()
+        while not restart and not quit_to_menu:
+            game_over = state.is_terminal()
+            if game_over:
+                pass  # skip game body, go directly to game-over handling below
+            else:
+                board_data = obs_to_board(state.observation_tensor())
+                cur = state.current_player()
+                legal = state.legal_actions()
 
-            if hvh or cur == human_color:
+            if not game_over and (hvh or cur == human_color):
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
                         pygame.quit(); sys.exit()
@@ -174,6 +191,7 @@ def main():
                             state.apply_action(action)
                             evaluator.clear_cache()
                             hint_engine.subtree_inherit(action)
+                            advance_bot_tree(action)
                             if not show_hints:
                                 hints = None; ai_value = None; _hint_printed = False
                                 hint_src_probs = None; _hint_arrows = None
@@ -190,6 +208,7 @@ def main():
                                 state = undo_stack.pop()
                             evaluator.clear_cache()
                             _, evaluator, hint_engine = _make_bot_and_hint()
+                            bot_tree = None
                             hints = None; ai_value = None; _hint_printed = False
                             hint_src_probs = None; _hint_arrows = None
                             hint_draw_rate = 0.0
@@ -260,6 +279,7 @@ def main():
                                 undo_stack.clear()
                                 evaluator.clear_cache()
                                 _, evaluator, hint_engine = _make_bot_and_hint()
+                                bot_tree = None
                                 hints = None; ai_value = None; _hint_printed = False
                                 hint_src_probs = None; _hint_arrows = None
                                 hint_draw_rate = 0.0
@@ -271,6 +291,7 @@ def main():
                         elif event.key == pygame.K_a:
                             _AB_FLAG[0] = not _AB_FLAG[0]
                             bot, evaluator, hint_engine = _make_bot_and_hint()
+                            bot_tree = None
                             hints = None; ai_value = None; _hint_printed = False
                             hint_src_probs = None; _hint_arrows = None
                             hint_draw_rate = 0.0
@@ -309,7 +330,7 @@ def main():
                     else:
                         _hint_arrows = None
                         hint_src_probs = None
-            else:
+            elif not game_over:
                 message = "AI thinking..."
                 screen.fill(BG_COLOR)
                 draw_board_ui(screen, board_data, legal,
@@ -326,12 +347,13 @@ def main():
                 mn = state.move_number()
                 if mn < TEMP_DROP:
                     from train.core.policy import select_action_with_adv
-                    root = bot.mcts_search(state)
+                    root = bot.mcts_search(state, root=bot_tree)
                     policy = bot.compute_root_policy(root, state)
                     action, probs = select_action_with_adv(
                         root, state, temperature=2/3, alpha=0.3, adv_t=0.2,
                         base_policy=policy)
                     bot._last_root = root
+                    bot_tree = root
                     # Display sharpened policy, not raw
                     display_pol = {c.action: float(probs[c.action])
                                    for c in root.children}
@@ -341,12 +363,13 @@ def main():
                                     engine_label="AB" if _AB_FLAG[0] else "MCTS")
                 else:
                     from train.core.policy import select_action_with_adv
-                    root = bot.mcts_search(state)
+                    root = bot.mcts_search(state, root=bot_tree)
                     policy = bot.compute_root_policy(root, state)
                     action, probs = select_action_with_adv(
                         root, state, temperature=AI_TEMPERATURE, alpha=0.0,
                         base_policy=policy)
                     bot._last_root = root
+                    bot_tree = root
                     display_pol = {c.action: float(probs[c.action])
                                    for c in root.children}
                     print_search_info(root, state, display_pol,
@@ -357,8 +380,7 @@ def main():
                 state.apply_action(action)
                 evaluator.clear_cache()
                 hint_engine.subtree_inherit(action)
-
-                hint_engine.subtree_inherit(action)
+                advance_bot_tree(action)
                 if not show_hints:
                     hints = None; ai_value = None; _hint_printed = False
                     hint_src_probs = None; _hint_arrows = None
@@ -384,20 +406,35 @@ def main():
             clock.tick(30)
             pygame.display.flip()
 
-        if not restart:
-            r = state.returns()
-            if r[0] > 0:
-                result = "Red wins!"
-            elif r[0] < 0:
-                result = "Black wins!"
-            else:
-                result = "Draw!"
+            # Game-over handling (inside the while so undo can continue)
+            if game_over and not restart:
+                r = state.returns()
+                if r[0] > 0:
+                    result = "Red wins!"
+                elif r[0] < 0:
+                    result = "Black wins!"
+                else:
+                    result = "Draw!"
 
-            board_data = obs_to_board(state.observation_tensor(0))
-            if not game_over_screen(screen, WIDTH, HEIGHT, result,
-                                    lambda scr, bd: draw_board_ui(scr, bd),
-                                    board_data):
-                break
+                board_data = obs_to_board(state.observation_tensor(0))
+                action = game_over_screen(screen, WIDTH, HEIGHT, result,
+                                          lambda scr, bd: draw_board_ui(scr, bd),
+                                          board_data)
+                if action == "undo" and undo_stack:
+                    steps = 2 if not hvh else 1
+                    for _ in range(min(steps, len(undo_stack))):
+                        state = undo_stack.pop()
+                    evaluator.clear_cache()
+                    _, evaluator, hint_engine = _make_bot_and_hint()
+                    bot_tree = None
+                    hints = None; ai_value = None; _hint_printed = False
+                    hint_src_probs = None; _hint_arrows = None
+                    hint_draw_rate = 0.0
+                    selector.reset()
+                    message = "Move undone"
+                    continue
+                elif action is not True:
+                    quit_to_menu = True
 
     pygame.quit()
 

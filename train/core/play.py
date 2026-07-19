@@ -10,7 +10,7 @@ from train.batch_mcts.mcts import compute_solved_policy
 from train.batch_mcts.shared_evaluator import fast_legal_mask
 from train.core.policy import mix_advantage
 from train.core.weak_move import try_weak_move
-from train.core.surprise import detect_surprise
+from train.core.surprise import detect_surprise, _wdl_from_qdr
 
 _EPS = 1e-6  # label smoothing — prevents float32 underflow from CE with p=0
 
@@ -166,6 +166,9 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
             logger.log_line(f"[weak steps = {sorted(weak_steps)}]")
 
     pruned = {"used": False, "cur_player": None}
+    # Opponent's chosen child from the previous move; used to decide
+    # whether to enhance BEFORE searching (the current root IS that child).
+    prev_node = None  # Node, None for the first move
 
     while not state.is_terminal():
         cur_player = state.current_player()
@@ -177,7 +180,30 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
             continue
 
         mcts = mcts_black if cur_player == 0 else mcts_white
-        root = mcts.mcts_search(state)
+
+        # Reparent only when both sides use the same model (NN caches stay valid).
+        same_model = mcts_black is mcts_white
+        root_from_prev = False
+        if same_model and prev_node is not None and prev_node.children:
+            best_gc_n = prev_node.best_child().explore_count
+            scale = min(0.5, 0.34 * config.max_simulations / max(best_gc_n, 1))
+            prev_node.reparent_as_root(scale=scale)
+            root_from_prev = True
+
+        # Enhanced search: deepen on balanced positions (reparented root WDL).
+        sim_budget = config.max_simulations
+        if (root_from_prev
+                and getattr(config, 'enhanced_prob', 0) > 0
+                and rng.random() < config.enhanced_prob):
+            cq, cdr = _stable_qdr(prev_node)
+            if max(_wdl_from_qdr(cq, cdr)) <= config.enhanced_max_wdl:
+                sim_budget = int(config.enhanced_multiplier * config.max_simulations)
+
+        if root_from_prev:
+            root = mcts.mcts_search(state, root=prev_node,
+                                    sim_override=sim_budget)
+        else:
+            root = mcts.mcts_search(state)
 
         pruned, do_break = _should_prune(
             pruned, root, cur_player, config, game.max_utility(),
@@ -327,6 +353,9 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
             logger.log_move(move_num + 1, cur_player, state, mcts_info,
                             action_str, tag=tag, tau=tau_sel)
 
+        # Save chosen child for next turn's enhanced-search decision.
+        chosen = next((c for c in root.children if c.action == action), None)
+        prev_node = chosen
         state.apply_action(action)
         move_num += 1
 

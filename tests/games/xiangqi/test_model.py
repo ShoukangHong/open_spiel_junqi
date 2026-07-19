@@ -240,7 +240,7 @@ def test_play_game_xiangqi():
     assert len(rare_games) == 0
     # Each state_info entry: (obs, mask, policy, cur_player, tag, q, dr)
     for item in states_info:
-        obs, mask, policy, cur_player, tag, q, dr = item
+        obs, mask, policy, cur_player, tag, q, dr = item[:7]
         assert obs.shape == (1530,)  # 15*10*9 flat
         assert mask.shape == (8100,)
         assert policy.shape == (8100,)

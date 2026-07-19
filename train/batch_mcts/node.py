@@ -10,19 +10,26 @@ from typing import Optional
 
 import pyspiel
 
+from train.core.position_hash import hash_state
+
 
 class Node:
     """A node in the MCTS search tree.
 
     Attributes:
         action: The action from the parent's perspective (None for root).
-        player: The player who made `action`.
+        player: The player who made `action` to reach this node.
+            For root, equals current_player at root state.
+            For non-root children, opposite of children[0].player (turns alternate).
         prior: Prior probability from the policy network.
         explore_count: Number of REAL visits (base truth for Q).
-        total_reward: Sum of REAL rewards through this node.
+        total_reward: Sum of REAL returns (from `player`'s perspective) through this node.
         virtual_visits: Temporary visit inflation from in-flight threads.
-        outcome: Terminal or proven outcome for all players, or None.
-        children: Child Node instances.
+        outcome: Terminal or proven outcome for all players (p0/p1 indexed), or None.
+        children: Child Node instances. children[0].player is the player who moves
+            FROM this node's state (= 1 - player for non-root, = player for root).
+        drawable: Whether the player-to-move from this node (children[0].player)
+            can achieve at least a draw — i.e. at least one child is a proven draw.
     """
     draw_penalty: float = 0.0  # class-level: penalise draw-heavy branches in PUCT
 
@@ -44,7 +51,7 @@ class Node:
         "nn_prior",        # NN prior distribution (list of (action, prob))
         "nn_prior_max",    # NN's max prior among legal actions
         "nn_argmax",       # NN's argmax action
-        "drawable",        # at least one child is a proven draw
+        "drawable",        # player-to-move (=children[0].player) can force ≥ draw
     )
 
     def __init__(self, action: Optional[int], player: int, prior: float):
@@ -56,7 +63,7 @@ class Node:
         self.draw_reward = 0.0
         self.virtual_visits = 0
         self.outcome = None
-        self.drawable = False   # at least one child is a proven draw
+        self.drawable = False   # player-to-move can force ≥ draw
         self.children = []
         self.state = None
         self.noise_applied = False
@@ -68,6 +75,19 @@ class Node:
         self.nn_argmax = None
 
     # ── Q / N / PUCT ──────────────────────────────────────────────────────
+
+    @property
+    def cur_player(self) -> int:
+        """Player whose turn it is from this node's state.
+
+        If children exist, this is children[0].player (the player who makes
+        the next move).  Otherwise falls back to the root convention (root's
+        player == current player) or the alternating-turn rule.
+        """
+        if self.children:
+            return self.children[0].player
+        # action is None only for root, where player already IS current player
+        return self.player if self.action is None else 1 - self.player
 
     @property
     def visit_count(self) -> int:
@@ -96,7 +116,7 @@ class Node:
         if self.explore_count == 0:
             return float("inf")
 
-        return self.q_value + uct_c * self.prior * math.sqrt(
+        return math.atanh(self.q_value * 0.99999) + uct_c * self.prior * math.sqrt(
             parent_explore_count) / (self.explore_count + 1)
 
     def puct_with_virtual(self, parent_explore_count: int, uct_c: float,
@@ -115,10 +135,50 @@ class Node:
         u = uct_c * self.prior * math.sqrt(max(parent_explore_count, 1)) / (n + 1)
         q = self.q_value - Node.draw_penalty * self.draw_rate
         if repeat_penalty > 0:
-            q = (1.0 + q) * (1.0 - repeat_penalty) - 1.0
+            q = max((1.0 + q) * (1.0 - repeat_penalty) - 1.0, -1)
+        q = math.atanh(q * 0.99999)
         if self.explore_count == 0 and fpu_lambda > 0:
             q = q_parent - fpu_lambda * (prior_max - self.prior) / max(prior_max, 1e-9)
         return q + u
+
+    # ── Reparent ──────────────────────────────────────────────────────────
+
+    def reparent_as_root(self, scale: float = None) -> None:
+        """Convert this node from a child into a new root, in-place.
+
+        Flips player and negates total_reward to match the new perspective.
+        If *scale* is given (e.g. 0.5), the root's and its direct children's
+        stats are shrunk so the inherited data doesn't dominate the new
+        search.  Deeper nodes in the subtree are left unchanged.
+        """
+        self.total_reward = -self.total_reward
+        self.player = 1 - self.player
+        self.action = None
+        self.noise_applied = False
+        self._pos_hash = None
+        self.virtual_visits = 0
+
+        if scale is not None and scale != 1.0:
+            self._scale_stats(scale)
+            for c in self.children:
+                if c.outcome is None:
+                    c._scale_stats(scale)
+
+        # Children are now root-level; compute pos_hash so repeat penalty works.
+        # Skip terminal children — solver excludes them from PUCT anyway.
+        for c in self.children:
+            if c._pos_hash is None and c.state is not None \
+                    and not c.state.is_terminal():
+                c._pos_hash = hash_state(c.state)
+
+    def _scale_stats(self, scale: float) -> None:
+        """Shrink explore_count by *scale*, then scale reward by the true
+        ratio (new_N / old_N) to preserve Q exactly despite rounding."""
+        old_n = self.explore_count
+        self.explore_count = max(math.ceil(old_n * scale), 0)
+        ratio = self.explore_count / max(old_n, 1)
+        self.total_reward *= ratio
+        self.draw_reward *= ratio
 
     # ── Best child ────────────────────────────────────────────────────────
 

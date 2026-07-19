@@ -41,7 +41,7 @@ class ReplayBuffer:
     """
 
     def __init__(self, max_size: int = 500_000, db_path: str = None,
-                 max_db_rows: int = 1_000_000, recent_db_rows: int = 0):
+                 max_db_rows: int = 2_000_000, recent_db_rows: int = 0):
         self._max_size = max_size
         self._db_path = db_path
         self._max_db_rows = max_db_rows

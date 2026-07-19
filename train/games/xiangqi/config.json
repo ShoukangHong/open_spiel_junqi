@@ -21,6 +21,9 @@
     "temperature_drop": 25,
     "probe_depth": 1,
     "probe_surprise": 0.3,
+    "enhanced_prob": 0.3,
+    "enhanced_multiplier": 4,
+    "enhanced_max_wdl": 0.95,
     "surprise_pol_kl": 0.5,
     "surprise_val_kl": 0.5,
     "surprise_child_min_n": 150,
@@ -50,7 +53,7 @@
     "weak_max_per_game": 3,
     "weak_move_max_step": 200,
 
-    "path": "/hy-tmp/fast",
+    "path": "C:\\Users\\shouk\\xiangqi_train\\fast",
     "seed": 42,
     "device": "cuda"
 }
