@@ -20,6 +20,18 @@ class XiangqiSymmetry:
 
     num_transforms = 4
 
+    # Plane 15 = move_num / MAX_GAME_LENGTH.
+    # Plane 16 = no_capture_count / MAX_NO_CAP_LENGTH.
+    MAX_GAME_LENGTH = 400
+    MAX_NO_CAP_LENGTH = 40
+    MOVE_NUM_PLANE = 15
+    NO_CAP_PLANE = 16
+
+    # Randomise move-number when below this many moves.
+    MOVE_NUM_RAND_MAX = 200
+    # Randomise no-capture when below this many, and only for decisive games.
+    NO_CAP_RAND_MAX = 39
+
     def __init__(self):
         # Precompute action mappings for each transform.
         # inv[k, new_a] = original_a  (same convention as OthelloSymmetry)
@@ -84,6 +96,30 @@ class XiangqiSymmetry:
                 o[0:7] = o[7:14]
                 o[7:14] = tmp                           # swap piece planes
                 o[14] = 1.0 - o[14]                    # invert turn indicator
+            # Randomise move-number plane to an integer count to break
+            # spurious phase correlation.
+            mn_val = float(o[self.MOVE_NUM_PLANE, 0, 0])
+            if mn_val * self.MAX_GAME_LENGTH < self.MOVE_NUM_RAND_MAX:
+                new_count = np.random.randint(0, self.MOVE_NUM_RAND_MAX)
+                o[self.MOVE_NUM_PLANE] = new_count / float(self.MAX_GAME_LENGTH)
+
+            # For decisive games, reduce no-capture counter to a smaller
+            # *integer* count so the model learns compact play in relaxed
+            # time contexts.  Drawn games are left untouched.
+            nc_val = float(o[self.NO_CAP_PLANE, 0, 0])
+            orig_count = int(round(nc_val * self.MAX_NO_CAP_LENGTH))
+            if (value is not None and value[i, 1] < 0.3
+                    and orig_count < self.NO_CAP_RAND_MAX):
+                if orig_count > 1:
+                    # max of 2 rolls: long tail toward orig_count, near 0 rare.
+                    r1 = np.random.randint(0, orig_count)
+                    r2 = np.random.randint(0, orig_count)
+                    new_count = max(r1, r2)
+                else:
+                    new_count = 0
+                o[self.NO_CAP_PLANE] = new_count / float(
+                    self.MAX_NO_CAP_LENGTH)
+
             new_obs[i] = o.reshape(-1) if flat else o
 
             # --- mask & policy ---

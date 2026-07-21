@@ -247,6 +247,101 @@ def test_dedup_child_surprise_complex():
             f"index {i}: got {tuple(got)[:2]+(tuple(got)[4],)}, expected {tuple(exp)[:2]+(tuple(exp)[4],)}"
 
 
+# ── _dedup_repeated_states ──────────────────────────────────────────────────
+
+
+def _make_obs_xiangqi(v0=0.0, v14=1.0, v15=0.2, v16=0.1):
+    obs = np.zeros(17, dtype=np.float32)
+    obs[0] = v0
+    obs[14] = v14
+    obs[15] = v15
+    obs[16] = v16
+    return obs
+
+
+def _s_item(obs, tag=""):
+    return (obs, None, None, 0, tag, 0.3, 0.1)
+
+
+def test_dedup_repeated_draw_unchanged():
+    """Draw game: all states kept regardless of duplicates."""
+    from train.core.train_loop import _dedup_repeated_states
+    obs1 = _make_obs_xiangqi(1.0)
+    obs2 = _make_obs_xiangqi(2.0)
+    items = [_s_item(obs1), _s_item(obs1, "surprise"), _s_item(obs2)]
+    returns = np.array([0.0, 0.0])  # draw
+    result = _dedup_repeated_states(items, "xiangqi", returns)
+    assert len(result) == 3
+
+
+def test_dedup_repeated_keeps_last():
+    """Decisive game: repeated state hash → only last occurrence kept."""
+    from train.core.train_loop import _dedup_repeated_states
+    obs1 = _make_obs_xiangqi(1.0, v15=0.1)  # early
+    obs1b = _make_obs_xiangqi(1.0, v15=0.8)  # same hash, later
+    obs2 = _make_obs_xiangqi(2.0)
+    items = [_s_item(obs1), _s_item(obs1b), _s_item(obs2)]
+    returns = np.array([1.0, -1.0])  # decisive
+    result = _dedup_repeated_states(items, "xiangqi", returns)
+    assert len(result) == 2
+    tags = [item[4] for item in result]
+    assert tags == ["", ""]  # normal states only
+    # Last occurrence (obs1b) is kept, first (obs1) is dropped
+    assert np.array_equal(result[0][0], obs1b)
+    assert np.array_equal(result[1][0], obs2)
+
+
+def test_dedup_repeated_preserves_surprise():
+    """Decisive game: surprise entries always kept, even if obs duplicates."""
+    from train.core.train_loop import _dedup_repeated_states
+    obs1 = _make_obs_xiangqi(1.0)
+    obs1s = _make_obs_xiangqi(1.0, v15=0.9)  # same hash, surprise
+    obs2 = _make_obs_xiangqi(2.0)
+    items = [_s_item(obs1), _s_item(obs1s, "surprise"), _s_item(obs2)]
+    returns = np.array([1.0, -1.0])
+    result = _dedup_repeated_states(items, "xiangqi", returns)
+    assert len(result) == 3  # surprise preserved
+    tags = [item[4] for item in result]
+    assert tags == ["", "surprise", ""]
+
+
+def test_dedup_repeated_unique_states_kept():
+    """Decisive game with no repeats: all kept."""
+    from train.core.train_loop import _dedup_repeated_states
+    items = [_s_item(_make_obs_xiangqi(1.0)),
+             _s_item(_make_obs_xiangqi(2.0)),
+             _s_item(_make_obs_xiangqi(3.0))]
+    returns = np.array([1.0, -1.0])
+    result = _dedup_repeated_states(items, "xiangqi", returns)
+    assert len(result) == 3
+
+
+def test_dedup_repeated_multiple_repeats():
+    """Multiple repeats of same hash → only the last kept."""
+    from train.core.train_loop import _dedup_repeated_states
+    obs_a = _make_obs_xiangqi(1.0, v15=0.1)
+    obs_b = _make_obs_xiangqi(1.0, v15=0.5)
+    obs_c = _make_obs_xiangqi(1.0, v15=0.9)  # last one wins
+    obs_d = _make_obs_xiangqi(2.0)
+    items = [_s_item(obs_a), _s_item(obs_b), _s_item(obs_c), _s_item(obs_d)]
+    returns = np.array([-1.0, 1.0])
+    result = _dedup_repeated_states(items, "xiangqi", returns)
+    assert len(result) == 2
+    assert np.array_equal(result[0][0], obs_c)  # last repeat
+    assert np.array_equal(result[1][0], obs_d)
+
+
+def test_dedup_repeated_different_player_kept():
+    """Same board, different current player → different hash → both kept."""
+    from train.core.train_loop import _dedup_repeated_states
+    obs_red = _make_obs_xiangqi(1.0, v14=1.0)
+    obs_black = _make_obs_xiangqi(1.0, v14=0.0)
+    items = [_s_item(obs_red), _s_item(obs_black)]
+    returns = np.array([1.0, -1.0])
+    result = _dedup_repeated_states(items, "xiangqi", returns)
+    assert len(result) == 2
+
+
 def test_child_surprise_proven_detection():
     """Only child_surprise with abs(q)==1.0 or dr==1.0 gets non-zero value."""
     import numpy as np

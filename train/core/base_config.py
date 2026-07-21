@@ -16,6 +16,7 @@ class BaseTrainConfig:
     weight_decay: float = 1e-4
     train_batch_size: int = 128
     entropy_weight: float = 0.01   # policy entropy bonus (0=off)
+    value_learn_prob: float = 1.0  # probability of including value loss per batch
     policy_mix_alpha: float = 0.5   # advantage mixing weight
     adv_temperature: float = 0.2    # softmax temperature (lower=sharper)
 

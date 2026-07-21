@@ -284,3 +284,118 @@ def test_write_symmetry_viz():
                 f.write(f"  *** WARNING: {illegal_count} illegal actions with non-zero policy!\n")
 
     print(f"[symmetry_viz] {out_path}")
+
+
+# ── Move-number randomisation ─────────────────────────────────────────────────
+
+def test_move_num_randomised_when_below_threshold():
+    """move_num < MOVE_NUM_RAND_MAX → re-rolled to another integer below it."""
+    sym = XiangqiSymmetry()
+    obs = np.zeros((1, 1530), dtype=np.float32)
+    o = obs.reshape(17, 10, 9)
+    count = 50
+    o[15] = count / sym.MAX_GAME_LENGTH
+    mask = np.ones((1, NUM_ACTIONS), dtype=bool)
+    policy = np.ones((1, NUM_ACTIONS), dtype=np.float32) / NUM_ACTIONS
+
+    found_changed = False
+    for _ in range(50):
+        new_obs, _, _, _ = sym.augment_batch(obs.copy(), mask.copy(), policy.copy())
+        o2 = new_obs.reshape(17, 10, 9)
+        new_mn = float(o2[15, 0, 0]) * sym.MAX_GAME_LENGTH
+        assert new_mn < sym.MOVE_NUM_RAND_MAX, \
+            f"move_num should stay < {sym.MOVE_NUM_RAND_MAX}: {new_mn}"
+        assert abs(round(new_mn) - new_mn) < 0.01, "should be integer"
+        if abs(new_mn - count) > 0.1:
+            found_changed = True
+    assert found_changed, "move_num should change at least once in 50 trials"
+
+
+def test_move_num_unchanged_when_above_threshold():
+    """move_num >= MOVE_NUM_RAND_MAX → never modified."""
+    sym = XiangqiSymmetry()
+    obs = np.zeros((1, 1530), dtype=np.float32)
+    o = obs.reshape(17, 10, 9)
+    count = sym.MOVE_NUM_RAND_MAX + 20
+    o[15] = count / sym.MAX_GAME_LENGTH
+    mask = np.ones((1, NUM_ACTIONS), dtype=bool)
+    policy = np.ones((1, NUM_ACTIONS), dtype=np.float32) / NUM_ACTIONS
+
+    for _ in range(20):
+        new_obs, _, _, _ = sym.augment_batch(obs.copy(), mask.copy(), policy.copy())
+        o2 = new_obs.reshape(17, 10, 9)
+        assert abs(float(o2[15, 0, 0]) * sym.MAX_GAME_LENGTH - count) < 0.01, \
+            "move_num >= threshold should not be randomised"
+
+
+# ── No-capture randomisation ─────────────────────────────────────────────────
+
+def test_no_cap_reduced_for_decisive_game():
+    """draw < 0.3 AND no_cap < threshold → counter decreases, integer steps."""
+    sym = XiangqiSymmetry()
+    obs = np.zeros((1, 1530), dtype=np.float32)
+    o = obs.reshape(17, 10, 9)
+    count = 5
+    o[16] = count / sym.MAX_NO_CAP_LENGTH
+    mask = np.ones((1, NUM_ACTIONS), dtype=bool)
+    policy = np.ones((1, NUM_ACTIONS), dtype=np.float32) / NUM_ACTIONS
+    value = np.array([[0.8, 0.1, 0.1]], dtype=np.float32)  # decisive
+
+    found_reduced = False
+    for _ in range(200):
+        np.random.seed(None)
+        new_obs, _, _, _ = sym.augment_batch(
+            obs.copy(), mask.copy(), policy.copy(), value.copy())
+        o2 = new_obs.reshape(17, 10, 9)
+        new_nc = float(o2[16, 0, 0]) * sym.MAX_NO_CAP_LENGTH
+        assert abs(round(new_nc) - new_nc) < 0.01, \
+            f"no_cap should be integer: {new_nc}"
+        assert new_nc <= count + 0.01, \
+            f"no_cap should not increase: {new_nc:.1f} > {count}"
+        if new_nc < count - 0.1:
+            found_reduced = True
+
+    assert found_reduced, "no_cap should decrease at least once in 200 trials"
+
+
+def test_no_cap_untouched_for_draw_game():
+    """draw >= 0.3 → no_cap never modified."""
+    sym = XiangqiSymmetry()
+    obs = np.zeros((1, 1530), dtype=np.float32)
+    o = obs.reshape(17, 10, 9)
+    count = 5
+    o[16] = count / sym.MAX_NO_CAP_LENGTH
+    mask = np.ones((1, NUM_ACTIONS), dtype=bool)
+    policy = np.ones((1, NUM_ACTIONS), dtype=np.float32) / NUM_ACTIONS
+    value = np.array([[0.2, 0.6, 0.2]], dtype=np.float32)  # draw-heavy
+
+    for _ in range(30):
+        np.random.seed(None)
+        new_obs, _, _, _ = sym.augment_batch(
+            obs.copy(), mask.copy(), policy.copy(), value.copy())
+        o2 = new_obs.reshape(17, 10, 9)
+        assert abs(float(o2[16, 0, 0]) * sym.MAX_NO_CAP_LENGTH - count) < 0.01, \
+            f"no_cap should not change for draw game: {float(o2[16, 0, 0]):.4f}"
+
+
+def test_no_cap_untouched_above_threshold():
+    """no_cap >= threshold → never modified even for decisive games."""
+    sym = XiangqiSymmetry()
+    obs = np.zeros((1, 1530), dtype=np.float32)
+    o = obs.reshape(17, 10, 9)
+    # Set at the threshold boundary: orig_count == NO_CAP_RAND_MAX
+    # is NOT < NO_CAP_RAND_MAX, so it should not be touched.
+    count = sym.NO_CAP_RAND_MAX
+    o[16] = count / sym.MAX_NO_CAP_LENGTH
+    mask = np.ones((1, NUM_ACTIONS), dtype=bool)
+    policy = np.ones((1, NUM_ACTIONS), dtype=np.float32) / NUM_ACTIONS
+    value = np.array([[0.9, 0.05, 0.05]], dtype=np.float32)
+
+    for _ in range(20):
+        np.random.seed(None)
+        new_obs, _, _, _ = sym.augment_batch(
+            obs.copy(), mask.copy(), policy.copy(), value.copy())
+        o2 = new_obs.reshape(17, 10, 9)
+        new_nc = float(o2[16, 0, 0]) * sym.MAX_NO_CAP_LENGTH
+        assert abs(new_nc - count) < 0.01, \
+            f"no_cap >= threshold should not change: {new_nc:.4f} vs {count}"

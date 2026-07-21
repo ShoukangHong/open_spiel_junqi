@@ -41,6 +41,7 @@ class Model:
 
         self._lr = learning_rate
         self._entropy_weight = 0.0
+        self._value_learn_prob = 1.0
         self._optimizer = torch.optim.AdamW([
             {"params": decay_params, "weight_decay": weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
@@ -122,16 +123,23 @@ class Model:
         # Value loss: cross-entropy with soft WDL target.
         # Zero-target samples (child_surprise without proven outcome)
         # carry v_weight=0 so they don't dilute gradients.
-        v_weights = torch.ones(target_value.shape[0], device=dev)
-        v_weights[target_value.sum(dim=-1) < 0.001] = 0.0
-        log_val = F.log_softmax(value_pred, dim=-1)
-        v_ce = -(target_value * log_val).sum(dim=-1)
-        value_loss = (v_weights * v_ce).sum() / v_weights.sum().clamp(min=1)
+        # value_learn_prob throttles value training to prevent overfitting
+        # while policy (harder to learn) catches up.
+        learn_value = np.random.random() < self._value_learn_prob
+        if learn_value:
+            v_weights = torch.ones(target_value.shape[0], device=dev)
+            v_weights[target_value.sum(dim=-1) < 0.001] = 0.0
+            log_val = F.log_softmax(value_pred, dim=-1)
+            v_ce = -(target_value * log_val).sum(dim=-1)
+            value_loss = (v_weights * v_ce).sum() / v_weights.sum().clamp(min=1)
 
-        with torch.no_grad():
-            v_ent = -(target_value * torch.log(target_value + eps)).sum(dim=-1)
-            v_kl = ((v_weights * (v_ce - v_ent)).sum()
-                    / v_weights.sum().clamp(min=1)).item()
+            with torch.no_grad():
+                v_ent = -(target_value * torch.log(target_value + eps)).sum(dim=-1)
+                v_kl = ((v_weights * (v_ce - v_ent)).sum()
+                        / v_weights.sum().clamp(min=1)).item()
+        else:
+            value_loss = torch.tensor(0.0, device=dev)
+            v_kl = 0.0
 
         l2_reg = sum(
             (p ** 2).sum()

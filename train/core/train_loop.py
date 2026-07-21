@@ -70,6 +70,38 @@ def _dedup_child_surprise(states_info, game_name):
     return keep
 
 
+def _dedup_repeated_states(states_info, game_name, returns):
+    """For decisive games, keep only the *last* occurrence of each
+    repeated non-surprise state.  Earlier visits to the same position
+    are redundant — the later one has a higher counter, and the
+    no-capture proposition guarantees no label ambiguity.
+
+    Surprise entries are left untouched.
+    """
+    returns = np.asarray(returns, dtype=np.float64)
+    if returns.shape != (2,) or not all(r in (-1, 0, 1) for r in returns):
+        raise ValueError(
+            f"returns must be [-1,1], [1,-1], or [0,0], got {returns}")
+    if all(r == 0 for r in returns):
+        return states_info  # draw: don't touch
+    from train.core.position_hash import hash_obs
+    # Walk backwards; keep the first (last-in-time) occurrence of each hash.
+    seen = set()
+    keep_rev = []
+    for item in reversed(states_info):
+        tag = item[4] if len(item) > 4 else ""
+        if "surprise" in tag:
+            keep_rev.append(item)
+            continue
+        h = hash_obs(item[0], game_name)
+        if h in seen:
+            continue  # earlier duplicate — drop
+        seen.add(h)
+        keep_rev.append(item)
+    keep_rev.reverse()
+    return keep_rev
+
+
 def compute_alpha(step_index: int, game_length: int, offset: int,
                   temperature_drop: int) -> float:
     """Outcome mixing weight for step i of a game.
@@ -405,6 +437,8 @@ def run_training(
                             break
                     offset = rare_at
                     states_info = _dedup_child_surprise(states_info, game_name)
+                    states_info = _dedup_repeated_states(
+                        states_info, game_name, returns)
                     for i, item in enumerate(states_info):
                         obs, mask, policy, cur_player = item[:4]
                         tag = item[4] if len(item) > 4 else ""
@@ -459,6 +493,7 @@ def run_training(
                     batch = TrainInput(observation=obs, legals_mask=mask,
                                        policy=policy, value=value)
                 model._entropy_weight = cfg.entropy_weight
+                model._value_learn_prob = getattr(cfg, 'value_learn_prob', 1.0)
                 loss = model.update(batch)
                 losses_list.append(loss)
                 p = batch.policy
