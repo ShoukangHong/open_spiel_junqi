@@ -1,102 +1,121 @@
-"""Fit model to a single buffer DB — diagnostic for policy learning.
+"""Fit model to replay buffer DBs — disk-only multi-DB sampling.
 
 Usage:
-    python -m experiment.fit_single_buffer
-    python -m experiment.fit_single_buffer --policy-lr 0.0001
+    python -m experiment.fit_single_buffer --config path/to/train_config.json
+    python -m experiment.fit_single_buffer --config config.json --batches 5000
+    python -m experiment.fit_single_buffer --config config.json --policy-lr 0.0001
 """
 
 import argparse
-import math
+import json
 import os
-import sqlite3
 import time
-import zlib
 
 import numpy as np
+import pyspiel
 import torch
-import torch.nn.functional as F
 
 from train.core.model_builder import build_xiangqi_model
-from train.core.replay_buffer import _unpack
-from train.core.types import TrainInput, Losses
+from train.core.replay_buffer import ReplayBuffer
+from train.core.types import TrainInput
 from train.model.xiangqi_symmetry import XiangqiSymmetry
-import json, pyspiel
 
-# ── Config ───────────────────────────────────────────────────────────────────
-
-DB_PATH = r"C:\Users\shouk\xiangqi_train\cloud_new\buffer_8693824.db"
-CKPT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_new"
-CKPT_STEP = 180
-CONFIG_PATH = os.path.join(CKPT_DIR, "train_config.json")
-NUM_BATCHES = 2000
-LOG_EVERY = 50
-SUBSET_SIZE = 1000_000  # sample this many rows from DB once, then train in-memory
+LOG_EVERY = 100
 
 
-def load_model_and_config():
-    with open(CONFIG_PATH) as f:
-        cfg_dict = json.load(f)
+def load_model_and_buffer(config_path, output_dir=None, fresh_optimizer=False):
+    """Load config, game, model from latest checkpoint (or fresh), and replay buffer."""
+    with open(config_path) as f:
+        cfg = json.load(f)
+
     game = pyspiel.load_game("xiangqi")
-    model_cfg = {
-        "nn_width": cfg_dict["nn_width"],
-        "nn_depth": cfg_dict["nn_depth"],
-        "device": "cuda",
-        "path": CKPT_DIR,
-    }
-    model = build_xiangqi_model(game, model_cfg)
-    model.load_checkpoint(CKPT_STEP)
-    return model, cfg_dict
+    model = build_xiangqi_model(game, {
+        "nn_width": cfg["nn_width"],
+        "nn_depth": cfg["nn_depth"],
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "path": output_dir or cfg["path"],
+    })
 
+    # Resume from latest checkpoint
+    ckpt_dir = output_dir or cfg["path"]
+    start_step = _find_latest(ckpt_dir)
+    if start_step > 0 and not fresh_optimizer:
+        model.load_checkpoint(start_step)
+        print(f"  Resumed from checkpoint-{start_step}")
+    elif start_step > 0:
+        model.load_checkpoint(start_step, fresh_optimizer=True)
+        print(f"  Resumed from checkpoint-{start_step} (fresh Adam)")
+    else:
+        print("  Starting fresh (no checkpoint found)")
 
-def load_id_subset(conn, table, n, total):
-    """Return *n* random IDs from DB (just the IDs, no data loaded)."""
-    rng = np.random.RandomState(42)
-    ids = rng.choice(total, size=n, replace=False) + 1  # DB ids are 1-based
-    return ids.astype(np.int64)
-
-
-def sample_batch_from_ids(conn, table, ids, batch_size, rng):
-    """Sample *batch_size* random IDs from *ids*, query DB, return TrainInput."""
-    idx = rng.choice(len(ids), size=batch_size, replace=True)
-    batch_ids = sorted(int(ids[i]) for i in idx)
-    placeholders = ",".join("?" for _ in batch_ids)
-    rows = conn.execute(
-        f"SELECT obs, mask, policy, value FROM {table} WHERE id IN ({placeholders})",
-        batch_ids).fetchall()
-    obs_l, mask_l, pol_l, val_l = [], [], [], []
-    for obs_b, mask_b, pol_b, val_b in rows:
-        obs_l.append(_unpack(obs_b, np.float32))
-        mask_l.append(_unpack(mask_b, bool))
-        pol_l.append(_unpack(pol_b, np.float32))
-        val_l.append(_unpack(val_b, np.float32))
-    return TrainInput(
-        observation=np.stack(obs_l),
-        legals_mask=np.stack(mask_l),
-        policy=np.stack(pol_l),
-        value=np.stack(val_l),
+    # Open replay buffer — disk-only, all DBs under cfg.path
+    buf = ReplayBuffer(
+        max_size=10**12,  # unbounded: sample from all rows
+        db_path=os.path.join(cfg["path"], "buffer.db"),
+        max_db_rows=10**12,
     )
+    n_dbs = len(buf._all_db_paths())
+    total_mb = sum(os.path.getsize(p) for p in buf._all_db_paths()
+                   if os.path.exists(p)) / 1e6
+    print(f"  Buffer: {len(buf)} states ({n_dbs} DB files, {total_mb:.0f} MB)")
+    return model, cfg, buf, start_step
+
+
+def _find_latest(directory):
+    """Return the largest checkpoint step number in *directory*, or 0."""
+    best = 0
+    if not os.path.isdir(directory):
+        return 0
+    for name in os.listdir(directory):
+        if name.startswith("checkpoint-") and name.endswith(".pt"):
+            try:
+                step = int(name[len("checkpoint-"):-len(".pt")])
+                if step > best:
+                    best = step
+            except ValueError:
+                pass
+    return best
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Fit model to buffer DBs (disk-only)")
+    parser.add_argument("--config", type=str, required=True,
+                        help="Path to train_config.json")
+    parser.add_argument("--output", type=str, default=None,
+                        help="Output directory for checkpoints (default: config.path)")
+    parser.add_argument("--batches", type=int, default=5000,
+                        help="Total forward passes")
+    parser.add_argument("--checkpoint-every", type=int, default=1000,
+                        help="Save checkpoint every N forward passes")
+    parser.add_argument("--log-every", type=int, default=100,
+                        help="Log stats every N forward passes")
     parser.add_argument("--policy-lr", type=float, default=None,
-                        help="Separate LR for policy head (None = use global LR)")
-    parser.add_argument("--batches", type=int, default=NUM_BATCHES)
-    parser.add_argument("--full", action="store_true",
-                        help="Use full DB instead of subset")
+                        help="Separate LR for policy head")
+    parser.add_argument("--value-learn-prob", type=float, default=None,
+                        help="Probability of training value head each batch")
+    parser.add_argument("--reset-optimizer", action="store_true",
+                        help="Start with fresh Adam state")
     args = parser.parse_args()
 
-    print(f"Loading model checkpoint-{CKPT_STEP} ...")
-    model, cfg = load_model_and_config()
+    # ── Load ────────────────────────────────────────────────────────────
+    print(f"Loading config from {args.config} ...")
+    model, cfg, buf, start_step = load_model_and_buffer(
+        args.config, args.output,
+        fresh_optimizer=args.reset_optimizer)
+
     print(f"  params={model.num_trainable_variables}")
     print(f"  config: lr={cfg['learning_rate']} wd={cfg['weight_decay']}"
-          f"  batch={cfg['train_batch_size']}")
+          f"  batch={cfg.get('train_batch_size', 256)}")
+    print(f"  batches={args.batches}  ckpt_every={args.checkpoint_every}")
 
     sym = XiangqiSymmetry() if cfg.get("symmetry", 1) > 1 else None
     batch_size = cfg.get("train_batch_size", 256)
     entropy_weight = cfg.get("entropy_weight", 0.0)
+    value_learn_prob = args.value_learn_prob
+    if value_learn_prob is None:
+        value_learn_prob = cfg.get("value_learn_prob", 1.0)
 
-    # Set up optimizer with optional per-layer LR
+    # ── Optional per-layer LR ───────────────────────────────────────────
     if args.policy_lr is not None:
         policy_params = []
         other_params = []
@@ -113,44 +132,21 @@ def main():
         ])
         print(f"  policy_lr={args.policy_lr}  (global lr={cfg['learning_rate']})")
 
-    conn = sqlite3.connect(DB_PATH)
-    table = "states"
-    total = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-    print(f"  DB rows: {total}")
+    # ── Training loop ───────────────────────────────────────────────────
+    p_kl_hist = []; v_kl_hist = []; l2_hist = []
+    total_updates = start_step
+    last_ckpt = start_step
 
-    if args.full:
-        subset_ids = None
-        print(f"  Using full DB ({total} rows)")
-    else:
-        subset_n = min(SUBSET_SIZE, total)
-        subset_ids = load_id_subset(conn, table, subset_n, total)
-        print(f"  Subset: {len(subset_ids)} IDs (data stays on disk)")
-
-    p_kl_hist = []
-    policy_loss_hist = []
-    v_kl_hist = []
+    ckpt_dir = args.output or cfg["path"]
+    model._checkpoint_path = ckpt_dir
+    if start_step == 0:
+        model.save_checkpoint(save_optimizer=False, step=0)
+        print(f"\n  Initial checkpoint saved: {os.path.join(ckpt_dir, 'checkpoint-0.pt')}")
+    print(f"Training {args.batches} forward passes (from step {start_step}) ...")
     t0 = time.time()
 
-    sample_rng = np.random.RandomState(123)
-    for step in range(args.batches):
-        if subset_ids is not None:
-            batch = sample_batch_from_ids(conn, table, subset_ids,
-                                          batch_size, sample_rng)
-        else:
-            ids = sorted(int(sample_rng.integers(1, total + 1, size=batch_size)))
-            placeholders = ",".join("?" for _ in ids)
-            rows = conn.execute(
-                f"SELECT obs, mask, policy, value FROM states WHERE id IN ({placeholders})",
-                ids).fetchall()
-            obs_l, mask_l, pol_l, val_l = [], [], [], []
-            for obs_b, mask_b, pol_b, val_b in rows:
-                obs_l.append(_unpack(obs_b, np.float32))
-                mask_l.append(_unpack(mask_b, bool))
-                pol_l.append(_unpack(pol_b, np.float32))
-                val_l.append(_unpack(val_b, np.float32))
-            batch = TrainInput(
-                observation=np.stack(obs_l), legals_mask=np.stack(mask_l),
-                policy=np.stack(pol_l), value=np.stack(val_l))
+    for _ in range(args.batches):
+        batch = buf.sample_uniform(batch_size)
         if sym is not None:
             obs, mask, policy, value = sym.augment_batch(
                 batch.observation, batch.legals_mask,
@@ -159,42 +155,58 @@ def main():
                                policy=policy, value=value)
 
         model._entropy_weight = entropy_weight
+        model._value_learn_prob = value_learn_prob
         loss = model.update(batch)
         p_kl_hist.append(loss.p_kl)
-        policy_loss_hist.append(loss.policy)
         v_kl_hist.append(loss.v_kl)
+        l2_hist.append(loss.l2)
+        total_updates += 1
 
-        if (step + 1) % LOG_EVERY == 0:
-            window_pkl = p_kl_hist[-LOG_EVERY:]
-            window_vkl = v_kl_hist[-LOG_EVERY:]
-            window_pl = policy_loss_hist[-LOG_EVERY:]
+        # Checkpoint
+        if total_updates - last_ckpt >= args.checkpoint_every:
+            ckpt_dir = args.output or cfg["path"]
+            model._checkpoint_path = ckpt_dir
+            model.save_checkpoint(save_optimizer=False, step=total_updates)
+            print(f"  [checkpoint] forward={total_updates}")
+            last_ckpt = total_updates
+
+        # Logging
+        if (total_updates) % args.log_every == 0:
+            w = args.log_every
+            window_pkl = p_kl_hist[-w:]
+            window_vkl = v_kl_hist[-w:]
+            window_l2 = l2_hist[-w:]
             elapsed = time.time() - t0
-            print(f"  {step+1:4d}/{args.batches}  "
+            print(f"  {total_updates:5d}/{args.batches}  "
                   f"P-KL={np.mean(window_pkl):.4f}±{np.std(window_pkl):.4f}"
                   f"[{np.min(window_pkl):.4f},{np.max(window_pkl):.4f}]  "
                   f"V-KL={np.mean(window_vkl):.4f}±{np.std(window_vkl):.4f}"
                   f"[{np.min(window_vkl):.4f},{np.max(window_vkl):.4f}]  "
-                  f"p_loss={np.mean(window_pl):.3f}  "
-                  f"l2={loss.l2:.3f}  "
+                  f"L2={np.mean(window_l2):.3f}  "
                   f"{elapsed:.0f}s")
-    conn.close()
+
+    buf.close()
     elapsed = time.time() - t0
 
+    # ── Summary ─────────────────────────────────────────────────────────
     print(f"\n{'='*50}")
     print(f"Done. {args.batches} batches in {elapsed:.0f}s"
-          f" ({elapsed/args.batches:.1f}s/batch)")
+          f" ({elapsed/args.batches*1000:.1f}ms/batch)")
 
-    # Summary: head / tail P-KL and V-KL
     n = len(p_kl_hist)
-    h = min(LOG_EVERY, n)
+    h = min(args.log_every, n)
     p_head = np.mean(p_kl_hist[:h])
     p_tail = np.mean(p_kl_hist[-h:])
     p_change = (p_tail - p_head) / max(abs(p_head), 1e-9)
     v_head = np.mean(v_kl_hist[:h])
     v_tail = np.mean(v_kl_hist[-h:])
     v_change = (v_tail - v_head) / max(abs(v_head), 1e-9)
+    l2_head = np.mean(l2_hist[:h])
+    l2_tail = np.mean(l2_hist[-h:])
     print(f"  P-KL: {p_head:.4f} → {p_tail:.4f}  ({p_change:+.1%})")
     print(f"  V-KL: {v_head:.4f} → {v_tail:.4f}  ({v_change:+.1%})")
+    print(f"  L2:   {l2_head:.4f} → {l2_tail:.4f}")
+
     if p_change < -0.1:
         print(f"  → P-KL decreasing — model IS learning")
     elif abs(p_change) < 0.05:
@@ -202,11 +214,11 @@ def main():
     else:
         print(f"  → P-KL increasing — model DIVERGING")
 
-    # Save fitted model as checkpoint-<step>_fit.pt
-    save_path = os.path.join(CKPT_DIR, f"checkpoint-{CKPT_STEP}_fit.pt")
-    model._checkpoint_path = CKPT_DIR
-    model.save_checkpoint(f"{CKPT_STEP}_fit")
-    print(f"\n  Model saved to {save_path}")
+    # ── Save fitted model ───────────────────────────────────────────────
+    ckpt_dir = args.output or cfg["path"]
+    model._checkpoint_path = ckpt_dir
+    model.save_checkpoint(save_optimizer=False, step=f"fit_{total_updates}")
+    print(f"  Model saved to {os.path.join(ckpt_dir, f'checkpoint-fit_{total_updates}.pt')}")
 
 
 if __name__ == "__main__":

@@ -57,6 +57,9 @@ class BaseTrainConfig:
     prune_threshold: float = 0.99    # MCTS Q exceeding this triggers prune
     prune_prob: float = 0.9          # probability of actually pruning
 
+    # Optimizer resume
+    reset_optimizer_state: bool = False  # if True, start with fresh Adam state
+
     # Opening book
     opening_book_dir: str = ""         # directory of serialized opening states
     opening_book_prob: float = 0.0     # probability of using an opening (0=off)

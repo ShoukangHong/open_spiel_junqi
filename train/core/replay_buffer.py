@@ -52,6 +52,7 @@ class ReplayBuffer:
         self._sample_rng = np.random.RandomState()
         self._stats_total = 0
         self._stats_hashes = set()
+        self._archived_sizes = []    # [(path, count), ...] oldest-first, cached
         self._diag_files = {}        # cumulative file→count across all samples
         self._diag_step_min = 10**9  # min training step seen this step
         self._diag_step_max = 0      # max training step seen this step
@@ -74,6 +75,7 @@ class ReplayBuffer:
             self._conn.execute("CREATE INDEX IF NOT EXISTS idx_step ON states(step)")
             self._conn.commit()
             self._sync_total()
+            self._refresh_archived_cache()
             if recent_db_rows > 0:
                 rpath = db_path.replace(".db", "_recent.db")
                 self._recent_conn = sqlite3.connect(rpath, timeout=30)
@@ -128,6 +130,26 @@ class ReplayBuffer:
     def _count_current(self):
         cur = self._conn.execute("SELECT COUNT(*) FROM states")
         return cur.fetchone()[0]
+
+    def _refresh_archived_cache(self):
+        """Cache row-counts of archived DBs so _sample_by_ids avoids per-call glob+COUNT."""
+        import glob as _glob, re as _re
+        base = self._db_path
+        if not base:
+            self._archived_sizes = []
+            return
+        archived = [p for p in _glob.glob(base.replace(".db", "_*.db"))
+                    if _re.search(r'_(\d+)\.db$', p)]
+        archived.sort(key=lambda p: int(_re.search(r'_(\d+)\.db$', p).group(1)))
+        self._archived_sizes = []
+        for p in archived:
+            try:
+                conn = sqlite3.connect(p)
+                cnt = conn.execute("SELECT COUNT(*) FROM states").fetchone()[0]
+                conn.close()
+                self._archived_sizes.append((p, cnt))
+            except Exception:
+                pass
 
     # ── Public API ──────────────────────────────────────────────────────────
 
@@ -196,20 +218,12 @@ class ReplayBuffer:
 
     def _sample_by_ids(self, abs_ids):
         """Query rows by global IDs across all DB files, unpack, track stats."""
-        paths = list(reversed(self._all_db_paths()))
-        file_sizes = []
-        for p in paths:
-            conn = self._conn if p == self._db_path else None
-            close_after = False
-            if conn is None:
-                conn = sqlite3.connect(p)
-                close_after = True
-            try:
-                cnt = conn.execute("SELECT COUNT(*) FROM states").fetchone()[0]
-                file_sizes.append((p, cnt))
-            finally:
-                if close_after:
-                    conn.close()
+        # Cached archived DB sizes (oldest-first) + live DB count
+        file_sizes = list(self._archived_sizes)
+        if self._db_path and os.path.exists(self._db_path):
+            cnt = self._conn.execute("SELECT COUNT(*) FROM states").fetchone()[0]
+            if cnt > 0:
+                file_sizes.append((self._db_path, cnt))
 
         file_ofs = {}
         for a_id in abs_ids:
@@ -305,12 +319,14 @@ class ReplayBuffer:
     def _rotate_db(self):
         if self._db_path is None:
             return
-        if self._count_current() < self._max_db_rows:
+        cur_count = self._count_current()
+        if cur_count < self._max_db_rows:
             return
         self._conn.close()
         suffix = self._total  # monotonic, never conflicts with existing archives
         rotated = self._db_path.replace(".db", f"_{suffix}.db")
         os.rename(self._db_path, rotated)
+        self._archived_sizes.append((rotated, cur_count))
         self._conn = sqlite3.connect(self._db_path, timeout=30)
         for p in _WAL_PRAGMAS:
             self._conn.execute(p)
@@ -354,6 +370,7 @@ class ReplayBuffer:
                 "UPDATE sqlite_sequence SET seq = 0 WHERE name = 'states'")
             self._recent_conn.commit()
         self._sync_total()
+        self._refresh_archived_cache()
 
     def close(self):
         self.flush()

@@ -32,7 +32,7 @@ from game_ui.xiangqi_render import (
     compute_top_moves)
 
 # ── Config ──────────────────────────────────────────────────────────────────
-BUFFER_FILE = r"C:\Users\shouk\xiangqi_train\cloud_re\buffer_recent.db"
+BUFFER_FILE = r"C:\Users\shouk\xiangqi_train\backup\cloud_re\cm\buffer_checkmate_0.db"
 
 
 # ── Side panel ──────────────────────────────────────────────────────────────

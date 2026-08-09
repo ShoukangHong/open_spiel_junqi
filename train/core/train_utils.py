@@ -101,7 +101,8 @@ def init_training(cfg, game_module, model_builder, ReplayBuffer_class,
     # Resume
     start_step = find_latest_checkpoint(cfg.path)
     if start_step > 0:
-        model.load_checkpoint(start_step)
+        fresh_opt = getattr(cfg, 'reset_optimizer_state', False)
+        model.load_checkpoint(start_step, fresh_optimizer=fresh_opt)
         buffer.rollback(start_step)  # discard states past this checkpoint
         logging.info(f"[train] Resumed from checkpoint-{start_step}"
                      f" (buffer: {len(buffer)} states)")

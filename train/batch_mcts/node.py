@@ -143,13 +143,18 @@ class Node:
 
     # ── Reparent ──────────────────────────────────────────────────────────
 
-    def reparent_as_root(self, scale: float = None) -> None:
+    def reparent_as_root(self, scale: float = None,
+                          recursive: bool = False) -> None:
         """Convert this node from a child into a new root, in-place.
 
         Flips player and negates total_reward to match the new perspective.
-        If *scale* is given (e.g. 0.5), the root's and its direct children's
-        stats are shrunk so the inherited data doesn't dominate the new
-        search.  Deeper nodes in the subtree are left unchanged.
+        If *scale* is given (e.g. 0.5), stats are shrunk so inherited data
+        doesn't dominate the new search.
+
+        With *recursive=False* (default): scales only direct children.
+        With *recursive=True*: recurses into descendants, but only if the
+        child's explore_count exceeds root threshold
+        (sum of children's explore_count × scale).
         """
         self.total_reward = -self.total_reward
         self.player = 1 - self.player
@@ -159,10 +164,14 @@ class Node:
         self.virtual_visits = 0
 
         if scale is not None and scale != 1.0:
+            root_n = sum(c.explore_count for c in self.children)
             self._scale_stats(scale)
             for c in self.children:
                 if c.outcome is None:
-                    c._scale_stats(scale)
+                    if recursive:
+                        c._reparent_scale_recursive(scale, root_n * scale)
+                    else:
+                        c._scale_stats(scale)
 
         # Children are now root-level; compute pos_hash so repeat penalty works.
         # Skip terminal children — solver excludes them from PUCT anyway.
@@ -179,6 +188,16 @@ class Node:
         ratio = self.explore_count / max(old_n, 1)
         self.total_reward *= ratio
         self.draw_reward *= ratio
+
+    def _reparent_scale_recursive(self, scale: float, threshold: float) -> None:
+        """Scale this node and recurse into children whose explore_count
+        exceeds *threshold*."""
+        if self.explore_count <= threshold:
+            return
+        self._scale_stats(scale)
+        for c in self.children:
+            if c.outcome is None:
+                c._reparent_scale_recursive(scale, threshold)
 
     # ── Best child ────────────────────────────────────────────────────────
 

@@ -409,5 +409,34 @@ def test_uniform_sample_across_dbs():
         _os.remove(f)
 
 
+def test_archived_sizes_cache():
+    """_archived_sizes cache matches real DB row counts after rotations."""
+    import sqlite3, glob
+    base = _tempfile.mktemp(suffix=".db")
+    buf = ReplayBuffer(max_size=200, db_path=base, max_db_rows=30)
+    obs = np.zeros(4 * 8 * 8, dtype=np.float32)
+    mask = np.ones(65, dtype=bool)
+    pol = np.ones(65, dtype=np.float32) / 65
+    val = np.array([0.5, 0.3, 0.2], dtype=np.float32)
+
+    for i in range(100):
+        buf.append(obs, mask, pol, val, step=1, tag="")
+        if (i + 1) % 30 == 0:
+            buf.flush()  # trigger rotation each 30 rows
+    buf.flush()
+
+    assert len(buf._archived_sizes) >= 3, f"Expected >=3 archived, got {len(buf._archived_sizes)}"
+    for path, cached_cnt in buf._archived_sizes:
+        conn = sqlite3.connect(path)
+        real_cnt = conn.execute("SELECT COUNT(*) FROM states").fetchone()[0]
+        conn.close()
+        assert cached_cnt == real_cnt, \
+            f"Cache mismatch: {os.path.basename(path)} cache={cached_cnt} real={real_cnt}"
+
+    buf.close()
+    for f in glob.glob(base.replace(".db", "_*.db")) + [base]:
+        _os.remove(f)
+
+
 if __name__ == "__main__":
     main()

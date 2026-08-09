@@ -114,6 +114,8 @@ def compute_alpha(step_index: int, game_length: int, offset: int,
     denom = max(offset + game_length - 1, 1)
     step_pos = offset + step_index
     if step_pos <= temperature_drop:
+        if temperature_drop == 0:
+            return 0.3
         return 0.1 + 0.2 * step_pos/temperature_drop
     return min(step_pos / denom, 1.0) * 0.7 + 0.3
 
@@ -503,11 +505,13 @@ def run_training(
 
             if losses_list:
                 n = len(losses_list)
+                v_kl_trained = [l for l in losses_list if l.v_kl > 0]
+                n_v = max(len(v_kl_trained), 1)
                 avg_loss = Losses(
                     policy=sum(l.policy for l in losses_list) / n,
                     value=sum(l.value for l in losses_list) / n,
                     l2=sum(l.l2 for l in losses_list) / n,
-                    v_kl=sum(l.v_kl for l in losses_list) / n,
+                    v_kl=sum(l.v_kl for l in v_kl_trained) / n_v,
                     top1=sum(l.top1 for l in losses_list) / n,
                     p_kl=sum(l.p_kl for l in losses_list) / n,
                     grad_rel=sum(l.grad_rel for l in losses_list) / n,
@@ -518,9 +522,12 @@ def run_training(
                 mid = max(0, n // 2 - h // 2)
                 p_kl_mid = sum(l.p_kl for l in losses_list[mid:mid + h]) / max(1, min(h, n - mid))
                 p_kl_tail = sum(l.p_kl for l in losses_list[-h:]) / h
-                v_kl_head = sum(l.v_kl for l in losses_list[:h]) / h
-                v_kl_mid = sum(l.v_kl for l in losses_list[mid:mid + h]) / max(1, min(h, n - mid))
-                v_kl_tail = sum(l.v_kl for l in losses_list[-h:]) / h
+                v_head = [l for l in losses_list[:h] if l.v_kl > 0]
+                v_kl_head = sum(x.v_kl for x in v_head) / max(len(v_head), 1)
+                v_mid = [l for l in losses_list[mid:mid + h] if l.v_kl > 0]
+                v_kl_mid = sum(x.v_kl for x in v_mid) / max(len(v_mid), 1)
+                v_tail = [l for l in losses_list[-h:] if l.v_kl > 0]
+                v_kl_tail = sum(x.v_kl for x in v_tail) / max(len(v_tail), 1)
                 avg_entropy = sum(entropies) / len(entropies)
             else:
                 avg_loss = None

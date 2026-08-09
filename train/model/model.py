@@ -200,7 +200,7 @@ class Model:
                       l2=l2_reg, v_kl=v_kl, top1=top1, p_kl=p_kl,
                       grad_rel=grad_rel, update_rel=update_rel)
 
-    def save_checkpoint(self, step: int) -> str:
+    def save_checkpoint(self, step: int, save_optimizer: bool = True) -> str:
         if not self._checkpoint_path:
             return ""
         os.makedirs(self._checkpoint_path, exist_ok=True)
@@ -216,26 +216,26 @@ class Model:
                     f"at step {step} — training diverged")
         filepath = os.path.join(self._checkpoint_path, f"checkpoint-{step}.pt")
         tmp = filepath + ".tmp"
-        torch.save({
-            "step": step,
-            "model_state_dict": self._model.state_dict(),
-            "optimizer_state_dict": self._optimizer.state_dict(),
-        }, tmp)
+        ckpt = {"step": step, "model_state_dict": self._model.state_dict()}
+        if save_optimizer:
+            ckpt["optimizer_state_dict"] = self._optimizer.state_dict()
+        torch.save(ckpt, tmp)
         os.replace(tmp, filepath)
         return filepath
 
-    def load_checkpoint(self, step: int) -> None:
+    def load_checkpoint(self, step: int, fresh_optimizer: bool = False) -> None:
         if not self._checkpoint_path:
             return
         filepath = os.path.join(self._checkpoint_path, f"checkpoint-{step}.pt")
         if os.path.exists(filepath):
             ckpt = torch.load(filepath, map_location=self._device, weights_only=False)
             self._model.load_state_dict(ckpt["model_state_dict"], strict=False)
-            try:
-                self._optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            except ValueError:
-                print(f"[model] Warning: optimizer state mismatch — "
-                      f"architecture changed. Starting with fresh optimizer.")
+            if not fresh_optimizer and "optimizer_state_dict" in ckpt:
+                try:
+                    self._optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                except ValueError:
+                    print(f"[model] Warning: optimizer state mismatch — "
+                          f"architecture changed. Starting with fresh optimizer.")
             for pg in self._optimizer.param_groups:
                 pg["lr"] = self._lr
         else:

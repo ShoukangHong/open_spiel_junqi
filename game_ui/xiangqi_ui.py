@@ -20,17 +20,17 @@ from game_ui.xiangqi_render import (
 from train.core.model_builder import build_xiangqi_model
 
 # ── Config ──────────────────────────────────────────────────────────────────
-CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_re"
-CHECKPOINT_STEP = 205
-MCTS_SIMULATIONS = 2000
-HINT_MAX_SIM = 10000
-INFERENCE_BATCH_SIZE = 10  # shared by MCTS and AlphaBeta
-UCT_C = 4.0
+CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_pre"
+CHECKPOINT_STEP = 250000
+MCTS_SIMULATIONS = 3200
+HINT_MAX_SIM = 16000
+INFERENCE_BATCH_SIZE = 16  # shared by MCTS and AlphaBeta
+UCT_C = 5.0
 FPU_LAMBDA = 0.2  # FPU penalty for unvisited nodes in MCTS (0 = disabled)
 PROBE_DEPTH = 1   # speculative probe layers (0 = disabled)
 PROBE_SURPRISE = 1.0  # Q-drop threshold for probe early termination
 AI_TEMPERATURE = 0.01  # τ for AI move selection (0 = argmax)
-TEMP_DROP = 1         # use τ=0.5 + advantage mixing before this move
+TEMP_DROP = 5         # use τ=0.5 + advantage mixing before this move
 SAVE_DIR = os.path.join(CHECKPOINT_DIR, "saved_positions")
 OPENING_DIR = os.path.join(CHECKPOINT_DIR, "opening_book")
 POLICY_EPSILON = 0.0  # Dirichlet noise weight for AI/hint search
@@ -433,7 +433,9 @@ def main():
                     selector.reset()
                     message = "Move undone"
                     continue
-                elif action is not True:
+                elif action is True:
+                    restart = True
+                else:
                     quit_to_menu = True
 
     pygame.quit()

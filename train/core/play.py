@@ -92,7 +92,10 @@ def _stable_qdr(root):
 
 
 def _should_prune(pruned, root, cur_player, config, max_utility, dice):
-    """Decide whether to prune (win) or truncate (draw) the current game.
+    """Decide whether to resign (loss) or truncate (draw) the current game.
+
+    Only resign / agree-to-draw are allowed — the winning side cannot
+    unilaterally declare victory (the opponent might still blunder).
 
     Returns (new_pruned, do_break).
     Checks every move; dice is rolled each time.
@@ -100,19 +103,19 @@ def _should_prune(pruned, root, cur_player, config, max_utility, dice):
     if not config.prune_enabled or pruned["used"]:
         return pruned, False
 
-    proven_win = root.outcome is not None and root.outcome[cur_player] > 0
+    proven_loss = root.outcome is not None and root.outcome[cur_player] < 0
     q, dr = _stable_qdr(root)
-    high_q = q >= config.prune_threshold * max_utility
+    high_loss = q <= -(config.prune_threshold * max_utility)
     high_draw = dr >= config.prune_threshold
 
-    qualifies = proven_win or high_q or high_draw
+    qualifies = proven_loss or high_loss or high_draw
     if not qualifies:
         return pruned, False
 
     if dice < config.prune_prob:
-        is_draw = high_draw and not (proven_win or high_q)
+        result = "draw" if high_draw else "loss"
         return {"used": True, "cur_player": cur_player,
-                "draw_truncate": is_draw}, True
+                "result": result}, True
     return pruned, False
 
 
@@ -359,12 +362,15 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
         state.apply_action(action)
         move_num += 1
 
-    if pruned.get("draw_truncate"):
-        returns = np.array([0.0, 0.0], dtype=np.float64)
-    elif pruned["used"]:
+    if pruned["used"]:
         max_u = game.max_utility()
         p = pruned["cur_player"]
-        returns = np.array([max_u if i == p else -max_u for i in range(2)],
+        result = pruned["result"]
+        if result == "draw":
+            returns = np.array([0.0, 0.0], dtype=np.float64)
+        elif result == "loss":
+            # cur_player resigned: that side loses
+            returns = np.array([-max_u if i == p else max_u for i in range(2)],
                            dtype=np.float64)
     else:
         returns = state.returns()

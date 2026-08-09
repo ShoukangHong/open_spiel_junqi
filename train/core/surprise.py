@@ -175,7 +175,7 @@ def detect_surprise(state, root, config, game_max_utility=1.0):
                 c_val_kl = _node_val_kl(c, c.nn_q, c.nn_draw)
             # Non-proven children: skip value surprise (MCTS value is noisy)
             if c.outcome is None:
-                c_val_kl = 0.0
+                c_val_kl *= 1/3
             # Scale by decisiveness
             c_wdl_scale = 1.33 - max(_wdl_from_qdr(*_stable_qdr(c)))/3
             c_pol_kl *= c_wdl_scale
