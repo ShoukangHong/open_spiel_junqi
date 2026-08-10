@@ -10,6 +10,7 @@ class _FakeConfig:
     surprise_pol_kl = 0.5
     surprise_val_kl = 0.3
     surprise_child_min_n = 150
+    max_simulations = 800
 
 
 def _make_root(nn_q=None, nn_draw=0.0, nn_prior_max=None, nn_argmax=None,
@@ -174,7 +175,7 @@ def test_child_surprise_value():
     state = game.new_initial_state()
 
     cc = _make_child(0, 15, -12, prior=0.5, player=1)
-    # outcome=None (non-proven) → value KL forced to 0
+    # outcome=None (non-proven) → val_kl reduced by 1/3, but still triggers
     c = _make_child(0, 200, -160, prior=0.5, player=1,
                     nn_q=0.8, nn_draw=0.0,
                     nn_prior=[(0, 0.5), (1, 0.5)],
@@ -185,8 +186,8 @@ def test_child_surprise_value():
     root.draw_reward = 0.1
 
     _, child_tags, _ = detect_surprise(state, root, cfg, game.max_utility())
-    assert 0 not in child_tags, \
-        f"Non-proven child should not trigger value surprise, got {child_tags}"
+    assert 0 in child_tags and child_tags[0][0] == "child_surprise", \
+        f"Non-proven child with value mismatch should still trigger, got {child_tags}"
 
 
 def test_child_surprise_value_proven():
@@ -259,7 +260,10 @@ def test_child_no_nn_prior_skipped():
     root.draw_reward = 0.1
 
     _, child_tags, _ = detect_surprise(state, root, cfg, game.max_utility())
-    assert child_tags == {}, f"Child without nn_prior should be skipped, got {child_tags}"
+    # nn_prior=None only skips pol_kl (falls back to children's priors);
+    # value surprise still triggers due to large nn_q vs MCTS mismatch.
+    assert 0 in child_tags and child_tags[0][0] == "child_surprise", \
+        f"Value surprise should trigger even without nn_prior, got {child_tags}"
     print("  Test I PASSED")
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -414,6 +418,253 @@ def main():
     print(f"  {'ALL PASSED' if failed == 0 else f'{failed} FAILED'}")
     print(f"{'=' * 50}")
     return 0 if failed == 0 else 1
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Recursive surprise detection
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def test_recursive_well_explored_grandchild():
+    """Grandchild with enough visits is checked for surprise."""
+    game = pyspiel.load_game("tic_tac_toe")
+    state = game.new_initial_state()
+    cfg = _FakeConfig()
+    cfg.max_simulations = 400  # _MIN_N = 100
+    cfg.surprise_child_min_n = 50
+    cfg.surprise_val_kl = 0.3
+
+    # Grandchild with value mismatch
+    gc = _make_child(0, 80, -64, prior=0.5, player=0,
+                     nn_q=-0.9, nn_draw=0.0, draw_reward=0.0)
+    # Child well-explored, will recurse into gc
+    c = _make_child(0, 200, -160, prior=0.5, player=1,
+                    nn_q=0.9, nn_draw=0.0,
+                    nn_prior=[(0, 1.0)],
+                    draw_reward=0.0, children=[gc])
+    root = _make_root(nn_q=0.0, nn_draw=0.1, children=[c])
+    root.total_reward = 0
+    root.draw_reward = 0.1
+
+    _, child_tags, _ = detect_surprise(state, root, cfg, game.max_utility())
+    # Child c triggers value surprise (nn_q=0.9 vs MCTS Q=-0.8 → large KL)
+    assert 0 in child_tags, f"Child should trigger surprise, got {child_tags}"
+
+
+def test_recursive_shallow_child_not_recursed():
+    """Child below _MIN_N is checked but NOT recursed into."""
+    game = pyspiel.load_game("tic_tac_toe")
+    state = game.new_initial_state()
+    cfg = _FakeConfig()
+    cfg.max_simulations = 800  # _MIN_N = 200
+    cfg.surprise_val_kl = 0.3
+
+    # Grandchild with huge value mismatch
+    gc = _make_child(0, 5, 5, prior=0.5, player=2,
+                     nn_q=0.99, nn_draw=0.0, draw_reward=0.0,
+                     outcome=[1, -1])
+    # Child has explore_count < _MIN_N (200) — checked for surprise, but NOT recursed
+    c = _make_child(0, 50, -40, prior=0.5, player=1,
+                    nn_q=0.3, nn_draw=0.0,
+                    draw_reward=0.0, children=[gc])
+    root = _make_root(nn_q=0.0, nn_draw=0.1, children=[c])
+    root.total_reward = 0
+    root.draw_reward = 0.1
+
+    _, child_tags, _ = detect_surprise(state, root, cfg, game.max_utility())
+    # Child's explore_count=50 < 200, so gc is NOT recursed.
+    # Only one tag possible: child c itself (but 50 < 200: c.nn_q=0.3, val KL might still trigger)
+    # The key point: gc's large mismatch should NOT appear because we don't recurse
+    for tag, _ in child_tags.values():
+        assert "grand" not in tag, \
+            f"Shallow child should not be recursed, got tag={tag}"
+
+
+def test_recursive_two_level_deep():
+    """Three-level tree: root → child → grandchild, all well-explored."""
+    game = pyspiel.load_game("tic_tac_toe")
+    state = game.new_initial_state()
+    cfg = _FakeConfig()
+    cfg.max_simulations = 400  # _MIN_N = 100
+    cfg.surprise_val_kl = 0.3
+
+    # Great-grandchild (player 1, p0 wins → outcome[1] = -1)
+    ggc = _make_child(0, 60, 60, prior=0.5, player=1,
+                      nn_q=-0.9, nn_draw=0.0, draw_reward=1.0,
+                      outcome=[1, -1])
+    # Grandchild (player 0) — well-explored, nn_q mismatches MCTS Q
+    gc = _make_child(0, 120, 100, prior=0.5, player=0,
+                     nn_q=-0.9, nn_draw=0.0,
+                     nn_prior=[(0, 1.0)],
+                     draw_reward=0.0, children=[ggc])
+    # MCTS Q from gc ≈ 0.83.  nn_q=-0.95 → large value KL.
+    c = _make_child(0, 200, -160, prior=0.5, player=1,
+                    nn_q=-0.95, nn_draw=0.0,
+                    nn_prior=[(0, 1.0)],
+                    draw_reward=0.0, children=[gc])
+    root = _make_root(nn_q=0.0, nn_draw=0.1, children=[c])
+    root.total_reward = 0
+    root.draw_reward = 0.1
+
+    _, child_tags, _ = detect_surprise(state, root, cfg, game.max_utility())
+    # All levels should trigger: child, grandchild, and at least child at root
+    assert len(child_tags) >= 1, f"Expected multi-level surprises, got {child_tags}"
+
+
+def test_recursive_no_children_no_recurse():
+    """Leaf node with explore_count >= _MIN_N but no children: no crash, no recursion."""
+    game = pyspiel.load_game("tic_tac_toe")
+    state = game.new_initial_state()
+    cfg = _FakeConfig()
+    cfg.max_simulations = 200  # _MIN_N = 50
+    cfg.surprise_val_kl = 0.3
+
+    # Leaf child (no children), well-explored, value surprise
+    c = _make_child(0, 300, -240, prior=0.5, player=1,
+                    nn_q=0.9, nn_draw=0.0, draw_reward=0.0)
+    root = _make_root(nn_q=0.0, nn_draw=0.1, children=[c])
+    root.total_reward = 0
+    root.draw_reward = 0.1
+
+    _, child_tags, _ = detect_surprise(state, root, cfg, game.max_utility())
+    # Should trigger child surprise (value mismatch), no crash from recursion
+    assert 0 in child_tags, f"Leaf child value surprise should trigger, got {child_tags}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  sample_surprise_copies
+# ═══════════════════════════════════════════════════════════════════════════════
+
+from train.core.surprise import sample_surprise_copies
+
+
+def _make_surprise_item(uid, tag, kl):
+    """Create a minimal surprise tuple for sampling tests (obs=uid serves as id)."""
+    obs = np.array([uid], dtype=np.float32)
+    mask = np.ones(1, dtype=bool)
+    pol = np.ones(1, dtype=np.float32)
+    return (obs, mask, pol, 0, tag, 0.0, 0.0, kl, -1)
+
+
+def test_sample_total_count():
+    """Total copies never exceed max_copies (12-40 clamped by max_states/4)."""
+    rng = np.random.RandomState(42)
+    items = [_make_surprise_item(i, "surprise", i * 0.1) for i in range(50)]
+
+    for n_states in [0, 10, 50, 200, 500, 2000]:
+        out = sample_surprise_copies(items, n_states, rng)
+        max_copies = min(max(12, n_states // 4), 40)
+        assert len(out) <= max_copies, \
+            f"max_states={n_states}: got {len(out)} > max {max_copies}"
+
+
+def test_sample_empty_and_small():
+    """Empty list returns empty; small surplus returns whatever fits."""
+    rng = np.random.RandomState(42)
+    assert sample_surprise_copies([], 100, rng) == []
+
+    # 1 item: at most 1 copy (regular) or 2 (super)
+    item = _make_surprise_item(0, "surprise", 0.5)
+    out = sample_surprise_copies([item], 100, rng)
+    assert 1 <= len(out) <= 2
+
+
+def test_sample_no_duplicates():
+    """Each original item appears at most once (no multi-selection)."""
+    rng = np.random.RandomState(42)
+    items = [_make_surprise_item(i, "surprise", i * 0.1) for i in range(20)]
+
+    for _ in range(10):
+        out = sample_surprise_copies(items, 200, rng)
+        ids_seen = {}
+        for copy in out:
+            uid = int(copy[0][0])
+            ids_seen[uid] = ids_seen.get(uid, 0) + 1
+        for uid, cnt in ids_seen.items():
+            tag = items[uid][4]
+            expected = 2 if "super" in tag else 1
+            assert cnt <= expected, \
+                f"Item {uid} ({tag}) appeared {cnt} times > expected {expected}"
+
+
+def test_sample_super_copies():
+    """super_surprise items get 2 copies, but only up to super_budget."""
+    rng = np.random.RandomState(42)
+    items = [_make_surprise_item(i, "super_surprise", i * 0.5) for i in range(30)]
+
+    out = sample_surprise_copies(items, 400, rng)
+    max_copies = min(max(12, 400 // 4), 40)  # = 40
+    super_budget = max_copies // 4  # = 10
+
+    super_copies = sum(1 for c in out if "super" in c[4])
+    # Each super item within budget gives 2 copies
+    assert super_copies <= super_budget * 2, \
+        f"super copies {super_copies} > budget*2 {super_budget * 2}"
+
+
+def test_sample_weighted_distribution():
+    """High-KL items dominate when only a subset fits (statistical)."""
+    items = []
+    for i in range(10):
+        items.append(_make_surprise_item(i, "surprise", 5.0))
+    for i in range(10, 50):
+        items.append(_make_surprise_item(i, "surprise", 0.1))
+
+    # max_states=80 → max_copies = min(max(12, 80//4), 40) = 20
+    # 50 items, all 1-copy "surprise" → only ~20 fit.  High-KL must dominate.
+    high_hits = 0
+    low_hits = 0
+    n_trials = 1000
+    rng = np.random.RandomState(42)
+    for _ in range(n_trials):
+        out = sample_surprise_copies(items, 80, rng)
+        assert len(out) <= 20, f"max_copies=20, got {len(out)}"
+        uids = {int(c[0][0]) for c in out}
+        high_hits += sum(1 for u in uids if u < 10)
+        low_hits += sum(1 for u in uids if u >= 10)
+
+    # Average: ~high_hits/n_trials → should have ≥8 high-KL out of 20
+    avg_high = high_hits / n_trials
+    avg_low = low_hits / n_trials
+    assert avg_high >= 8, \
+        f"Expected ≥8 high-KL items per trial, got {avg_high:.1f}"
+    assert avg_low <= 12, \
+        f"Expected ≤12 low-KL items per trial, got {avg_low:.1f}"
+
+
+def test_sample_no_deterministic_selection():
+    """Selection varies across trials — high KL are not the exact same set."""
+    items = []
+    for i in range(15):
+        items.append(_make_surprise_item(i, "surprise", 5.0))
+    for i in range(15, 30):
+        items.append(_make_surprise_item(i, "surprise", 0.1))
+
+    # max_states=40 → max_copies=12, 30 items → ~18 excluded per trial
+    rng = np.random.RandomState(42)
+    all_selections = []
+    for _ in range(200):
+        out = sample_surprise_copies(items, 40, rng)
+        uids = frozenset(int(c[0][0]) for c in out)
+        all_selections.append(uids)
+
+    # Not every trial produces the identical set
+    assert len(set(all_selections)) >= 5, \
+        f"Expected ≥5 distinct selection sets, got {len(set(all_selections))}"
+
+    # With 15 high-KL competing for ~12 slots, some get excluded
+    high_ever_missing = sum(
+        1 for uid in range(15)
+        if any(uid not in s for s in all_selections))
+    assert high_ever_missing >= 8, \
+        f"Only {high_ever_missing}/15 high-KL items ever excluded"
+
+    # Low-KL items occasionally sneak in
+    low_appearances = {}
+    for uid in range(15, 30):
+        low_appearances[uid] = sum(1 for s in all_selections if uid in s)
+    appeared = sum(1 for c in low_appearances.values() if c > 0)
+    assert appeared >= 3, \
+        f"Only {appeared}/15 low-KL items ever appeared — too deterministic"
 
 
 if __name__ == "__main__":

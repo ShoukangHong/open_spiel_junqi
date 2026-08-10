@@ -298,8 +298,11 @@ def run_match_parallel(cfg0, cfg1, num_games=100, temperature=0.1,
             if pcfg["strategy"] not in ("mcts", "model"):
                 continue
             model_objs = _model_for(pcfg)
+            pc_path = os.path.join(pcfg["checkpoint_dir"], "train_config.json")
+            with open(pc_path) as f:
+                pc = json.load(f)
             srv.register_model(mid, model_objs._model.state_dict(),
-                               tc.get("nn_width", 32), tc.get("nn_depth", 6))
+                               pc.get("nn_width", 32), pc.get("nn_depth", 6))
         actor_rqs = [srv.register_actor(i) for i in range(num_actors)]
         actor_ids = list(range(num_actors))
         shm_names = [srv.actor_shm_name(i) for i in range(num_actors)]

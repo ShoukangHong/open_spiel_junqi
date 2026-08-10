@@ -190,14 +190,19 @@ class Node:
         self.draw_reward *= ratio
 
     def _reparent_scale_recursive(self, scale: float, threshold: float) -> None:
-        """Scale this node and recurse into children whose explore_count
-        exceeds *threshold*."""
-        if self.explore_count <= threshold:
+        """Scale this subtree.  Only self uses children's sum (may have
+        been scaled); children's explore_count is still clean."""
+        total_n = sum(c.explore_count for c in self.children) \
+                  or self.explore_count
+        if total_n <= threshold:
             return
         self._scale_stats(scale)
         for c in self.children:
             if c.outcome is None:
-                c._reparent_scale_recursive(scale, threshold)
+                if c.explore_count > threshold:
+                    c._reparent_scale_recursive(scale, threshold)
+                else:
+                    c._scale_stats(scale)
 
     # ── Best child ────────────────────────────────────────────────────────
 

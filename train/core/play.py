@@ -10,7 +10,7 @@ from train.batch_mcts.mcts import compute_solved_policy
 from train.batch_mcts.shared_evaluator import fast_legal_mask
 from train.core.policy import mix_advantage
 from train.core.weak_move import try_weak_move
-from train.core.surprise import detect_surprise, _wdl_from_qdr
+from train.core.surprise import detect_surprise, sample_surprise_copies, _wdl_from_qdr
 
 _EPS = 1e-6  # label smoothing — prevents float32 underflow from CE with p=0
 
@@ -376,25 +376,7 @@ def play_game(game, mcts_black, mcts_white, config, rng, logger=None,
         returns = state.returns()
     if logger is not None:
         logger.log_game_end(returns, move_num, len(rare_games))
-    # Extra copies: super ×2 (up to max_copies//4), rest ×1
-    extra_surprise.sort(key=lambda x: x[7], reverse=True)
-    super_count = 0
-    copies = []
-    max_copies = max(12, len(states_info) // 4)
-    for item in extra_surprise:
-        tag = item[4]
-        if "super_surprise" in tag:
-            super_count += 1
-            n = 2 if super_count <= max_copies//4 else 1
-            final_tag = tag if super_count <= max_copies // 4 else tag.replace("super_", "")
-        else:
-            n = 1
-            final_tag = tag
-        step_idx = item[8] if len(item) > 8 else -1
-        for _ in range(n):
-            copies.append((item[0], item[1], item[2], item[3],
-                           final_tag, item[5], item[6], item[7], step_idx))
-    if len(copies) > max_copies:
-        copies = copies[:max_copies]
-    states_info.extend(copies)
+    # Extra copies: weighted random sample of surprise states
+    states_info.extend(sample_surprise_copies(
+        extra_surprise, len(states_info), rng))
     return states_info, returns, rare_games, wstats, eff_td

@@ -147,42 +147,97 @@ def detect_surprise(state, root, config, game_max_utility=1.0):
     root_tag, combined = _surprise_tag(pol_kl, val_kl)
     root_tag, combined = _surprise_tag(pol_kl, val_kl)
 
-    # ── Children ──────────────────────────────────────────────────────
-    child_tags = {}
-    min_n = config.surprise_child_min_n
-    for c in root.children:
-        if c.nn_q is None:
-            continue
-        if c.outcome is not None or c.explore_count >= min_n:
-            c_player = (c.state.current_player()
-                        if c.state is not None else c.player)
-            if c.children:
-                if c.nn_prior is not None:
-                    c_nn_prior = np.array(
-                        [max(dict(c.nn_prior).get(cc.action, 0.0), 0.0)
-                         for cc in c.children],
-                        dtype=np.float64)
+    _MIN_N = max(int(config.max_simulations * 0.25), 80)
+
+    def _check_children(node, node_player, prefix, tags_out):
+        """Check *node*'s direct children for surprise.  Recurses into
+        well-explored children (explore_count >= _MIN_N)."""
+        for c in node.children:
+            if c.nn_q is None:
+                continue
+            if c.outcome is not None or c.explore_count >= _MIN_N:
+                c_player = (c.state.current_player()
+                            if c.state is not None else c.player)
+                if c.children:
+                    if c.nn_prior is not None:
+                        c_nn_prior = np.array(
+                            [max(dict(c.nn_prior).get(cc.action, 0.0), 0.0)
+                             for cc in c.children],
+                            dtype=np.float64)
+                    else:
+                        c_nn_prior = np.array(
+                            [cc.prior for cc in c.children],
+                            dtype=np.float64)
+                    c_nn_prior /= c_nn_prior.sum()
+                    c_pol_kl, c_val_kl = _node_pol_val_kl(
+                        c, c_player, c.nn_q, c.nn_draw, c_nn_prior,
+                        game_max_utility)
                 else:
-                    c_nn_prior = np.array(
-                        [cc.prior for cc in c.children],
-                        dtype=np.float64)
-                c_nn_prior /= c_nn_prior.sum()
-                c_pol_kl, c_val_kl = _node_pol_val_kl(
-                    c, c_player, c.nn_q, c.nn_draw, c_nn_prior,
-                    game_max_utility)
-            else:
-                c_pol_kl = 0.0
-                c_val_kl = _node_val_kl(c, c.nn_q, c.nn_draw)
-            # Non-proven children: skip value surprise (MCTS value is noisy)
-            if c.outcome is None:
-                c_val_kl *= 1/3
-            # Scale by decisiveness
-            c_wdl_scale = 1.33 - max(_wdl_from_qdr(*_stable_qdr(c)))/3
-            c_pol_kl *= c_wdl_scale
-            c_val_kl *= c_wdl_scale
-            ctag, c_combined = _surprise_tag(c_pol_kl, c_val_kl,
-                                             prefix="child_")
-            if ctag:
-                child_tags[c.action] = (ctag, c_combined)
+                    c_pol_kl = 0.0
+                    c_val_kl = _node_val_kl(c, c.nn_q, c.nn_draw)
+                if c.outcome is None:
+                    c_val_kl *= 1/3
+                c_wdl_scale = 1.33 - max(_wdl_from_qdr(*_stable_qdr(c)))/3
+                c_pol_kl *= c_wdl_scale
+                c_val_kl *= c_wdl_scale
+                ctag, c_combined = _surprise_tag(c_pol_kl, c_val_kl,
+                                                 prefix=prefix)
+                if ctag:
+                    tags_out[c.action] = (ctag, c_combined)
+
+            # Recurse into well-explored children
+            if c.explore_count >= _MIN_N and c.children:
+                _check_children(c, c_player, prefix + "grand_", tags_out)
+
+    child_tags = {}
+    _check_children(root, cur, "child_", child_tags)
 
     return root_tag, child_tags, combined
+
+
+def sample_surprise_copies(extra_surprise, max_states, rng):
+    """Sample surprise states for replay, weighted by KL value.
+
+    Each item in *extra_surprise* is a tuple whose element [7] is the
+    combined KL score.  Weights are shifted by -min + 0.1 and normalised
+    so every item has a non-zero chance.
+
+    Args:
+        extra_surprise: list of surprise items (see play.py for tuple layout).
+        max_states: max number of extra states to add (≈ states_info // 4).
+        rng: numpy RandomState.
+
+    Returns:
+        List of (obs, mask, policy, player, tag, q, dr, kl, step_idx) copies.
+    """
+    max_copies = min(max(12, max_states // 4), 40)
+    if not extra_surprise:
+        return []
+
+    kls = np.array([x[7] for x in extra_surprise], dtype=np.float64)
+    weights = kls - kls.min() + 0.1
+    probs = weights / weights.sum()
+    order = rng.choice(len(extra_surprise), size=len(extra_surprise),
+                       replace=False, p=probs)
+
+    copies = []
+    super_count = 0
+    super_budget = max_copies // 4
+    for idx in order:
+        item = extra_surprise[idx]
+        tag = item[4]
+        if "super_surprise" in tag:
+            super_count += 1
+            n = 2 if super_count <= super_budget else 1
+            final_tag = tag if super_count <= super_budget else tag.replace("super_", "")
+        else:
+            n = 1
+            final_tag = tag
+        step_idx = item[8] if len(item) > 8 else -1
+        for _ in range(n):
+            copies.append((item[0], item[1], item[2], item[3],
+                           final_tag, item[5], item[6], item[7], step_idx))
+
+    if len(copies) > max_copies:
+        copies = copies[:max_copies]
+    return copies

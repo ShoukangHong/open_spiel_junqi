@@ -197,7 +197,7 @@ def run_buffer_training(config_class=XiangqiTrainConfig,
             batch = TrainInput(observation=obs, legals_mask=mask,
                                policy=policy, value=value)
             model._entropy_weight = cfg.entropy_weight
-                model._value_learn_prob = getattr(cfg, 'value_learn_prob', 1.0)
+            model._value_learn_prob = getattr(cfg, 'value_learn_prob', 1.0)
             loss = model.update(batch)
             losses_list.append(loss)
 

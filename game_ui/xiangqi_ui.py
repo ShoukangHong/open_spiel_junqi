@@ -21,10 +21,10 @@ from train.core.model_builder import build_xiangqi_model
 
 # ── Config ──────────────────────────────────────────────────────────────────
 CHECKPOINT_DIR = r"C:\Users\shouk\xiangqi_train\cloud_pre"
-CHECKPOINT_STEP = 250000
+CHECKPOINT_STEP = 290000
 MCTS_SIMULATIONS = 3200
-HINT_MAX_SIM = 16000
-INFERENCE_BATCH_SIZE = 16  # shared by MCTS and AlphaBeta
+HINT_MAX_SIM = 32000
+INFERENCE_BATCH_SIZE = 32  # shared by MCTS and AlphaBeta
 UCT_C = 5.0
 FPU_LAMBDA = 0.2  # FPU penalty for unvisited nodes in MCTS (0 = disabled)
 PROBE_DEPTH = 1   # speculative probe layers (0 = disabled)
